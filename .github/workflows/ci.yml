@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure and build (Release, Ninja, /W4)
+        shell: pwsh
+        run: |
+          cmake -S . -B build/Release -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run unit tests (--unit-only)
+        shell: pwsh
+        run: |
+          .\build\Release\kestrel_tests.exe --unit-only
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify no untracked repo dirt
+        shell: pwsh
+        run: |
+          $status = git status --porcelain
+          if ($status) {
+            Write-Error "Repository has unexpected modified or untracked files:`n$status"
+            exit 1
+          }

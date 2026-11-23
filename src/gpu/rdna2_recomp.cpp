@@ -164,9 +164,40 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
         case IrOp::VCeilF32:
             out << ind << std::format("v[{}] = asuint(ceil({}));\n", i.dst.reg, emit_f32(i.src0));
             break;
-        case IrOp::VFractF32:
-            out << ind << std::format("v[{}] = asuint(frac({}));\n", i.dst.reg, emit_f32(i.src0));
+        case IrOp::VFractF32: {
+            out << ind << "{\n";
+            out << ind << std::format("    float _in = {};\n", emit_f32(i.src0));
+            out << ind << "    float _fr = _in - floor(_in);\n";
+            out << ind << "    if (_fr >= 1.0f) _fr = asfloat(0x3f7fffff);\n";
+            out << ind << std::format("    v[{}] = asuint(_fr);\n", i.dst.reg);
+            out << ind << "}\n";
             break;
+        }
+        case IrOp::VMed3F32: {
+            out << ind << "{\n";
+            out << ind << std::format("    float _a = {}; float _b = {}; float _c = {};\n", emit_f32(i.src0), emit_f32(i.src1), emit_f32(i.src2));
+            out << ind << "    if (isnan(_a) || isnan(_b) || isnan(_c)) {\n";
+            out << ind << std::format("        v[{}] = asuint(min(min(_a, _b), _c));\n", i.dst.reg);
+            out << ind << "    } else {\n";
+            out << ind << std::format("        v[{}] = asuint(max(min(_a, _b), min(max(_a, _b), _c)));\n", i.dst.reg);
+            out << ind << "    }\n";
+            out << ind << "}\n";
+            break;
+        }
+        case IrOp::VBfeI32: {
+            out << ind << "{\n";
+            out << ind << std::format("    int _val = asint({}); uint _off = asuint({}) & 31u; uint _w = asuint({}) & 63u;\n", emit_f32(i.src0), emit_f32(i.src1), emit_f32(i.src2));
+            out << ind << "    if (_w == 0) {\n";
+            out << ind << std::format("        v[{}] = 0;\n", i.dst.reg);
+            out << ind << "    } else if (_off + _w >= 32) {\n";
+            out << ind << std::format("        v[{}] = asuint(_val >> _off);\n", i.dst.reg);
+            out << ind << "    } else {\n";
+            out << ind << "        int _sh = 32 - (_off + _w);\n";
+            out << ind << std::format("        v[{}] = asuint((_val << _sh) >> (_sh + _off));\n", i.dst.reg);
+            out << ind << "    }\n";
+            out << ind << "}\n";
+            break;
+        }
         case IrOp::VCmp: {
             if (i.subop == "v_cmp_lt_f32") out << ind << std::format("vcc = ({} < {});\n", emit_f32(i.src0), emit_f32(i.src1));
             else if (i.subop == "v_cmp_eq_f32") out << ind << std::format("vcc = ({} == {});\n", emit_f32(i.src0), emit_f32(i.src1));

@@ -44,9 +44,10 @@ add_library(kestrel_core STATIC
     src/gpu/dxc_compiler.cpp
     src/gpu/gpu_runner.cpp
     src/gpu/gfx10_tiling.cpp
+    src/formats/sgd5.cpp
 )
 target_include_directories(kestrel_core PUBLIC include)
-target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32 user32 gdi32)
+target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32 user32 gdi32 cabinet)
 
 add_executable(kestrel src/cli/main.cpp)
 target_link_libraries(kestrel PRIVATE kestrel_core)

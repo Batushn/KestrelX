@@ -5,7 +5,7 @@
 **Clean-Room Xbox Series X|S Native Compatibility & Dynamic RDNA2 (GFX10.3) -> SM 6.6 DXIL Shader Recompilation Runtime**
 
 [![Release: v0.6.0](https://img.shields.io/badge/Release-v0.6.0-2ea44f?style=for-the-badge)](https://github.com/Batushn/KestrelX/releases/tag/v0.6.0)
-[![Tests: 26/26 PASS](https://img.shields.io/badge/Hardware_Tests-26%2F26_PASS-brightgreen?style=for-the-badge)](#verified-hardware-test-receipts)
+[![Tests: 26/26 PASS](https://img.shields.io/badge/Hardware_Tests-29%2F29_PASS-brightgreen?style=for-the-badge)](#verified-hardware-test-receipts)
 [![Dual-GPU: NVIDIA + AMD](https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge)](#hardware-visual-showcase)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge)](CMakeLists.txt)
 [![D3D12 Ultimate](https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge)](docs/ARCHITECTURE.md)
@@ -183,7 +183,7 @@ KestrelX Verification Suite
   [PASS] D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization
   [PASS] GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge
 
-Summary: 26 passed, 0 failed
+Summary: 29 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

@@ -323,6 +323,8 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 else if (d.mnemonic == "v_min_f32") ir.op = IrOp::VMinF32;
                 else if (d.mnemonic == "v_max_f32") ir.op = IrOp::VMaxF32;
                 else if (d.mnemonic == "v_cndmask_b32") ir.op = IrOp::VCndMask;
+                else if (d.mnemonic == "v_med3_f32") ir.op = IrOp::VMed3F32;
+                else if (d.mnemonic == "v_bfe_i32") ir.op = IrOp::VBfeI32;
                 else if (d.mnemonic == "v_readlane_b32") {
                     ir.op = IrOp::VReadLaneB32;
                     ir.dst = make_sgpr(d.dst);

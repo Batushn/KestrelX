@@ -161,6 +161,7 @@ const char* vopc_name(uint32_t op) {
 const char* vop3_name(uint32_t op) {
     switch (op) {
         case 0x14B: return "v_fma_f32";
+        case 0x147: return "v_bfe_i32";
         case 0x148: return "v_bfe_u32";
         case 0x14A: return "v_bfi_b32";
         case 0x151: return "v_med3_f32";

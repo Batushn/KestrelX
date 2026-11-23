@@ -50,6 +50,8 @@ enum class IrOp : uint8_t {
     VFloorF32,
     VCeilF32,
     VFractF32,
+    VMed3F32,
+    VBfeI32,
     VCmp,
     VCndMask,
     // Wave / subgroup intrinsics (RDNA2 Wave32/Wave64 -> SM 6.6 Wave*)

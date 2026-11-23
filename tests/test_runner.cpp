@@ -20,6 +20,7 @@
 #include "kestrel/loader/pe_image.hpp"
 #include "kestrel/loader/pe_loader.hpp"
 #include "kestrel/vfs/overlay_vfs.hpp"
+#include "kestrel/formats/sgd5.hpp"
 
 #include <dxgi1_6.h>
 #include <cmath>
@@ -374,6 +375,7 @@ void test_strict_unsupported_opcode_refusal() {
     gpu::DxcCompiler dxc;
     KX_CHECK(dxc.initialize().has_value(), "DXC init");
     auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    
     KX_CHECK(!compiled.has_value(), "DXC must reject shader containing unsupported RDNA2 opcode");
 }
 
@@ -1259,6 +1261,7 @@ void test_rdna2_wave_intrinsics_dual_gpu() {
     KX_CHECK(dxc.initialize().has_value(), "DXC init");
     auto recomp = gpu::emit_hlsl_from_ir(ir, {.stage = gpu::ShaderStage::Compute, .wave_mode = gpu::WaveMode::Wave32, .group_size_x = 32});
     auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    
     KX_CHECK(compiled.has_value(), compiled.error().message);
 
     auto adapters = gpu::enumerate_d3d12_adapters();
@@ -2022,6 +2025,7 @@ void test_rdna2_compute_2d_workgroup_tiling_dual_gpu() {
         .group_size_z = 1
     });
     auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    
     KX_CHECK(compiled.has_value(), compiled.error().message);
 
     auto adapters = gpu::enumerate_d3d12_adapters();
@@ -2502,6 +2506,166 @@ void test_gameinput_force_feedback_rumble() {
     gi->Release();
 }
 
+
+void test_sgd5_shader_archive_and_decompression() {
+    using namespace formats;
+
+    std::vector<uint8_t> payload1 = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA };
+    std::vector<uint8_t> payload2(512);
+    for (size_t i = 0; i < payload2.size(); ++i) payload2[i] = static_cast<uint8_t>(i ^ 0x5A);
+    std::vector<uint8_t> payload3(2048, 0xCC);
+
+    std::vector<std::tuple<std::string, uint8_t, std::vector<uint8_t>>> items = {
+        {"VS_Main_Wrapped", static_cast<uint8_t>(Sgd5ShaderKind::StandardShader), payload1},
+        {"PS_GBuffer_Wrapped", static_cast<uint8_t>(Sgd5ShaderKind::MeshShader), payload2},
+        {"CS_Cull_Wrapped", static_cast<uint8_t>(Sgd5ShaderKind::ComputeShader), payload3},
+    };
+
+    const auto archive = Sgd5Archive::synthesize_archive(items);
+    KX_CHECK(!archive.empty(), "Synthesized SGD5 archive must not be empty");
+    KX_CHECK(Sgd5Archive::is_sgd5(archive), "Buffer must be detected as valid SGD5 archive");
+
+    const auto records = Sgd5Archive::parse_records(archive);
+    KX_CHECK(records.size() == 3, "Parsed record count must match 3");
+
+    KX_CHECK(records[0].name == "VS_Main_Wrapped", "Record 0 name matches");
+    KX_CHECK(records[0].kind == Sgd5ShaderKind::StandardShader, "Record 0 kind matches");
+    KX_CHECK(records[0].unpacked_size == payload1.size(), "Record 0 unpacked size matches");
+    auto unp1 = records[0].unpack();
+    
+    KX_CHECK(unp1.has_value() && *unp1 == payload1, "Record 0 decompresses bit-exact");
+
+    KX_CHECK(records[1].name == "PS_GBuffer_Wrapped", "Record 1 name matches");
+    KX_CHECK(records[1].kind == Sgd5ShaderKind::MeshShader, "Record 1 kind matches");
+    KX_CHECK(records[1].unpacked_size == payload2.size(), "Record 1 unpacked size matches");
+    auto unp2 = records[1].unpack();
+    KX_CHECK(unp2.has_value() && *unp2 == payload2, "Record 1 decompresses bit-exact");
+
+    KX_CHECK(records[2].name == "CS_Cull_Wrapped", "Record 2 name matches");
+    KX_CHECK(records[2].kind == Sgd5ShaderKind::ComputeShader, "Record 2 kind matches");
+    KX_CHECK(records[2].unpacked_size == payload3.size(), "Record 2 unpacked size matches");
+    auto unp3 = records[2].unpack();
+    KX_CHECK(unp3.has_value() && *unp3 == payload3, "Record 2 decompresses bit-exact");
+}
+
+void test_rdna2_valu_precision_parity() {
+    using namespace gpu::encode;
+
+    std::vector<uint32_t> words;
+    auto mov_lit = [&](uint32_t vreg, uint32_t val) {
+        words.push_back(vop1(1, vreg, 255));
+        words.push_back(val);
+    };
+
+    // v0: input = -1e-10f (0xB3E533F4) -> hardware clamps to 0x3f7fffff
+    mov_lit(0, 0xAF4DF204u);
+    // v3 = v_fract_f32 v0
+    words.push_back(vop1(32, 3, 256 + 0));
+
+    // v1: 1.0f (0x3F800000), v2: 2.0f (0x40000000), v4: NaN (0x7FC00000)
+    mov_lit(1, 0x3F800000u);
+    mov_lit(2, 0x40000000u);
+    mov_lit(4, 0x7FC00000u);
+    // v5 = v_med3_f32 v1, v2, v4 -> RDNA2 hardware returns min3=1.0f (0x3F800000)
+    vop3(words, 0x151, 5, 256 + 1, 256 + 2, 256 + 4);
+
+    // v6: 0xD2F90159, v7: 28, v8: 16
+    mov_lit(6, 0xD2F90159u);
+    mov_lit(7, 28u);
+    mov_lit(8, 16u);
+    // v9 = v_bfe_i32 v6, v7, v8 -> past bit 31 sign-extends to 0xFFFFFFFD (-3)
+    vop3(words, 0x147, 9, 256 + 6, 256 + 7, 256 + 8);
+
+    // Output to g_buf0:
+    words.push_back(vop1(1, 10, 128)); // v10 = 0
+    global_mem(words, 28, 3, 10, 127, 0); // offset 0
+    global_mem(words, 28, 5, 10, 127, 4); // offset 4
+    global_mem(words, 28, 9, 10, 127, 8); // offset 8
+    words.push_back(sopp(1)); // s_endpgm
+
+    auto dec = gpu::decode_rdna2(words.data(), words.size());
+    auto ir = gpu::lift_rdna2_to_ir(dec);
+    KX_CHECK(ir.unknown_count == 0, "All VALU precision ops recognized");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.stage = gpu::ShaderStage::Compute, .wave_mode = gpu::WaveMode::Wave32, .group_size_x = 32});
+    auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    
+    KX_CHECK(compiled.has_value(), compiled.error().message);
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value(), adapters.error().message);
+
+    std::vector<uint32_t> init_buf(32, 0);
+    uint32_t roots[8]{};
+    std::vector<uint32_t> ref_output;
+
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        auto ran = gpu::run_compute_dxil_on_gpu(ad.index, compiled->dxil, init_buf, roots, 1, 1, 1);
+        KX_CHECK(ran.has_value(), ran.error().message);
+        KX_CHECK(ran->output_u32.size() >= 3, "Output buffer size check");
+
+        // 1. VFractF32 hardware clamp to 0x3F7FFFFF
+        const uint32_t got_fract = ran->output_u32[0];
+        KX_CHECK(got_fract == 0x3F7FFFFFu, std::format("GPU {} VFractF32 clamp: got 0x{:08X}", ad.name, got_fract));
+
+        // 2. VMed3F32 NaN operand -> min3 = 1.0f (0x3F800000)
+        const uint32_t got_med3 = ran->output_u32[1];
+        KX_CHECK(got_med3 == 0x3F800000u, std::format("GPU {} VMed3F32 NaN operand: got 0x{:08X}", ad.name, got_med3));
+
+        // 3. VBfeI32 past bit 31 sign-extends to 0xFFFFFFFD (-3)
+        const uint32_t got_bfe = ran->output_u32[2];
+        KX_CHECK(got_bfe == 0xFFFFFFFDu, std::format("GPU {} VBfeI32 sign-extension: got 0x{:08X}", ad.name, got_bfe));
+
+        if (ref_output.empty()) {
+            ref_output = ran->output_u32;
+        } else {
+            KX_CHECK(ref_output == ran->output_u32, "Cross-GPU bit-exact VALU precision parity");
+        }
+    }
+}
+
+void test_veh_zen2_sse4a_extrq_insertq() {
+    cpu::ScopedVehShim::reset_stats();
+
+    // 1. EXTRQ imm8, imm8: 66 0F 78 C0 10 08 (len=16, idx=8 on XMM0)
+    const uint8_t extrq_code[] = { 0x66, 0x0F, 0x78, 0xC0, 0x10, 0x08 };
+    const auto dec_extrq = cpu::decode_zen2_extension(extrq_code, sizeof(extrq_code));
+    KX_CHECK(dec_extrq.kind == cpu::Zen2Instruction::Extrq, "Decoder identifies EXTRQ");
+    KX_CHECK(dec_extrq.length == 6, "EXTRQ length is 6 bytes");
+    KX_CHECK(dec_extrq.bit_len == 16, "EXTRQ bit_len is 16");
+    KX_CHECK(dec_extrq.bit_idx == 8, "EXTRQ bit_idx is 8");
+
+    CONTEXT ctx{};
+    ctx.Xmm0.Low = 0x123456789ABCDEF0ull;
+    ctx.Xmm0.High = 0xDEADBEEFCAFEBABEull;
+    uint64_t rax = 0;
+    bool ok_extrq = cpu::emulate_zen2_instruction(dec_extrq, rax, &ctx);
+    KX_CHECK(ok_extrq, "EXTRQ emulation succeeds");
+    KX_CHECK(ctx.Xmm0.Low == 0xBCDEull, std::format("EXTRQ Low matches 0xBCDE (got 0x{:016X})", ctx.Xmm0.Low));
+    KX_CHECK(ctx.Xmm0.High == 0ull, "EXTRQ High is cleared to 0");
+
+    // 2. INSERTQ imm8, imm8: F2 0F 78 C1 18 0C (len=24, idx=12 on XMM1)
+    const uint8_t insertq_code[] = { 0xF2, 0x0F, 0x78, 0xC1, 0x18, 0x0C };
+    const auto dec_insertq = cpu::decode_zen2_extension(insertq_code, sizeof(insertq_code));
+    KX_CHECK(dec_insertq.kind == cpu::Zen2Instruction::Insertq, "Decoder identifies INSERTQ");
+    KX_CHECK(dec_insertq.length == 6, "INSERTQ length is 6 bytes");
+    KX_CHECK(dec_insertq.bit_len == 24, "INSERTQ bit_len is 24");
+    KX_CHECK(dec_insertq.bit_idx == 12, "INSERTQ bit_idx is 12");
+
+    ctx.Xmm1.Low = 0xFFFFFFFFFFFFFFFFull;
+    ctx.Xmm1.High = 0xAAAAAAAAAAAAAAAAull;
+    bool ok_insertq = cpu::emulate_zen2_instruction(dec_insertq, rax, &ctx);
+    KX_CHECK(ok_insertq, "INSERTQ emulation succeeds");
+    KX_CHECK(ctx.Xmm1.High == 0xAAAAAAAAAAAAAAAAull, "INSERTQ High remains unchanged");
+
+    const auto st = cpu::ScopedVehShim::stats();
+    KX_CHECK(st.extrq_emulated == 1, "Extrq counter incremented");
+    KX_CHECK(st.insertq_emulated == 1, "Insertq counter incremented");
+}
+
 }  // namespace
 
 int main() {
@@ -2534,6 +2698,9 @@ int main() {
     run_test("RDNA2 PBR Material Deferred GBuffer (Albedo, Normal, Material) MRT Pipeline on Dual-GPU Hardware", test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu);
     run_test("D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization", test_d3d12x_async_compute_queue_fence_sync);
     run_test("GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge", test_gameinput_force_feedback_rumble);
+    run_test("SGD5 Game Shader Container Archive Parsing & Decompression", test_sgd5_shader_archive_and_decompression);
+    run_test("RDNA2 VALU Hardware Precision Parity (NaN Med3, Fract Clamp, Signed BFE)", test_rdna2_valu_precision_parity);
+    run_test("AMD Zen 2 VEH Shim SSE4a Instruction Emulation (EXTRQ / INSERTQ on Intel & AMD)", test_veh_zen2_sse4a_extrq_insertq);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

@@ -1,20 +1,30 @@
 <div align="center">
 
-# KestrelX
+  <h1>KestrelX</h1>
 
-**Clean-Room Xbox Series X|S Native Compatibility & Dynamic RDNA2 (GFX10.3) -> SM 6.6 DXIL Shader Recompilation Runtime**
+  <p><strong>Clean-Room Xbox Series X|S Native Compatibility &amp; Dynamic RDNA2 (GFX10.3) &rarr; SM 6.6 DXIL Shader Recompilation Runtime</strong></p>
 
-[![Release: v0.6.0](https://img.shields.io/badge/Release-v0.6.0-2ea44f?style=for-the-badge)](https://github.com/Batushn/KestrelX/releases/tag/v0.6.0)
-[![Tests: 26/26 PASS](https://img.shields.io/badge/Hardware_Tests-29%2F29_PASS-brightgreen?style=for-the-badge)](#verified-hardware-test-receipts)
-[![Dual-GPU: NVIDIA + AMD](https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge)](#hardware-visual-showcase)
-[![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge)](CMakeLists.txt)
-[![D3D12 Ultimate](https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge)](docs/ARCHITECTURE.md)
-[![License: MIT](https://img.shields.io/badge/License-MIT_Clean--Room-blue?style=for-the-badge)](LICENSE)
-[![Discord: Community](https://img.shields.io/badge/Discord-Join_Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/KxsNwBwhVs)
+  <p>
+    <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.6.0"><img src="https://img.shields.io/badge/Release-v0.6.0-2ea44f?style=for-the-badge" alt="Release: v0.6.0" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-29%2F29_PASS-brightgreen?style=for-the-badge" alt="Tests: 29/29 PASS" /></a>
+    <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
+    <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
+    <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT_Clean--Room-blue?style=for-the-badge" alt="License: MIT" /></a>
+    <a href="https://discord.gg/KxsNwBwhVs"><img src="https://img.shields.io/badge/Discord-Join_Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord: Community" /></a>
+  </p>
 
-*Built from scratch in C++23 under the MIT license — zero proprietary code, zero game assets, zero cryptographic keys.*
+  <p><em>Built from scratch in C++23 under the MIT license &mdash; zero proprietary code, zero game assets, zero cryptographic keys.</em></p>
 
-[Visual Showcase](#hardware-visual-showcase) • [Progress Dashboard](#live-progress-dashboard) • [Architecture](#architecture) • [Hardware Receipts](#verified-hardware-test-receipts) • [Build & Run](#building--running) • [Discord](https://discord.gg/KxsNwBwhVs) • [Contribute](#contributing)
+  <p>
+    <a href="#hardware-visual-showcase">Visual Showcase</a> &bull;
+    <a href="#live-progress-dashboard">Progress Dashboard</a> &bull;
+    <a href="#architecture">Architecture</a> &bull;
+    <a href="#verified-hardware-test-receipts">Hardware Receipts</a> &bull;
+    <a href="#building--running">Build &amp; Run</a> &bull;
+    <a href="https://discord.gg/KxsNwBwhVs">Discord</a> &bull;
+    <a href="#contributing">Contribute</a>
+  </p>
 
 </div>
 
@@ -104,21 +114,21 @@ flowchart LR
 
 | Groundwork Component | Score | Status | Evidence & Verified Capabilities |
 | :--- | :---: | :---: | :--- |
-| **Loader & System Libraries** |  .90 | ?? Verified | PE32+ loader with recursive guest DLL mapping, base relocations, .pdata SEH via RtlAddFunctionTable, TLS callbacks, kernelx.dll (XMemAlloc/Free), xgameruntime.dll, and AMD Zen 2 VEH shim (CLZERO/MONITORX/MWAITX + SSE4a EXTRQ/INSERTQ for Intel compatibility). Compatible with game_scarlett_master.exe PE32+ structures. |
-| **Shader Translation** |  .90 | ?? Verified | Clean-room RDNA2 (GFX10.3) microcode decoder, CFG IR lifter, dual Wave32/Wave64 SM 6.6 HLSL emission, in-process DXC (dxcompiler.dll), atomic disk cache (.kxdxil), strict refusal of unhandled opcodes (Test 10), and SGD5 container archive unpacking (shaders.rpf, Test 27). |
-| **Graphics Layer** |  .85 | ?? Verified | Pure COM wrapper KxDeviceProxy (ID3D12Device -> Device10 QI), Stream PSO recomp, dedicated Async Compute command queues (D3D12_COMMAND_LIST_TYPE_COMPUTE), cross-queue fence synchronization telemetry, and Win32 WindowHost flip-model swapchain PresentX. |
-| **Proven on Test Title** |  .80 | ?? Verified | Stand-alone clean-room guest test title (kestrel_test_title.exe + kestrel_test_dll.dll linked against synthetic GDK import libraries) boots via PeLoader with d3d12_xs.dll RTV clear + PresentX; 29/29 dual-GPU bit-exact test receipts on NVIDIA RTX 4060 and AMD Radeon 780M with 0 compiler warnings. |
+| **Loader & System Libraries** | 0.90 | ✅ Verified | PE32+ loader with recursive guest DLL mapping, base relocations, .pdata SEH via RtlAddFunctionTable, TLS callbacks, kernelx.dll (XMemAlloc/Free), xgameruntime.dll, and AMD Zen 2 VEH shim (CLZERO/MONITORX/MWAITX + SSE4a EXTRQ/INSERTQ for Intel compatibility). Compatible with game_scarlett_master.exe PE32+ structures. |
+| **Shader Translation** | 0.90 | ✅ Verified | Clean-room RDNA2 (GFX10.3) microcode decoder, CFG IR lifter, dual Wave32/Wave64 SM 6.6 HLSL emission, in-process DXC (dxcompiler.dll), atomic disk cache (.kxdxil), strict refusal of unhandled opcodes (Test 10), and SGD5 container archive unpacking (shaders.rpf, Test 27). |
+| **Graphics Layer** | 0.85 | ✅ Verified | Pure COM wrapper KxDeviceProxy (ID3D12Device -> Device10 QI), Stream PSO recomp, dedicated Async Compute command queues (D3D12_COMMAND_LIST_TYPE_COMPUTE), cross-queue fence synchronization telemetry, and Win32 WindowHost flip-model swapchain PresentX. |
+| **Proven on Test Title** | 0.80 | ✅ Verified | Stand-alone clean-room guest test title (kestrel_test_title.exe + kestrel_test_dll.dll linked against synthetic GDK import libraries) boots via PeLoader with d3d12_xs.dll RTV clear + PresentX; 29/29 dual-GPU bit-exact test receipts on NVIDIA RTX 4060 and AMD Radeon 780M with 0 compiler warnings. |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A["Title Dir<br/>MicrosoftGame.config + PE32+"] --> B["PeLoader + Overlay VFS<br/>Relocs · IAT · .pdata SEH · TLS"]
+    A["Title Dir<br/>MicrosoftGame.config + PE32+"] --> B["PeLoader + Overlay VFS<br/>Relocs — •  IAT — •  .pdata SEH — •  TLS"]
     B --> C["Native x64 Execution<br/>+ VEH Zen 2 Shim<br/>(CLZERO / MONITORX / MWAITX)"]
-    C --> D["HLE Runtime<br/>kernelx (Async I/O) · xgameruntime<br/>gameinput · xaudio2 (WASAPI)"]
+    C --> D["HLE Runtime<br/>kernelx (Async I/O) — •  xgameruntime<br/>gameinput — •  xaudio2 (WASAPI)"]
     C --> E["d3d12_xs COM Proxy<br/>KxDeviceProxy (Dev1..10)<br/>KxGraphicsCommandListProxy"]
-    E --> F["RDNA2 (GFX10.3) Decoder<br/>SOP · VOP · FLAT · SMEM · DS<br/>MUBUF · MTBUF · MIMG · EXP"]
-    F --> G["CFG Basic-Block IR<br/>-> Dual-Wave SM 6.6 HLSL<br/>Wave32 (NVIDIA) · Wave64 (AMD)"]
+    E --> F["RDNA2 (GFX10.3) Decoder<br/>SOP — •  VOP — •  FLAT — •  SMEM — •  DS<br/>MUBUF — •  MTBUF — •  MIMG — •  EXP"]
+    F --> G["CFG Basic-Block IR<br/>-> Dual-Wave SM 6.6 HLSL<br/>Wave32 (NVIDIA) — •  Wave64 (AMD)"]
     G --> H["In-Process DXC + Disk Cache<br/>dxcompiler.dll <-> .kxdxil"]
     H --> I["D3D12 Ultimate GPU<br/>+ WindowHost / BMP Capture"]
 ```

@@ -1,0 +1,320 @@
+#include "kestrel/gpu/ir.hpp"
+
+#include <algorithm>
+#include <format>
+#include <set>
+#include <sstream>
+#include <unordered_map>
+
+namespace kestrel::gpu {
+
+namespace {
+
+IrOperand decode_operand(uint32_t code, bool has_lit, uint32_t lit, bool abs = false, bool neg = false) {
+    IrOperand op{};
+    op.abs = abs;
+    op.neg = neg;
+    if (code <= 105) {
+        op.kind = IrOperand::Kind::Sgpr;
+        op.reg = code;
+    } else if (code == 106 || code == 107) {
+        op.kind = IrOperand::Kind::Vcc;
+    } else if (code == 126 || code == 127) {
+        op.kind = IrOperand::Kind::Exec;
+    } else if (code >= 128 && code <= 192) {
+        op.kind = IrOperand::Kind::InlineInt;
+        op.imm_i = static_cast<int32_t>(code) - 128;
+    } else if (code >= 193 && code <= 208) {
+        op.kind = IrOperand::Kind::InlineInt;
+        op.imm_i = -(static_cast<int32_t>(code) - 192);
+    } else if (code >= 240 && code <= 248) {
+        static constexpr float kConsts[9] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f, 0.15915494f};
+        op.kind = IrOperand::Kind::InlineFloat;
+        op.imm_f = kConsts[code - 240];
+    } else if (code == 253) {
+        op.kind = IrOperand::Kind::Scc;
+    } else if (code == 255) {
+        op.kind = IrOperand::Kind::Literal;
+        op.lit_u32 = has_lit ? lit : 0u;
+    } else if (code >= 256 && code <= 511) {
+        op.kind = IrOperand::Kind::Vgpr;
+        op.reg = code - 256;
+    }
+    return op;
+}
+
+IrOperand make_sgpr(uint32_t r) {
+    IrOperand op{};
+    op.kind = IrOperand::Kind::Sgpr;
+    op.reg = r;
+    return op;
+}
+
+IrOperand make_vgpr(uint32_t r) {
+    IrOperand op{};
+    op.kind = IrOperand::Kind::Vgpr;
+    op.reg = r;
+    return op;
+}
+
+void track_regs(const IrOperand& op, uint32_t& max_v, uint32_t& max_s) {
+    if (op.kind == IrOperand::Kind::Vgpr && op.reg + 1 > max_v) max_v = op.reg + 1;
+    if (op.kind == IrOperand::Kind::Sgpr && op.reg + 1 > max_s) max_s = op.reg + 1;
+}
+
+}  // namespace
+
+IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
+    IrFunction fn{};
+    fn.inst_count = static_cast<uint32_t>(decoded.size());
+    if (decoded.empty()) return fn;
+
+    // 1. Discover basic-block leaders (entry, branch targets, fallthrough after branch/terminator)
+    std::set<uint32_t> leaders;
+    leaders.insert(decoded.front().pc);
+    std::unordered_map<uint32_t, size_t> pc_to_idx;
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        pc_to_idx[decoded[i].pc] = i;
+    }
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        const auto& d = decoded[i];
+        if (d.is_branch) {
+            if (pc_to_idx.count(d.branch_target)) leaders.insert(d.branch_target);
+            if (i + 1 < decoded.size()) leaders.insert(decoded[i + 1].pc);
+        } else if (d.is_terminator && i + 1 < decoded.size()) {
+            leaders.insert(decoded[i + 1].pc);
+        }
+    }
+
+    std::unordered_map<uint32_t, uint32_t> pc_to_block;
+    uint32_t next_id = 0;
+    for (uint32_t lpc : leaders) {
+        pc_to_block[lpc] = next_id;
+        IrBlock blk{};
+        blk.id = next_id++;
+        blk.start_pc = lpc;
+        fn.blocks.push_back(std::move(blk));
+    }
+
+    // 2. Lift instructions into their owning basic blocks
+    uint32_t cur_blk = 0;
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        const auto& d = decoded[i];
+        auto it = pc_to_block.find(d.pc);
+        if (it != pc_to_block.end()) cur_blk = it->second;
+
+        IrInst ir{};
+        ir.pc = d.pc;
+        ir.clamp = d.clamp;
+        ir.offset = d.offset;
+
+        switch (d.enc) {
+            case Encoding::SOPP:
+                if (d.mnemonic == "s_nop" || d.mnemonic == "s_waitcnt" || d.mnemonic == "s_waitcnt_vscnt" ||
+                    d.mnemonic == "s_barrier" || d.mnemonic == "s_clause") {
+                    ir.op = IrOp::Nop;
+                } else if (d.mnemonic == "s_endpgm" || d.mnemonic == "s_endpgm_saved") {
+                    ir.op = IrOp::EndPgm;
+                } else if (d.mnemonic == "s_branch") {
+                    ir.op = IrOp::Branch;
+                    ir.target_block = pc_to_block.count(d.branch_target) ? pc_to_block[d.branch_target] : 0;
+                } else if (d.mnemonic == "s_cbranch_scc0" || d.mnemonic == "s_cbranch_scc1" ||
+                           d.mnemonic == "s_cbranch_vccz" || d.mnemonic == "s_cbranch_vccnz") {
+                    ir.op = IrOp::CondBranch;
+                    ir.subop = d.mnemonic;
+                    ir.branch_on_true = (d.mnemonic == "s_cbranch_scc1" || d.mnemonic == "s_cbranch_vccnz");
+                    ir.target_block = pc_to_block.count(d.branch_target) ? pc_to_block[d.branch_target] : 0;
+                } else {
+                    ir.op = IrOp::Nop;
+                    ir.subop = d.mnemonic;
+                }
+                break;
+
+            case Encoding::SOP1:
+                ir.dst = make_sgpr(d.dst);
+                ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
+                if (d.mnemonic == "s_mov_b32") ir.op = IrOp::SMov;
+                else { ir.op = IrOp::Unknown; ir.subop = d.mnemonic; ++fn.unknown_count; }
+                break;
+
+            case Encoding::SOPK:
+                ir.dst = make_sgpr(d.dst);
+                ir.src0.kind = IrOperand::Kind::InlineInt;
+                ir.src0.imm_i = d.simm16;
+                if (d.mnemonic == "s_movk_i32") ir.op = IrOp::SMov;
+                else if (d.mnemonic == "s_addk_i32") { ir.op = IrOp::SAddU32; ir.src1 = ir.dst; }
+                else if (d.mnemonic == "s_mulk_i32") { ir.op = IrOp::SMulI32; ir.src1 = ir.dst; }
+                else { ir.op = IrOp::Unknown; ir.subop = d.mnemonic; ++fn.unknown_count; }
+                break;
+
+            case Encoding::SOP2:
+                ir.dst = make_sgpr(d.dst);
+                ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
+                ir.src1 = decode_operand(d.src1, d.has_literal, d.literal);
+                if (d.mnemonic == "s_add_u32" || d.mnemonic == "s_add_i32") ir.op = IrOp::SAddU32;
+                else if (d.mnemonic == "s_sub_u32" || d.mnemonic == "s_sub_i32") ir.op = IrOp::SSubU32;
+                else if (d.mnemonic == "s_mul_i32") ir.op = IrOp::SMulI32;
+                else if (d.mnemonic == "s_and_b32") ir.op = IrOp::SAndB32;
+                else if (d.mnemonic == "s_or_b32") ir.op = IrOp::SOrB32;
+                else if (d.mnemonic == "s_xor_b32") ir.op = IrOp::SXorB32;
+                else if (d.mnemonic == "s_lshl_b32") ir.op = IrOp::SLshlB32;
+                else if (d.mnemonic == "s_lshr_b32") ir.op = IrOp::SLshrB32;
+                else if (d.mnemonic == "s_ashr_i32") ir.op = IrOp::SAshrI32;
+                else { ir.op = IrOp::Unknown; ir.subop = d.mnemonic; ++fn.unknown_count; }
+                break;
+
+            case Encoding::SOPC:
+                ir.op = IrOp::SCmp;
+                ir.subop = d.mnemonic;
+                ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
+                ir.src1 = decode_operand(d.src1, d.has_literal, d.literal);
+                break;
+
+            case Encoding::VOP1:
+                ir.dst = make_vgpr(d.dst);
+                ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
+                if (d.mnemonic == "v_nop") ir.op = IrOp::Nop;
+                else if (d.mnemonic == "v_mov_b32") ir.op = IrOp::VMov;
+                else if (d.mnemonic == "v_cvt_f32_i32") ir.op = IrOp::VCvtF32I32;
+                else if (d.mnemonic == "v_cvt_f32_u32") ir.op = IrOp::VCvtF32U32;
+                else if (d.mnemonic == "v_cvt_i32_f32") ir.op = IrOp::VCvtI32F32;
+                else if (d.mnemonic == "v_cvt_u32_f32") ir.op = IrOp::VCvtU32F32;
+                else if (d.mnemonic == "v_rcp_f32") ir.op = IrOp::VRcpF32;
+                else if (d.mnemonic == "v_rsq_f32") ir.op = IrOp::VRsqF32;
+                else if (d.mnemonic == "v_sqrt_f32") ir.op = IrOp::VSqrtF32;
+                else if (d.mnemonic == "v_floor_f32") ir.op = IrOp::VFloorF32;
+                else if (d.mnemonic == "v_ceil_f32") ir.op = IrOp::VCeilF32;
+                else if (d.mnemonic == "v_fract_f32") ir.op = IrOp::VFractF32;
+                else { ir.op = IrOp::Unknown; ir.subop = d.mnemonic; ++fn.unknown_count; }
+                break;
+
+            case Encoding::VOP2:
+                ir.dst = make_vgpr(d.dst);
+                ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
+                ir.src1 = decode_operand(d.src1, d.has_literal, d.literal);
+                if (d.mnemonic == "v_add_f32") ir.op = IrOp::VAddF32;
+                else if (d.mnemonic == "v_sub_f32") ir.op = IrOp::VSubF32;
+                else if (d.mnemonic == "v_subrev_f32") ir.op = IrOp::VSubRevF32;
+                else if (d.mnemonic == "v_mul_f32") ir.op = IrOp::VMulF32;
+                else if (d.mnemonic == "v_min_f32") ir.op = IrOp::VMinF32;
+                else if (d.mnemonic == "v_max_f32") ir.op = IrOp::VMaxF32;
+                else if (d.mnemonic == "v_add_nc_u32") ir.op = IrOp::VAddU32;
+                else if (d.mnemonic == "v_sub_nc_u32") ir.op = IrOp::VSubU32;
+                else if (d.mnemonic == "v_and_b32") ir.op = IrOp::VAndB32;
+                else if (d.mnemonic == "v_or_b32") ir.op = IrOp::VOrB32;
+                else if (d.mnemonic == "v_xor_b32") ir.op = IrOp::VXorB32;
+                else if (d.mnemonic == "v_lshlrev_b32") ir.op = IrOp::VLshlRevB32;
+                else if (d.mnemonic == "v_lshrrev_b32") ir.op = IrOp::VLshrRevB32;
+                else if (d.mnemonic == "v_ashrrev_i32") ir.op = IrOp::VAshrRevI32;
+                else if (d.mnemonic == "v_fmac_f32") { ir.op = IrOp::VFmaF32; ir.src2 = ir.dst; }
+                else if (d.mnemonic == "v_fmaak_f32") {
+                    ir.op = IrOp::VFmaF32;
+                    ir.src2.kind = IrOperand::Kind::Literal;
+                    ir.src2.lit_u32 = d.literal;
+                } else if (d.mnemonic == "v_fmamk_f32") {
+                    ir.op = IrOp::VFmaF32;
+                    ir.src2 = ir.src1;
+                    ir.src1.kind = IrOperand::Kind::Literal;
+                    ir.src1.lit_u32 = d.literal;
+                } else if (d.mnemonic == "v_cndmask_b32") {
+                    ir.op = IrOp::VCndMask;
+                } else {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
+                }
+                break;
+
+            case Encoding::VOPC:
+                ir.op = IrOp::VCmp;
+                ir.subop = d.mnemonic;
+                ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
+                ir.src1 = decode_operand(d.src1, d.has_literal, d.literal);
+                break;
+
+            case Encoding::VOP3:
+                ir.dst = make_vgpr(d.dst);
+                ir.src0 = decode_operand(d.src0, d.has_literal, d.literal, (d.abs_mask & 1) != 0, (d.neg_mask & 1) != 0);
+                ir.src1 = decode_operand(d.src1, d.has_literal, d.literal, (d.abs_mask & 2) != 0, (d.neg_mask & 2) != 0);
+                ir.src2 = decode_operand(d.src2, d.has_literal, d.literal, (d.abs_mask & 4) != 0, (d.neg_mask & 4) != 0);
+                if (d.mnemonic == "v_fma_f32" || d.mnemonic == "v_mad_f32") ir.op = IrOp::VFmaF32;
+                else if (d.mnemonic == "v_mul_lo_u32") ir.op = IrOp::VMulLoU32;
+                else if (d.mnemonic == "v_add_nc_u32") ir.op = IrOp::VAddU32;
+                else if (d.mnemonic == "v_sub_nc_u32") ir.op = IrOp::VSubU32;
+                else if (d.mnemonic == "v_lshlrev_b32") ir.op = IrOp::VLshlRevB32;
+                else if (d.mnemonic == "v_lshrrev_b32") ir.op = IrOp::VLshrRevB32;
+                else if (d.mnemonic == "v_min_f32") ir.op = IrOp::VMinF32;
+                else if (d.mnemonic == "v_max_f32") ir.op = IrOp::VMaxF32;
+                else if (d.mnemonic == "v_cndmask_b32") ir.op = IrOp::VCndMask;
+                else { ir.op = IrOp::Unknown; ir.subop = d.mnemonic; ++fn.unknown_count; }
+                break;
+
+            case Encoding::FLAT:
+                if (d.mnemonic == "global_load_dword") {
+                    ir.op = IrOp::GlobalLoadDword;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                } else if (d.mnemonic == "global_store_dword") {
+                    ir.op = IrOp::GlobalStoreDword;
+                    ir.src0 = make_vgpr(d.src0);  // addr
+                    ir.src1 = make_vgpr(d.src1);  // data
+                } else {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
+                }
+                break;
+
+            default:
+                ir.op = IrOp::Unknown;
+                ir.subop = d.mnemonic;
+                ++fn.unknown_count;
+                break;
+        }
+
+        track_regs(ir.dst, fn.max_vgpr, fn.max_sgpr);
+        track_regs(ir.src0, fn.max_vgpr, fn.max_sgpr);
+        track_regs(ir.src1, fn.max_vgpr, fn.max_sgpr);
+        track_regs(ir.src2, fn.max_vgpr, fn.max_sgpr);
+
+        fn.blocks[cur_blk].insts.push_back(std::move(ir));
+        fn.blocks[cur_blk].end_pc = d.pc + d.size;
+    }
+
+    // 3. Build CFG successor / predecessor edges
+    for (uint32_t b = 0; b < fn.blocks.size(); ++b) {
+        auto& blk = fn.blocks[b];
+        if (blk.insts.empty()) continue;
+        const auto& last = blk.insts.back();
+        if (last.op == IrOp::EndPgm) {
+            continue;
+        } else if (last.op == IrOp::Branch) {
+            blk.successors.push_back(last.target_block);
+        } else if (last.op == IrOp::CondBranch) {
+            blk.successors.push_back(last.target_block);
+            if (b + 1 < fn.blocks.size()) blk.successors.push_back(b + 1);
+        } else if (b + 1 < fn.blocks.size()) {
+            blk.successors.push_back(b + 1);
+        }
+        for (uint32_t succ : blk.successors) {
+            if (succ < fn.blocks.size()) fn.blocks[succ].predecessors.push_back(b);
+        }
+    }
+
+    return fn;
+}
+
+std::string dump_ir(const IrFunction& fn) {
+    std::ostringstream oss;
+    oss << std::format("; KestrelX IR: {} blocks, {} insts, max_v={}, max_s={}\n",
+                       fn.blocks.size(), fn.inst_count, fn.max_vgpr, fn.max_sgpr);
+    for (const auto& b : fn.blocks) {
+        oss << std::format("bb_{} [pc={:#x}..{:#x}]:\n", b.id, b.start_pc, b.end_pc);
+        for (const auto& inst : b.insts) {
+            oss << std::format("  {:#06x}: op={} {}\n", inst.pc, static_cast<int>(inst.op), inst.subop);
+        }
+    }
+    return oss.str();
+}
+
+}  // namespace kestrel::gpu

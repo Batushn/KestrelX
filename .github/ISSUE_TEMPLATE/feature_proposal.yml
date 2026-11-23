@@ -1,0 +1,25 @@
+name: Feature / Subsystem Proposal
+description: Propose a new HLE API, RDNA2 opcode group, IR pass, or D3D12.X proxy feature
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Subsystem
+      options:
+        - PE Loader / Manifest
+        - CPU VEH Shim
+        - Overlay VFS
+        - HLE (kernelx / xgameruntime / audio / input)
+        - D3D12.X COM Proxy
+        - RDNA2 Decoder / IR / HLSL Recompiler
+        - GFX10 Texture Tiling
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Technical Proposal
+      description: Describe the API/opcode semantics, clean-room test plan, and public references.
+    validations:
+      required: true

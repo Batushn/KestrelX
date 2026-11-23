@@ -1,0 +1,28 @@
+name: Bug Report
+description: Report a bug in KestrelX (loader, VFS, VEH shim, HLE, or RDNA2 shader pipeline)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "**Reminder:** Do not attach copyrighted game binaries, keys, or retail dumps."
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Concise description of the issue and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Hardware & Environment
+      description: Output of `kestrel.exe adapters`, CPU model, Windows version, and MSVC/SDK version.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction Steps
+      description: Commands or minimal clean-room test case to reproduce.
+    validations:
+      required: true

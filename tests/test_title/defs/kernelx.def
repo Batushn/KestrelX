@@ -1,0 +1,8 @@
+LIBRARY kernelx
+EXPORTS
+    XMemAlloc
+    XMemFree
+    XMemSize
+    TitleMemoryStatus
+    GetConsoleType
+    CreateFileA

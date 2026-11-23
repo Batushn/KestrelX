@@ -1,0 +1,8 @@
+LIBRARY xgameruntime
+EXPORTS
+    XGameGetXboxTitleId
+    XSystemGetDeviceType
+    XTaskQueueCreate
+    XTaskQueueSubmitCallback
+    XTaskQueueDispatch
+    XTaskQueueCloseHandle

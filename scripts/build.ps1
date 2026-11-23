@@ -11,8 +11,44 @@ $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Compon
 if (-not $vsPath) { throw "Visual Studio 2022 C++ x64 build tools not found." }
 
 $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
-$cmake = Join-Path $vsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-$ninja = Join-Path $vsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+
+function Resolve-Tool {
+    param(
+        [string]$Name,
+        [string[]]$Candidates
+    )
+    foreach ($candidate in $Candidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            return $candidate
+        }
+    }
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        return $cmd.Source
+    }
+    return $null
+}
+
+$cmake = Resolve-Tool -Name "cmake" -Candidates @(
+    (Join-Path $vsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"),
+    "$env:ProgramFiles\CMake\bin\cmake.exe",
+    "${env:ProgramFiles(x86)}\CMake\bin\cmake.exe",
+    "$env:LOCALAPPDATA\Microsoft\WinGet\Links\cmake.exe"
+)
+if (-not $cmake) {
+    throw "cmake.exe not found in Visual Studio CommonExtensions, PATH, or standard install paths. Install CMake (e.g. 'winget install Kitware.CMake' or VS C++ CMake tools)."
+}
+
+$ninja = Resolve-Tool -Name "ninja" -Candidates @(
+    (Join-Path $vsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"),
+    "$env:LOCALAPPDATA\Microsoft\WinGet\Links\ninja.exe",
+    "$env:ProgramFiles\Ninja\ninja.exe",
+    "C:\ProgramData\chocolatey\bin\ninja.exe"
+)
+if (-not $ninja) {
+    throw "ninja.exe not found in Visual Studio CommonExtensions, PATH, or standard install paths. Install Ninja (e.g. 'winget install Ninja-build.Ninja' or VS C++ CMake tools)."
+}
+
 $buildDir = Join-Path $root "build\$Config"
 
 $cmd = "`"$vcvars`" >nul && `"$cmake`" -S `"$root`" -B `"$buildDir`" -G Ninja -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=$Config && `"$cmake`" --build `"$buildDir`""

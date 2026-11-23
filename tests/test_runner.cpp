@@ -43,6 +43,8 @@ namespace {
 
 int g_passed = 0;
 int g_failed = 0;
+int g_skipped = 0;
+bool g_unit_only = false;
 
 #define KX_CHECK(cond, msg)                                                   \
     do {                                                                      \
@@ -61,6 +63,16 @@ void run_test(const char* name, Fn&& fn) {
         std::cerr << std::format("  [FAIL] {} -> {}\n", name, e.what()) << std::flush;
         ++g_failed;
     }
+}
+
+template <typename Fn>
+void run_hw_test(const char* name, Fn&& fn) {
+    if (g_unit_only) {
+        std::cout << std::format("  [SKIP] {} (--unit-only)\n", name) << std::flush;
+        ++g_skipped;
+        return;
+    }
+    run_test(name, std::forward<Fn>(fn));
 }
 
 void test_game_config_parser() {
@@ -1550,7 +1562,6 @@ void test_rdna2_depth_buffered_3d_cube_dual_gpu() {
     int hw_verified = 0;
     uint32_t ref_cube_pixels = 0;
     const char* capture_env = std::getenv("KESTREL_CAPTURE_CUBE_BMP");
-    fs::path capture_path = capture_env ? fs::path(capture_env) : (fs::current_path() / "docs" / "cube_3d.bmp");
 
     for (const auto& ad : *adapters) {
         if (ad.is_software) continue;
@@ -1781,10 +1792,16 @@ void test_rdna2_depth_buffered_3d_cube_dual_gpu() {
         WaitForSingleObject(ev, 5000);
         CloseHandle(ev);
 
-        // Capture BMP screenshot on first GPU
-        if (hw_verified == 0) {
-            std::error_code ec;
-            fs::create_directories(capture_path.parent_path(), ec);
+        // Capture BMP screenshot on first GPU only when explicitly requested
+        if (capture_env && capture_env[0] != '\0' && hw_verified == 0) {
+            const fs::path capture_path =
+                (std::string_view(capture_env) == "1" || std::string_view(capture_env) == "true")
+                    ? (fs::current_path() / "docs" / "cube_3d.bmp")
+                    : fs::path(capture_env);
+            if (!capture_path.parent_path().empty()) {
+                std::error_code ec;
+                fs::create_directories(capture_path.parent_path(), ec);
+            }
             (void)hle::capture_d3d12_texture_bmp(dev, queue, rt, D3D12_RESOURCE_STATE_COPY_SOURCE, capture_path);
         }
 
@@ -2361,8 +2378,9 @@ void test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu() {
         KX_CHECK(std::abs(static_cast<int>(pMaterial[center + 1]) - 51) <= 1, "Roughness channel ~51");
         KX_CHECK(pMaterial[center + 2] == 255, "AO channel 255");
 
-        // Export PBR GBuffer composite image to docs/pbr_mrt.bmp
-        if (verified == 0) {
+        // Export PBR GBuffer composite image only when explicitly requested
+        const char* mrt_capture_env = std::getenv("KESTREL_CAPTURE_MRT_BMP");
+        if (mrt_capture_env && mrt_capture_env[0] != '\0' && verified == 0) {
             std::vector<uint8_t> composite(kW * 3 * kH * 4);
             for (uint32_t y = 0; y < kH; ++y) {
                 for (uint32_t x = 0; x < kW; ++x) {
@@ -2387,7 +2405,15 @@ void test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu() {
                     composite[d2 + 3] = 255;
                 }
             }
-            save_bmp_rgba("docs/pbr_mrt.bmp", kW * 3, kH, composite.data());
+            const fs::path mrt_capture_path =
+                (std::string_view(mrt_capture_env) == "1" || std::string_view(mrt_capture_env) == "true")
+                    ? (fs::current_path() / "docs" / "pbr_mrt.bmp")
+                    : fs::path(mrt_capture_env);
+            if (!mrt_capture_path.parent_path().empty()) {
+                std::error_code ec;
+                fs::create_directories(mrt_capture_path.parent_path(), ec);
+            }
+            save_bmp_rgba(mrt_capture_path, kW * 3, kH, composite.data());
         }
 
         rbs[0]->Unmap(0, nullptr);
@@ -3341,19 +3367,28 @@ void test_gameinput_hotplug_callbacks_and_telemetry() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--unit-only") {
+            g_unit_only = true;
+        }
+    }
+
     std::cout << "KestrelX Verification Suite\n";
     std::cout << "===========================\n";
+    if (g_unit_only) {
+        std::cout << "(--unit-only: skipping D3D12 hardware GPU execution tests)\n";
+    }
 
     run_test("MicrosoftGame.config XML parser", test_game_config_parser);
     run_test("Overlay VFS copy-on-write, whiteouts & path-traversal rejection", test_overlay_vfs_cow_and_security);
     run_test("VEH AMD Zen 2 instruction decoder & emulator (CLZERO/MONITORX/MWAITX)", test_veh_zen2_decode_and_emulate);
     run_test("RDNA2 (GFX10.3) decoder, CFG IR lifter & dual Wave32/Wave64 HLSL emission", test_rdna2_decoder_and_ir_cfg);
     run_test("In-process DXC SM 6.6 compilation & DXBC/DXIL container verification", test_dxbc_container_and_dxc_compile);
-    run_test("End-to-end RDNA2 -> IR -> HLSL -> DXC -> Real Dual-GPU Hardware Execution", test_rdna2_recomp_real_dual_gpu_execution);
-    run_test("RDNA2 SMEM + DS (LDS) + s_barrier Workgroup Shuffle on Dual-GPU Hardware", test_rdna2_smem_lds_barrier_dual_gpu);
+    run_hw_test("End-to-end RDNA2 -> IR -> HLSL -> DXC -> Real Dual-GPU Hardware Execution", test_rdna2_recomp_real_dual_gpu_execution);
+    run_hw_test("RDNA2 SMEM + DS (LDS) + s_barrier Workgroup Shuffle on Dual-GPU Hardware", test_rdna2_smem_lds_barrier_dual_gpu);
     run_test("RDNA2 EXP Vertex & Pixel (vs_6_6 / ps_6_6) Decode, IR Lift & DXC Compile", test_rdna2_exp_vs_ps_compile);
-    run_test("RDNA2 MUBUF/MTBUF + MIMG (image_sample) Textured Quad on Dual-GPU Hardware", test_rdna2_mubuf_mimg_textured_quad_dual_gpu);
+    run_hw_test("RDNA2 MUBUF/MTBUF + MIMG (image_sample) Textured Quad on Dual-GPU Hardware", test_rdna2_mubuf_mimg_textured_quad_dual_gpu);
     run_test("Strict recompiler refusal of unsupported RDNA2 opcodes", test_strict_unsupported_opcode_refusal);
     run_test("Persistent on-disk DXIL shader cache & corruption recovery", test_persistent_disk_shader_cache);
     run_test("D3D12.X ID3D12Device1..10 QI, Stream PSO Recomp & CmdListProxy Telemetry", test_d3d12_device_qi_stream_pso_and_cmdlist_telemetry);
@@ -3363,22 +3398,27 @@ int main() {
     run_test("XAudio2 stereo PCM ring-buffer, RMS energy & underrun verification", test_xaudio2_pcm_ring_buffer);
     run_test("KernelX CreateFile2/ReadFileEx Async VFS I/O & WASAPI Thread Lifecycle", test_kernelx_async_io_and_wasapi_lifecycle);
     run_test("End-to-end PE32+ Loader + Guest DLL + Wide-VFS + GameInput + XAudio2 + RDNA2 VS/PS First Light", test_end_to_end_pe_loader_guest_title);
-    run_test("RDNA2 Wave Intrinsics (WaveReadLaneFirst/At, WavePrefixCountBits, Ballot) on Dual-GPU Hardware", test_rdna2_wave_intrinsics_dual_gpu);
+    run_hw_test("RDNA2 Wave Intrinsics (WaveReadLaneFirst/At, WavePrefixCountBits, Ballot) on Dual-GPU Hardware", test_rdna2_wave_intrinsics_dual_gpu);
     run_test("RDNA2 Multi-Texture & Multi-Buffer Dynamic Descriptor Remapping", test_rdna2_multi_texture_multi_buffer_descriptor_remapping);
-    run_test("RDNA2 Depth-Buffered 3D Lit & Textured Perspective Cube on Dual-GPU Hardware", test_rdna2_depth_buffered_3d_cube_dual_gpu);
+    run_hw_test("RDNA2 Depth-Buffered 3D Lit & Textured Perspective Cube on Dual-GPU Hardware", test_rdna2_depth_buffered_3d_cube_dual_gpu);
     run_test("GDK XUser/XStore/XPackage & DirectStorage VFS Async Bridge", test_gdk_runtime_and_directstorage_bridge);
-    run_test("RDNA2 2D/3D Compute Workgroup Tiling & LDS Spatial Exchange on Dual-GPU Hardware", test_rdna2_compute_2d_workgroup_tiling_dual_gpu);
-    run_test("RDNA2 PBR Material Deferred GBuffer (Albedo, Normal, Material) MRT Pipeline on Dual-GPU Hardware", test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu);
+    run_hw_test("RDNA2 2D/3D Compute Workgroup Tiling & LDS Spatial Exchange on Dual-GPU Hardware", test_rdna2_compute_2d_workgroup_tiling_dual_gpu);
+    run_hw_test("RDNA2 PBR Material Deferred GBuffer (Albedo, Normal, Material) MRT Pipeline on Dual-GPU Hardware", test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu);
     run_test("D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization", test_d3d12x_async_compute_queue_fence_sync);
     run_test("GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge", test_gameinput_force_feedback_rumble);
     run_test("SGD5 Game Shader Container Archive Parsing & Decompression", test_sgd5_shader_archive_and_decompression);
-    run_test("RDNA2 VALU Hardware Precision Parity (NaN Med3, Fract Clamp, Signed BFE)", test_rdna2_valu_precision_parity);
+    run_hw_test("RDNA2 VALU Hardware Precision Parity (NaN Med3, Fract Clamp, Signed BFE)", test_rdna2_valu_precision_parity);
     run_test("AMD Zen 2 VEH Shim SSE4a Instruction Emulation (EXTRQ / INSERTQ on Intel & AMD)", test_veh_zen2_sse4a_extrq_insertq);
     run_test("RDNA2 VRS Tier 2 Rate/Tile Encode-Decode, Combiners & Shading Rate Image Builder", test_vrs_tier2_encode_decode_combiners_and_image);
-    run_test("D3D12.X ID3D12GraphicsCommandList5 VRS Tier 2 Hardware Render & Telemetry", test_vrs_tier2_hardware_render_and_proxy_telemetry);
+    run_hw_test("D3D12.X ID3D12GraphicsCommandList5 VRS Tier 2 Hardware Render & Telemetry", test_vrs_tier2_hardware_render_and_proxy_telemetry);
     run_test("GameInput Multi-Controller Slot Management (0..3) & Rumble Isolation", test_gameinput_multi_controller_slots_and_rumble);
     run_test("GameInput Device Hotplug Callbacks, Re-Entrancy & Telemetry", test_gameinput_hotplug_callbacks_and_telemetry);
 
-    std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
+    if (g_skipped > 0) {
+        std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",
+                                 g_passed, g_failed, g_skipped);
+    } else {
+        std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
+    }
     return g_failed == 0 ? 0 : 1;
 }

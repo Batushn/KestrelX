@@ -159,6 +159,37 @@ BOOL __stdcall kx_GetFileAttributesExW(LPCWSTR filename, GET_FILEEX_INFO_LEVELS 
     return GetFileAttributesExW(filename, level, info);
 }
 
+HANDLE __stdcall kx_CreateFile2(
+    LPCWSTR filename, DWORD access, DWORD share, DWORD disp, LPCREATEFILE2_EXTENDED_PARAMETERS ext) {
+    {
+        std::lock_guard lock(g_mem_mtx);
+        ++g_stats.create_file2_calls;
+    }
+    if (g_vfs && filename) {
+        const std::string utf8 = wide_to_utf8(filename);
+        auto resolved = g_vfs->resolve(utf8, is_write_open(access, disp));
+        if (resolved) {
+            return CreateFile2(resolved->c_str(), access, share, disp, ext);
+        }
+        if (utf8.find(':') != std::string::npos) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    return CreateFile2(filename, access, share, disp, ext);
+}
+
+BOOL __stdcall kx_ReadFileEx(
+    HANDLE file, LPVOID buffer, DWORD bytes_to_read,
+    LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE completion) {
+    const BOOL ok = ReadFileEx(file, buffer, bytes_to_read, overlapped, completion);
+    if (ok) {
+        std::lock_guard lock(g_mem_mtx);
+        ++g_stats.async_reads;
+    }
+    return ok;
+}
+
 }  // namespace
 
 void set_kernelx_vfs(vfs::OverlayVfs* vfs) { g_vfs = vfs; }
@@ -173,6 +204,8 @@ void register_kernelx(Registry& reg) {
     reg.register_export("kernelx.dll", "GetConsoleType", reinterpret_cast<void*>(&kx_GetConsoleType));
     reg.register_export("kernelx.dll", "CreateFileA", reinterpret_cast<void*>(&kx_CreateFileA));
     reg.register_export("kernelx.dll", "CreateFileW", reinterpret_cast<void*>(&kx_CreateFileW));
+    reg.register_export("kernelx.dll", "CreateFile2", reinterpret_cast<void*>(&kx_CreateFile2));
+    reg.register_export("kernelx.dll", "ReadFileEx", reinterpret_cast<void*>(&kx_ReadFileEx));
     reg.register_export("kernelx.dll", "DeleteFileA", reinterpret_cast<void*>(&kx_DeleteFileA));
     reg.register_export("kernelx.dll", "DeleteFileW", reinterpret_cast<void*>(&kx_DeleteFileW));
     reg.register_export("kernelx.dll", "GetFileAttributesExW", reinterpret_cast<void*>(&kx_GetFileAttributesExW));

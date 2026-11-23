@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(KestrelX VERSION 0.3.0 LANGUAGES CXX)
+project(KestrelX VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,6 +37,7 @@ add_library(kestrel_core STATIC
     src/hle/xaudio2.cpp
     src/gpu/rdna2_isa.cpp
     src/gpu/shader_container.cpp
+    src/gpu/shader_cache.cpp
     src/gpu/ir.cpp
     src/gpu/rdna2_recomp.cpp
     src/gpu/dxc_compiler.cpp

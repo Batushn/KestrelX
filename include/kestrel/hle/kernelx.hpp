@@ -12,6 +12,8 @@ struct KernelXStats {
     uint64_t free_count = 0;
     uint64_t live_bytes = 0;
     uint64_t peak_bytes = 0;
+    uint64_t create_file2_calls = 0;
+    uint64_t async_reads = 0;
 };
 
 void set_kernelx_vfs(vfs::OverlayVfs* vfs);

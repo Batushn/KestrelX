@@ -52,10 +52,19 @@ enum class IrOp : uint8_t {
     VFractF32,
     VCmp,
     VCndMask,
-    // Memory, LDS & Graphics Export
+    // Memory, Buffer, Texture, LDS & Graphics Export
     SLoadDword,
     GlobalLoadDword,
     GlobalStoreDword,
+    BufferLoadDword,
+    BufferLoadDwordx2,
+    BufferLoadDwordx4,
+    BufferStoreDword,
+    BufferStoreDwordx2,
+    BufferStoreDwordx4,
+    ImageSample,
+    ImageLoad,
+    ImageGetResInfo,
     DsReadB32,
     DsWriteB32,
     Barrier,
@@ -100,6 +109,7 @@ struct IrInst {
     uint32_t offset = 0;
     uint8_t exp_target = 0;
     uint8_t exp_en = 0;
+    uint8_t dmask = 0xFu;
     bool exp_done = false;
     bool clamp = false;
     uint32_t target_block = 0;
@@ -123,6 +133,8 @@ struct IrFunction {
     uint32_t unknown_count = 0;
     bool uses_lds = false;
     bool uses_mem = false;
+    bool uses_buf_srv = false;
+    bool uses_tex = false;
 };
 
 IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded);

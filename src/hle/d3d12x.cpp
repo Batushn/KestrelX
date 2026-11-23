@@ -4,6 +4,7 @@
 #include "kestrel/gpu/ir.hpp"
 #include "kestrel/gpu/rdna2_isa.hpp"
 #include "kestrel/gpu/rdna2_recomp.hpp"
+#include "kestrel/gpu/shader_cache.hpp"
 
 #include <dxgi1_6.h>
 #include <atomic>
@@ -17,10 +18,17 @@ namespace kestrel::hle {
 
 namespace {
 
+// Private internal IID used to safely unwrap KxGraphicsCommandListProxy inside ExecuteCommandLists
+// {9E1B5E73-8F24-4B9E-9A5E-4C12D30F1201}
+constexpr GUID kIID_KxGraphicsCommandListProxy = {
+    0x9e1b5e73, 0x8f24, 0x4b9e, {0x9a, 0x5e, 0x4c, 0x12, 0xd3, 0x0f, 0x12, 0x01}};
+
 std::atomic<int> g_preferred_adapter{-1};
 std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0},
     g_zero_mem{0}, g_presents{0}, g_pso_recomp{0}, g_pso_cache_hits{0},
-    g_gfx_pso_recomp{0}, g_gfx_pso_cache_hits{0};
+    g_gfx_pso_recomp{0}, g_gfx_pso_cache_hits{0}, g_stream_pso_recomp{0},
+    g_disk_cache_hits{0}, g_disk_cache_misses{0}, g_device_qi_upgrades{0},
+    g_draw_calls{0}, g_dispatch_calls{0}, g_barrier_calls{0}, g_pso_binds{0};
 
 std::mutex g_present_mtx;
 bool g_windowed = false;
@@ -31,16 +39,47 @@ std::unique_ptr<WindowHost> g_window_host;
 
 std::mutex g_shader_cache_mtx;
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_dxil_cache;
+gpu::DiskShaderCache g_disk_cache;
 gpu::DxcCompiler g_dxc;
 bool g_dxc_ready = false;
 
-uint64_t fnv1a_64(const uint8_t* data, size_t len, uint64_t seed = 14695981039346656037ull) {
-    uint64_t h = seed;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= data[i];
-        h *= 1099511628211ull;
+template <typename T>
+constexpr size_t subobj_aligned_size() {
+    constexpr size_t header = sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE);
+    constexpr size_t payload_off = (header + alignof(T) - 1) & ~(alignof(T) - 1);
+    constexpr size_t end_off = payload_off + sizeof(T);
+    return (end_off + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
+}
+
+size_t subobject_stride(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
+    switch (type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: return subobj_aligned_size<ID3D12RootSignature*>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: return subobj_aligned_size<D3D12_SHADER_BYTECODE>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: return subobj_aligned_size<D3D12_STREAM_OUTPUT_DESC>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: return subobj_aligned_size<D3D12_BLEND_DESC>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: return subobj_aligned_size<UINT>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: return subobj_aligned_size<D3D12_RASTERIZER_DESC>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: return subobj_aligned_size<D3D12_DEPTH_STENCIL_DESC>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: return subobj_aligned_size<D3D12_INPUT_LAYOUT_DESC>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: return subobj_aligned_size<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: return subobj_aligned_size<D3D12_PRIMITIVE_TOPOLOGY_TYPE>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: return subobj_aligned_size<D3D12_RT_FORMAT_ARRAY>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: return subobj_aligned_size<DXGI_FORMAT>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: return subobj_aligned_size<DXGI_SAMPLE_DESC>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: return subobj_aligned_size<UINT>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: return subobj_aligned_size<D3D12_CACHED_PIPELINE_STATE>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: return subobj_aligned_size<D3D12_PIPELINE_STATE_FLAGS>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: return subobj_aligned_size<D3D12_DEPTH_STENCIL_DESC1>();
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: return subobj_aligned_size<D3D12_VIEW_INSTANCING_DESC>();
+        default: return 0;
     }
-    return h;
 }
 
 // Clean-room native RDNA2 container headers:
@@ -69,11 +108,11 @@ bool try_recompile_kestrel_rdna2(
     if (code_bytes == 0 || (code_bytes % 4) != 0) return false;
 
     const gpu::WaveMode wave = prefer_wave64 ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
-    const uint64_t seed = (static_cast<uint64_t>(expected_stage) << 8) | static_cast<uint64_t>(wave);
-    const uint64_t cache_key = fnv1a_64(bytes, length, seed);
+    const uint64_t cache_key = gpu::DiskShaderCache::make_key(expected_stage, wave, group_x, bytes, length);
 
     {
         std::lock_guard lock(g_shader_cache_mtx);
+        // 1. Check in-memory DXIL cache
         auto it = g_dxil_cache.find(cache_key);
         if (it != g_dxil_cache.end()) {
             out_dxil = it->second;
@@ -82,6 +121,18 @@ bool try_recompile_kestrel_rdna2(
             else g_gfx_pso_cache_hits.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
+        // 2. Check persistent on-disk DXIL shader cache
+        std::vector<uint8_t> disk_dxil;
+        if (g_disk_cache.load(cache_key, disk_dxil)) {
+            g_disk_cache_hits.fetch_add(1, std::memory_order_relaxed);
+            g_dxil_cache[cache_key] = disk_dxil;
+            out_dxil = std::move(disk_dxil);
+            out_cache_hit = true;
+            if (expected_stage == gpu::ShaderStage::Compute) g_pso_cache_hits.fetch_add(1, std::memory_order_relaxed);
+            else g_gfx_pso_cache_hits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        g_disk_cache_misses.fetch_add(1, std::memory_order_relaxed);
         if (!g_dxc_ready) {
             if (!g_dxc.initialize()) return false;
             g_dxc_ready = true;
@@ -104,6 +155,7 @@ bool try_recompile_kestrel_rdna2(
 
     {
         std::lock_guard lock(g_shader_cache_mtx);
+        (void)g_disk_cache.store(cache_key, compiled->dxil);
         g_dxil_cache[cache_key] = compiled->dxil;
     }
     out_dxil = std::move(compiled->dxil);
@@ -226,6 +278,123 @@ HRESULT __stdcall kx_D3D12WaitFrameEventX(uint64_t, uint32_t, void*) {
 
 }  // namespace
 
+// ---- KxGraphicsCommandListProxy ----
+
+KxGraphicsCommandListProxy::KxGraphicsCommandListProxy(ID3D12GraphicsCommandList* inner) : inner_(inner) {
+    if (inner_) inner_->AddRef();
+}
+KxGraphicsCommandListProxy::~KxGraphicsCommandListProxy() {
+    if (inner_) { inner_->Release(); inner_ = nullptr; }
+}
+
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::QueryInterface(REFIID riid, void** ppv) {
+    if (!ppv) return E_POINTER;
+    if (riid == kIID_KxGraphicsCommandListProxy) {
+        *ppv = this;
+        AddRef();
+        return S_OK;
+    }
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
+        riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12CommandList) ||
+        riid == __uuidof(ID3D12GraphicsCommandList)) {
+        *ppv = static_cast<ID3D12GraphicsCommandList*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return inner_->QueryInterface(riid, ppv);
+}
+
+ULONG STDMETHODCALLTYPE KxGraphicsCommandListProxy::AddRef() { return ref_.fetch_add(1, std::memory_order_relaxed) + 1; }
+ULONG STDMETHODCALLTYPE KxGraphicsCommandListProxy::Release() {
+    const ULONG next = ref_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (next == 0) delete this;
+    return next;
+}
+
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::GetPrivateData(REFGUID g, UINT* s, void* d) { return inner_->GetPrivateData(g, s, d); }
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetPrivateData(REFGUID g, UINT s, const void* d) { return inner_->SetPrivateData(g, s, d); }
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetPrivateDataInterface(REFGUID g, const IUnknown* d) { return inner_->SetPrivateDataInterface(g, d); }
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetName(LPCWSTR n) { return inner_->SetName(n); }
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::GetDevice(REFIID r, void** o) { return inner_->GetDevice(r, o); }
+D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE KxGraphicsCommandListProxy::GetType() { return inner_->GetType(); }
+
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::Close() { return inner_->Close(); }
+HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) { return inner_->Reset(a, p); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ClearState(ID3D12PipelineState* p) { inner_->ClearState(p); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::DrawInstanced(UINT vc, UINT ic, UINT sv, UINT si) {
+    g_draw_calls.fetch_add(1, std::memory_order_relaxed);
+    inner_->DrawInstanced(vc, ic, sv, si);
+}
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::DrawIndexedInstanced(UINT ixc, UINT ic, UINT si, INT bv, UINT st) {
+    g_draw_calls.fetch_add(1, std::memory_order_relaxed);
+    inner_->DrawIndexedInstanced(ixc, ic, si, bv, st);
+}
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::Dispatch(UINT x, UINT y, UINT z) {
+    g_dispatch_calls.fetch_add(1, std::memory_order_relaxed);
+    inner_->Dispatch(x, y, z);
+}
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyBufferRegion(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT64 nb) { inner_->CopyBufferRegion(d, dof, s, sof, nb); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT dx, UINT dy, UINT dz, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* sb) { inner_->CopyTextureRegion(d, dx, dy, dz, s, sb); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyResource(ID3D12Resource* d, ID3D12Resource* s) { inner_->CopyResource(d, s); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyTiles(ID3D12Resource* tr, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 off, D3D12_TILE_COPY_FLAGS f) { inner_->CopyTiles(tr, c, sz, b, off, f); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ResolveSubresource(ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT fmt) { inner_->ResolveSubresource(d, ds, s, ss, fmt); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) { inner_->IASetPrimitiveTopology(t); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::RSSetViewports(UINT n, const D3D12_VIEWPORT* v) { inner_->RSSetViewports(n, v); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::RSSetScissorRects(UINT n, const D3D12_RECT* r) { inner_->RSSetScissorRects(n, r); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::OMSetBlendFactor(const FLOAT f[4]) { inner_->OMSetBlendFactor(f); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::OMSetStencilRef(UINT r) { inner_->OMSetStencilRef(r); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetPipelineState(ID3D12PipelineState* p) {
+    g_pso_binds.fetch_add(1, std::memory_order_relaxed);
+    inner_->SetPipelineState(p);
+}
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    g_barrier_calls.fetch_add(n, std::memory_order_relaxed);
+    inner_->ResourceBarrier(n, b);
+}
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ExecuteBundle(ID3D12GraphicsCommandList* cl) {
+    if (cl) {
+        KxGraphicsCommandListProxy* p = nullptr;
+        if (SUCCEEDED(cl->QueryInterface(kIID_KxGraphicsCommandListProxy, reinterpret_cast<void**>(&p))) && p) {
+            inner_->ExecuteBundle(p->inner());
+            p->Release();
+            return;
+        }
+    }
+    inner_->ExecuteBundle(cl);
+}
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetDescriptorHeaps(UINT n, ID3D12DescriptorHeap* const* h) { inner_->SetDescriptorHeaps(n, h); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetComputeRootSignature(ID3D12RootSignature* rs) { inner_->SetComputeRootSignature(rs); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetGraphicsRootSignature(ID3D12RootSignature* rs) { inner_->SetGraphicsRootSignature(rs); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetComputeRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { inner_->SetComputeRootDescriptorTable(i, h); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetGraphicsRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { inner_->SetGraphicsRootDescriptorTable(i, h); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetComputeRoot32BitConstant(UINT i, UINT d, UINT off) { inner_->SetComputeRoot32BitConstant(i, d, off); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetGraphicsRoot32BitConstant(UINT i, UINT d, UINT off) { inner_->SetGraphicsRoot32BitConstant(i, d, off); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetComputeRoot32BitConstants(UINT i, UINT n, const void* d, UINT off) { inner_->SetComputeRoot32BitConstants(i, n, d, off); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetGraphicsRoot32BitConstants(UINT i, UINT n, const void* d, UINT off) { inner_->SetGraphicsRoot32BitConstants(i, n, d, off); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetComputeRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { inner_->SetComputeRootConstantBufferView(i, a); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetGraphicsRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { inner_->SetGraphicsRootConstantBufferView(i, a); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetComputeRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { inner_->SetComputeRootShaderResourceView(i, a); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetGraphicsRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { inner_->SetGraphicsRootShaderResourceView(i, a); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetComputeRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { inner_->SetComputeRootUnorderedAccessView(i, a); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetGraphicsRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { inner_->SetGraphicsRootUnorderedAccessView(i, a); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* v) { inner_->IASetIndexBuffer(v); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::IASetVertexBuffers(UINT s, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) { inner_->IASetVertexBuffers(s, n, v); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SOSetTargets(UINT s, UINT n, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* v) { inner_->SOSetTargets(s, n, v); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::OMSetRenderTargets(UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* r, BOOL sr, const D3D12_CPU_DESCRIPTOR_HANDLE* d) { inner_->OMSetRenderTargets(n, r, sr, d); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT nr, const D3D12_RECT* rc) { inner_->ClearDepthStencilView(h, f, d, s, nr, rc); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT nr, const D3D12_RECT* rc) { inner_->ClearRenderTargetView(h, c, nr, rc); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE gh, D3D12_CPU_DESCRIPTOR_HANDLE ch, ID3D12Resource* r, const UINT v[4], UINT nr, const D3D12_RECT* rc) { inner_->ClearUnorderedAccessViewUint(gh, ch, r, v, nr, rc); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE gh, D3D12_CPU_DESCRIPTOR_HANDLE ch, ID3D12Resource* r, const FLOAT v[4], UINT nr, const D3D12_RECT* rc) { inner_->ClearUnorderedAccessViewFloat(gh, ch, r, v, nr, rc); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::DiscardResource(ID3D12Resource* r, const D3D12_DISCARD_REGION* rg) { inner_->DiscardResource(r, rg); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::BeginQuery(ID3D12QueryHeap* qh, D3D12_QUERY_TYPE t, UINT i) { inner_->BeginQuery(qh, t, i); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::EndQuery(ID3D12QueryHeap* qh, D3D12_QUERY_TYPE t, UINT i) { inner_->EndQuery(qh, t, i); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ResolveQueryData(ID3D12QueryHeap* qh, D3D12_QUERY_TYPE t, UINT si, UINT n, ID3D12Resource* dst, UINT64 off) { inner_->ResolveQueryData(qh, t, si, n, dst, off); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetPredication(ID3D12Resource* b, UINT64 off, D3D12_PREDICATION_OP op) { inner_->SetPredication(b, off, op); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::SetMarker(UINT m, const void* d, UINT s) { inner_->SetMarker(m, d, s); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::BeginEvent(UINT m, const void* d, UINT s) { inner_->BeginEvent(m, d, s); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::EndEvent() { inner_->EndEvent(); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ExecuteIndirect(ID3D12CommandSignature* cs, UINT mc, ID3D12Resource* ab, UINT64 ao, ID3D12Resource* cb, UINT64 co) { inner_->ExecuteIndirect(cs, mc, ab, ao, cb, co); }
+
 // ---- KxCommandQueueProxy ----
 
 KxCommandQueueProxy::KxCommandQueueProxy(ID3D12CommandQueue* inner) : inner_(inner) {
@@ -261,7 +430,24 @@ HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::SetName(LPCWSTR n) { return inner
 HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetDevice(REFIID r, void** o) { return inner_->GetDevice(r, o); }
 void STDMETHODCALLTYPE KxCommandQueueProxy::UpdateTileMappings(ID3D12Resource* res, UINT n, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Heap* h, UINT nr, const D3D12_TILE_RANGE_FLAGS* f, const UINT* ho, const UINT* tc, D3D12_TILE_MAPPING_FLAGS fl) { inner_->UpdateTileMappings(res, n, c, sz, h, nr, f, ho, tc, fl); }
 void STDMETHODCALLTYPE KxCommandQueueProxy::CopyTileMappings(ID3D12Resource* dr, const D3D12_TILED_RESOURCE_COORDINATE* dc, ID3D12Resource* sr, const D3D12_TILED_RESOURCE_COORDINATE* sc, const D3D12_TILE_REGION_SIZE* sz, D3D12_TILE_MAPPING_FLAGS fl) { inner_->CopyTileMappings(dr, dc, sr, sc, sz, fl); }
-void STDMETHODCALLTYPE KxCommandQueueProxy::ExecuteCommandLists(UINT n, ID3D12CommandList* const* ls) { inner_->ExecuteCommandLists(n, ls); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::ExecuteCommandLists(UINT n, ID3D12CommandList* const* ls) {
+    if (n == 0 || !ls) {
+        inner_->ExecuteCommandLists(n, ls);
+        return;
+    }
+    std::vector<ID3D12CommandList*> unwrapped(n, nullptr);
+    for (UINT i = 0; i < n; ++i) {
+        unwrapped[i] = ls[i];
+        if (ls[i]) {
+            KxGraphicsCommandListProxy* p = nullptr;
+            if (SUCCEEDED(ls[i]->QueryInterface(kIID_KxGraphicsCommandListProxy, reinterpret_cast<void**>(&p))) && p) {
+                unwrapped[i] = p->inner();
+                p->Release();
+            }
+        }
+    }
+    inner_->ExecuteCommandLists(n, unwrapped.data());
+}
 void STDMETHODCALLTYPE KxCommandQueueProxy::SetMarker(UINT m, const void* d, UINT s) { inner_->SetMarker(m, d, s); }
 void STDMETHODCALLTYPE KxCommandQueueProxy::BeginEvent(UINT m, const void* d, UINT s) { inner_->BeginEvent(m, d, s); }
 void STDMETHODCALLTYPE KxCommandQueueProxy::EndEvent() { inner_->EndEvent(); }
@@ -276,13 +462,19 @@ D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE KxCommandQueueProxy::GetDesc() { retu
 KxDeviceProxy::KxDeviceProxy(ID3D12Device* inner) : inner_(inner) {
     if (inner_) {
         inner_->AddRef();
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner1_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner2_));
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt1{};
         if (SUCCEEDED(inner_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opt1, sizeof(opt1)))) {
             supports_wave64_ = (opt1.WaveLaneCountMin <= 64 && opt1.WaveLaneCountMax >= 64);
         }
     }
 }
-KxDeviceProxy::~KxDeviceProxy() { if (inner_) { inner_->Release(); inner_ = nullptr; } }
+KxDeviceProxy::~KxDeviceProxy() {
+    if (inner2_) { inner2_->Release(); inner2_ = nullptr; }
+    if (inner1_) { inner1_->Release(); inner1_ = nullptr; }
+    if (inner_) { inner_->Release(); inner_ = nullptr; }
+}
 
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
@@ -291,7 +483,24 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::QueryInterface(REFIID riid, void** ppv)
         AddRef();
         return S_OK;
     }
-    return inner_->QueryInterface(riid, ppv);
+    if (riid == __uuidof(ID3D12Device1) && inner1_) {
+        *ppv = static_cast<ID3D12Device1*>(this);
+        AddRef();
+        g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
+    if (riid == __uuidof(ID3D12Device2) && inner2_) {
+        *ppv = static_cast<ID3D12Device2*>(this);
+        AddRef();
+        g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
+    // Forward ID3D12Device3..ID3D12Device10 (and newer interfaces) cleanly to the underlying hardware device
+    HRESULT hr = inner_->QueryInterface(riid, ppv);
+    if (SUCCEEDED(hr)) {
+        g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed);
+    }
+    return hr;
 }
 
 ULONG STDMETHODCALLTYPE KxDeviceProxy::AddRef() { return ref_.fetch_add(1, std::memory_order_relaxed) + 1; }
@@ -366,6 +575,17 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateComputePipelineState(const D3D12_
 }
 
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandList(UINT m, D3D12_COMMAND_LIST_TYPE t, ID3D12CommandAllocator* a, ID3D12PipelineState* i, REFIID r, void** o) {
+    if (r == __uuidof(ID3D12GraphicsCommandList) || r == __uuidof(ID3D12CommandList)) {
+        ID3D12GraphicsCommandList* raw = nullptr;
+        HRESULT hr = inner_->CreateCommandList(m, t, a, i, IID_PPV_ARGS(&raw));
+        if (FAILED(hr)) return hr;
+        g_cmd_lists.fetch_add(1, std::memory_order_relaxed);
+        auto* proxy = new KxGraphicsCommandListProxy(raw);
+        raw->Release();
+        hr = proxy->QueryInterface(r, o);
+        proxy->Release();
+        return hr;
+    }
     HRESULT hr = inner_->CreateCommandList(m, t, a, i, r, o);
     if (SUCCEEDED(hr)) g_cmd_lists.fetch_add(1, std::memory_order_relaxed);
     return hr;
@@ -410,6 +630,69 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandSignature(const D3D12_COMM
 void STDMETHODCALLTYPE KxDeviceProxy::GetResourceTiling(ID3D12Resource* res, UINT* nt, D3D12_PACKED_MIP_INFO* pm, D3D12_TILE_SHAPE* ts, UINT* ns, UINT fs, D3D12_SUBRESOURCE_TILING* st) { inner_->GetResourceTiling(res, nt, pm, ts, ns, fs, st); }
 LUID STDMETHODCALLTYPE KxDeviceProxy::GetAdapterLuid() { return inner_->GetAdapterLuid(); }
 
+// ID3D12Device1
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePipelineLibrary(const void* b, SIZE_T l, REFIID r, void** o) {
+    return inner1_ ? inner1_->CreatePipelineLibrary(b, l, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::SetEventOnMultipleFenceCompletion(ID3D12Fence* const* f, const UINT64* v, UINT n, D3D12_MULTIPLE_FENCE_WAIT_FLAGS fl, HANDLE ev) {
+    return inner1_ ? inner1_->SetEventOnMultipleFenceCompletion(f, v, n, fl, ev) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::SetResidencyPriority(UINT n, ID3D12Pageable* const* o, const D3D12_RESIDENCY_PRIORITY* p) {
+    return inner1_ ? inner1_->SetResidencyPriority(n, o, p) : E_NOINTERFACE;
+}
+
+// ID3D12Device2 — stream-based PSO creation with automatic KXRN/KXRV/KXRP RDNA2->DXIL patching
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID r, void** o) {
+    if (!inner2_) return E_NOINTERFACE;
+    if (!d || !d->pPipelineStateSubobjectStream || d->SizeInBytes == 0) {
+        return inner2_->CreatePipelineState(d, r, o);
+    }
+
+    std::vector<uint8_t> stream_copy(d->SizeInBytes);
+    std::memcpy(stream_copy.data(), d->pPipelineStateSubobjectStream, d->SizeInBytes);
+
+    std::vector<std::vector<uint8_t>> owned_dxil;
+    owned_dxil.reserve(4);
+    bool patched_any = false;
+
+    constexpr size_t bc_off = (sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + alignof(D3D12_SHADER_BYTECODE) - 1) &
+                              ~(alignof(D3D12_SHADER_BYTECODE) - 1);
+
+    size_t offset = 0;
+    while (offset + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= stream_copy.size()) {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type{};
+        std::memcpy(&type, stream_copy.data() + offset, sizeof(type));
+        const size_t stride = subobject_stride(type);
+        if (stride == 0 || offset + stride > stream_copy.size()) break;
+
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+            D3D12_SHADER_BYTECODE bc{};
+            std::memcpy(&bc, stream_copy.data() + offset + bc_off, sizeof(bc));
+            const auto stage = (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) ? gpu::ShaderStage::Vertex
+                             : (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) ? gpu::ShaderStage::Pixel
+                                                                                : gpu::ShaderStage::Compute;
+            std::vector<uint8_t> dxil;
+            bool cache_hit = false;
+            if (try_recompile_kestrel_rdna2(bc.pShaderBytecode, bc.BytecodeLength, stage, supports_wave64_, dxil, cache_hit)) {
+                owned_dxil.push_back(std::move(dxil));
+                D3D12_SHADER_BYTECODE patched_bc{owned_dxil.back().data(), owned_dxil.back().size()};
+                std::memcpy(stream_copy.data() + offset + bc_off, &patched_bc, sizeof(patched_bc));
+                patched_any = true;
+            }
+        }
+        offset += stride;
+    }
+
+    if (patched_any) {
+        g_stream_pso_recomp.fetch_add(1, std::memory_order_relaxed);
+        D3D12_PIPELINE_STATE_STREAM_DESC patched_desc{stream_copy.size(), stream_copy.data()};
+        return inner2_->CreatePipelineState(&patched_desc, r, o);
+    }
+    return inner2_->CreatePipelineState(d, r, o);
+}
+
 void set_d3d12x_preferred_adapter(int adapter_index) { g_preferred_adapter.store(adapter_index, std::memory_order_relaxed); }
 
 void set_d3d12x_windowed(bool enabled, uint32_t width, uint32_t height) {
@@ -422,6 +705,16 @@ void set_d3d12x_windowed(bool enabled, uint32_t width, uint32_t height) {
 void set_d3d12x_capture_path(const std::filesystem::path& bmp_path) {
     std::lock_guard lock(g_present_mtx);
     g_capture_path = bmp_path;
+}
+
+void set_d3d12x_shader_cache_dir(const std::filesystem::path& cache_dir) {
+    std::lock_guard lock(g_shader_cache_mtx);
+    g_disk_cache.set_root_dir(cache_dir);
+}
+
+void clear_d3d12x_memory_shader_cache() {
+    std::lock_guard lock(g_shader_cache_mtx);
+    g_dxil_cache.clear();
 }
 
 void shutdown_d3d12x_window() {
@@ -445,14 +738,20 @@ void register_d3d12x(Registry& reg) {
 D3D12XStats d3d12x_stats() {
     return {g_devices.load(), g_queues.load(), g_cmd_lists.load(), g_resources.load(),
             g_zero_mem.load(), g_presents.load(), g_pso_recomp.load(), g_pso_cache_hits.load(),
-            g_gfx_pso_recomp.load(), g_gfx_pso_cache_hits.load()};
+            g_gfx_pso_recomp.load(), g_gfx_pso_cache_hits.load(), g_stream_pso_recomp.load(),
+            g_disk_cache_hits.load(), g_disk_cache_misses.load(), g_device_qi_upgrades.load(),
+            g_draw_calls.load(), g_dispatch_calls.load(), g_barrier_calls.load(), g_pso_binds.load()};
 }
+
 void reset_d3d12x_stats() {
     g_devices = g_queues = g_cmd_lists = g_resources = g_zero_mem = g_presents =
-        g_pso_recomp = g_pso_cache_hits = g_gfx_pso_recomp = g_gfx_pso_cache_hits = 0;
+        g_pso_recomp = g_pso_cache_hits = g_gfx_pso_recomp = g_gfx_pso_cache_hits =
+        g_stream_pso_recomp = g_disk_cache_hits = g_disk_cache_misses = g_device_qi_upgrades =
+        g_draw_calls = g_dispatch_calls = g_barrier_calls = g_pso_binds = 0;
     {
         std::lock_guard lock(g_shader_cache_mtx);
         g_dxil_cache.clear();
+        g_disk_cache.reset_stats();
     }
     {
         std::lock_guard lock(g_present_mtx);

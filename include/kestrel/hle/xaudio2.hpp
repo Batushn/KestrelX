@@ -56,12 +56,15 @@ struct XAudio2Stats {
     uint64_t frames_submitted = 0;
     uint64_t frames_consumed = 0;
     uint64_t underruns = 0;
+    uint64_t wasapi_packets = 0;
+    bool wasapi_active = false;
     double last_rms = 0.0;
 };
 
 // Drain stereo float32 PCM frames from the internal ring buffer (for WASAPI sink or headless verification).
 size_t xaudio2_drain_stereo_f32(float* out_interleaved_stereo, size_t max_frames);
 void set_xaudio2_wasapi_enabled(bool enabled);
+void shutdown_xaudio2_wasapi();
 void register_xaudio2(Registry& reg);
 XAudio2Stats xaudio2_stats();
 void reset_xaudio2_stats();

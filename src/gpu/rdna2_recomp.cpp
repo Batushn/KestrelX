@@ -197,6 +197,82 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
         case IrOp::GlobalStoreDword:
             out << ind << std::format("g_mem.Store({} + {}u, {});\n", emit_u32(i.src0), i.offset, emit_u32(i.src1));
             break;
+        case IrOp::BufferLoadDword:
+        case IrOp::BufferLoadDwordx2:
+        case IrOp::BufferLoadDwordx4: {
+            const char* buf = (stage == ShaderStage::Compute) ? "g_mem" : "g_buf";
+            const std::string addr = std::format("({} + {} + {}u)", emit_u32(i.src0), emit_u32(i.src3), i.offset);
+            if (i.op == IrOp::BufferLoadDword) {
+                out << ind << std::format("v[{}] = {}.Load({});\n", i.dst.reg, buf, addr);
+            } else if (i.op == IrOp::BufferLoadDwordx2) {
+                out << ind << std::format("{{ uint2 kx_b2 = {}.Load2({}); v[{}] = kx_b2.x; v[{}] = kx_b2.y; }}\n",
+                                          buf, addr, i.dst.reg, i.dst.reg + 1);
+            } else {
+                out << ind << std::format("{{ uint4 kx_b4 = {}.Load4({}); v[{}] = kx_b4.x; v[{}] = kx_b4.y; v[{}] = kx_b4.z; v[{}] = kx_b4.w; }}\n",
+                                          buf, addr, i.dst.reg, i.dst.reg + 1, i.dst.reg + 2, i.dst.reg + 3);
+            }
+            break;
+        }
+        case IrOp::BufferStoreDword:
+        case IrOp::BufferStoreDwordx2:
+        case IrOp::BufferStoreDwordx4: {
+            const std::string addr = std::format("({} + {} + {}u)", emit_u32(i.src0), emit_u32(i.src3), i.offset);
+            if (i.op == IrOp::BufferStoreDword) {
+                out << ind << std::format("g_mem.Store({}, v[{}]);\n", addr, i.src1.reg);
+            } else if (i.op == IrOp::BufferStoreDwordx2) {
+                out << ind << std::format("g_mem.Store2({}, uint2(v[{}], v[{}]));\n",
+                                          addr, i.src1.reg, i.src1.reg + 1);
+            } else {
+                out << ind << std::format("g_mem.Store4({}, uint4(v[{}], v[{}], v[{}], v[{}]));\n",
+                                          addr, i.src1.reg, i.src1.reg + 1, i.src1.reg + 2, i.src1.reg + 3);
+            }
+            break;
+        }
+        case IrOp::ImageSample: {
+            const char* comps[4] = {"x", "y", "z", "w"};
+            out << ind << "{ ";
+            if (stage == ShaderStage::Pixel) {
+                out << std::format("float4 kx_tx = g_tex0.Sample(g_samp0, float2(asfloat(v[{}]), asfloat(v[{}]))); ",
+                                   i.src0.reg, i.src0.reg + 1);
+            } else {
+                out << std::format("float4 kx_tx = g_tex0.SampleLevel(g_samp0, float2(asfloat(v[{}]), asfloat(v[{}])), 0.0); ",
+                                   i.src0.reg, i.src0.reg + 1);
+            }
+            uint32_t out_idx = i.dst.reg;
+            for (int c = 0; c < 4; ++c) {
+                if (i.dmask & (1u << c)) {
+                    out << std::format("v[{}] = asuint(kx_tx.{}); ", out_idx++, comps[c]);
+                }
+            }
+            out << "}\n";
+            break;
+        }
+        case IrOp::ImageLoad: {
+            const char* comps[4] = {"x", "y", "z", "w"};
+            out << ind << std::format("{{ float4 kx_tx = g_tex0.Load(int3(int(v[{}]), int(v[{}]), 0)); ",
+                                      i.src0.reg, i.src0.reg + 1);
+            uint32_t out_idx = i.dst.reg;
+            for (int c = 0; c < 4; ++c) {
+                if (i.dmask & (1u << c)) {
+                    out << std::format("v[{}] = asuint(kx_tx.{}); ", out_idx++, comps[c]);
+                }
+            }
+            out << "}\n";
+            break;
+        }
+        case IrOp::ImageGetResInfo: {
+            out << ind << std::format("{{ uint kx_tw = 0u, kx_th = 0u, kx_tm = 0u; g_tex0.GetDimensions(v[{}], kx_tw, kx_th, kx_tm); ",
+                                      i.src0.reg);
+            const char* fields[4] = {"kx_tw", "kx_th", "1u", "kx_tm"};
+            uint32_t out_idx = i.dst.reg;
+            for (int c = 0; c < 4; ++c) {
+                if (i.dmask & (1u << c)) {
+                    out << std::format("v[{}] = {}; ", out_idx++, fields[c]);
+                }
+            }
+            out << "}\n";
+            break;
+        }
         case IrOp::DsWriteB32:
             out << ind << std::format("g_lds[(({} + {}u) >> 2u) & 8191u] = {};\n",
                                       emit_u32(i.src0), i.offset, emit_u32(i.src1));
@@ -272,6 +348,10 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
         out << std::format("// Stage: Compute | Target wave mode: Wave{}\n", static_cast<uint32_t>(opt.wave_mode));
         out << "RWByteAddressBuffer g_mem : register(u0);\n";
         out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
+        if (fn.uses_tex) {
+            out << "Texture2D<float4> g_tex0 : register(t0);\n";
+            out << "SamplerState g_samp0 : register(s0);\n";
+        }
         if (fn.uses_lds) {
             out << "groupshared uint g_lds[8192];\n";
         }
@@ -285,6 +365,13 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
             out << "RWByteAddressBuffer g_mem : register(u0);\n";
             out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
         }
+        if (fn.uses_buf_srv) {
+            out << "ByteAddressBuffer g_buf : register(t1);\n";
+        }
+        if (fn.uses_tex) {
+            out << "Texture2D<float4> g_tex0 : register(t0);\n";
+            out << "SamplerState g_samp0 : register(s0);\n";
+        }
         out << "struct KxVsOut { float4 pos : SV_Position; float4 param0 : TEXCOORD0; };\n\n";
         out << std::format("KxVsOut {}(uint sv_vid : SV_VertexID) {{\n", opt.entry_point);
         out << "    KxVsOut kx_out = (KxVsOut)0;\n";
@@ -293,6 +380,13 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
         if (fn.uses_mem) {
             out << "RWByteAddressBuffer g_mem : register(u0);\n";
             out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
+        }
+        if (fn.uses_buf_srv) {
+            out << "ByteAddressBuffer g_buf : register(t1);\n";
+        }
+        if (fn.uses_tex) {
+            out << "Texture2D<float4> g_tex0 : register(t0);\n";
+            out << "SamplerState g_samp0 : register(s0);\n";
         }
         out << "struct KxPsIn { float4 pos : SV_Position; float4 param0 : TEXCOORD0; };\n\n";
         out << std::format("float4 {}(KxPsIn kx_in) : SV_Target0 {{\n", opt.entry_point);

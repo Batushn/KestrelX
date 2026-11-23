@@ -20,6 +20,8 @@ enum class Encoding : uint8_t {
     VOPC,
     VOP3,
     MUBUF,
+    MTBUF,
+    MIMG,
     DS,
     FLAT,
     EXP,
@@ -44,6 +46,9 @@ struct DecodedInst {
     uint8_t abs_mask = 0;
     uint8_t neg_mask = 0;
     uint8_t exp_en = 0;
+    uint8_t dmask = 0xFu;      // MIMG channel write mask (RGBA)
+    uint8_t img_dim = 1;       // MIMG dimension (0=1D, 1=2D, 2=3D, 3=Cube)
+    uint8_t mtbuf_format = 0;  // MTBUF data/number format
     bool exp_done = false;
     bool clamp = false;
     bool is_branch = false;
@@ -97,9 +102,43 @@ inline void global_mem(std::vector<uint32_t>& out, uint32_t op, uint32_t vdst_or
     out.push_back(w0);
     out.push_back(w1);
 }
+// GFX10.3 SMEM encoding prefix: 0x3D (111101)
 inline void smem(std::vector<uint32_t>& out, uint32_t op, uint32_t sdst, uint32_t sbase_pair, uint32_t offset = 0) {
-    const uint32_t w0 = (0x3Cu << 26) | ((op & 0xFFu) << 18) | ((sdst & 0x7Fu) << 6) | ((sbase_pair >> 1) & 0x3Fu);
+    const uint32_t w0 = (0x3Du << 26) | ((op & 0xFFu) << 18) | ((sdst & 0x7Fu) << 6) | ((sbase_pair >> 1) & 0x3Fu);
     const uint32_t w1 = offset & 0x1FFFFFu;
+    out.push_back(w0);
+    out.push_back(w1);
+}
+// GFX10.3 MUBUF encoding prefix: 0x38 (111000)
+// op: 12=buffer_load_dword, 13=x2, 14=x4, 28=buffer_store_dword, 29=x2, 30=x4
+inline void mubuf(std::vector<uint32_t>& out, uint32_t op, uint32_t vdata, uint32_t vaddr,
+                  uint32_t srsrc = 0, uint32_t soffset = 128, uint16_t offset = 0) {
+    const uint32_t w0 = (0x38u << 26) | ((op & 0x7Fu) << 18) | (offset & 0xFFFu);
+    const uint32_t w1 = ((soffset & 0xFFu) << 24) | (((srsrc >> 2) & 0x1Fu) << 16) |
+                        ((vdata & 0xFFu) << 8) | (vaddr & 0xFFu);
+    out.push_back(w0);
+    out.push_back(w1);
+}
+// GFX10.3 MTBUF encoding prefix: 0x3A (111010)
+// op: 0=tbuffer_load_format_x, 1=xy, 3=xyzw, 4=tbuffer_store_format_x, 7=xyzw
+inline void mtbuf(std::vector<uint32_t>& out, uint32_t op, uint32_t vdata, uint32_t vaddr,
+                  uint32_t srsrc = 0, uint32_t soffset = 128, uint8_t format = 0, uint16_t offset = 0) {
+    const uint32_t w0 = (0x3Au << 26) | ((static_cast<uint32_t>(format) & 0x7Fu) << 19) |
+                        ((op & 0x7u) << 16) | (offset & 0xFFFu);
+    const uint32_t w1 = ((soffset & 0xFFu) << 24) | (((srsrc >> 2) & 0x1Fu) << 16) |
+                        ((vdata & 0xFFu) << 8) | (vaddr & 0xFFu);
+    out.push_back(w0);
+    out.push_back(w1);
+}
+// GFX10.3 MIMG encoding prefix: 0x3C (111100)
+// op: 0x00=image_load, 0x0E=image_get_resinfo, 0x20=image_sample, 0x24=image_sample_l
+inline void mimg(std::vector<uint32_t>& out, uint32_t op, uint32_t vdata, uint32_t vaddr,
+                 uint32_t srsrc = 0, uint32_t ssamp = 0, uint8_t dmask = 0xFu, uint8_t dim = 1) {
+    const uint32_t w0 = (0x3Cu << 26) | ((op & 0x7Fu) << 18) |
+                        ((static_cast<uint32_t>(dmask) & 0xFu) << 8) |
+                        ((static_cast<uint32_t>(dim) & 0x7u) << 3);
+    const uint32_t w1 = (((ssamp >> 2) & 0x1Fu) << 21) | (((srsrc >> 2) & 0x1Fu) << 16) |
+                        ((vdata & 0xFFu) << 8) | (vaddr & 0xFFu);
     out.push_back(w0);
     out.push_back(w1);
 }

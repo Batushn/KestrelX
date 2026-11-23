@@ -7,6 +7,8 @@ EXPORTS
     GetConsoleType
     CreateFileA
     CreateFileW
+    CreateFile2
+    ReadFileEx
     DeleteFileA
     DeleteFileW
     GetFileAttributesExW

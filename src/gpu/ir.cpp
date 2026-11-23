@@ -303,6 +303,94 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 }
                 break;
 
+            case Encoding::MUBUF:
+            case Encoding::MTBUF: {
+                auto track_vspan = [&](uint32_t base, uint32_t n) {
+                    if (base + n > fn.max_vgpr) fn.max_vgpr = base + n;
+                };
+                if (d.mnemonic == "buffer_load_dword" || d.mnemonic == "tbuffer_load_format_x") {
+                    ir.op = IrOp::BufferLoadDword;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                    ir.src3 = decode_operand(d.src3, false, 0);
+                    fn.uses_buf_srv = true;
+                } else if (d.mnemonic == "buffer_load_dwordx2" || d.mnemonic == "tbuffer_load_format_xy") {
+                    ir.op = IrOp::BufferLoadDwordx2;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                    ir.src3 = decode_operand(d.src3, false, 0);
+                    track_vspan(d.dst, 2);
+                    fn.uses_buf_srv = true;
+                } else if (d.mnemonic == "buffer_load_dwordx4" || d.mnemonic == "tbuffer_load_format_xyzw") {
+                    ir.op = IrOp::BufferLoadDwordx4;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                    ir.src3 = decode_operand(d.src3, false, 0);
+                    track_vspan(d.dst, 4);
+                    fn.uses_buf_srv = true;
+                } else if (d.mnemonic == "buffer_store_dword" || d.mnemonic == "tbuffer_store_format_x") {
+                    ir.op = IrOp::BufferStoreDword;
+                    ir.src0 = make_vgpr(d.src0);
+                    ir.src1 = make_vgpr(d.src1);
+                    ir.src3 = decode_operand(d.src3, false, 0);
+                    fn.uses_mem = true;
+                } else if (d.mnemonic == "buffer_store_dwordx2") {
+                    ir.op = IrOp::BufferStoreDwordx2;
+                    ir.src0 = make_vgpr(d.src0);
+                    ir.src1 = make_vgpr(d.src1);
+                    ir.src3 = decode_operand(d.src3, false, 0);
+                    track_vspan(d.src1, 2);
+                    fn.uses_mem = true;
+                } else if (d.mnemonic == "buffer_store_dwordx4" || d.mnemonic == "tbuffer_store_format_xyzw") {
+                    ir.op = IrOp::BufferStoreDwordx4;
+                    ir.src0 = make_vgpr(d.src0);
+                    ir.src1 = make_vgpr(d.src1);
+                    ir.src3 = decode_operand(d.src3, false, 0);
+                    track_vspan(d.src1, 4);
+                    fn.uses_mem = true;
+                } else {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
+                }
+                break;
+            }
+
+            case Encoding::MIMG: {
+                ir.dmask = d.dmask;
+                uint32_t out_regs = 0;
+                for (int c = 0; c < 4; ++c) {
+                    if (d.dmask & (1u << c)) ++out_regs;
+                }
+                if (out_regs == 0) out_regs = 1;
+                if (d.mnemonic == "image_sample" || d.mnemonic == "image_sample_l") {
+                    ir.op = IrOp::ImageSample;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                    if (d.dst + out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + out_regs;
+                    if (d.src0 + 2 > fn.max_vgpr) fn.max_vgpr = d.src0 + 2;
+                    fn.uses_tex = true;
+                } else if (d.mnemonic == "image_load") {
+                    ir.op = IrOp::ImageLoad;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                    if (d.dst + out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + out_regs;
+                    if (d.src0 + 2 > fn.max_vgpr) fn.max_vgpr = d.src0 + 2;
+                    fn.uses_tex = true;
+                } else if (d.mnemonic == "image_get_resinfo") {
+                    ir.op = IrOp::ImageGetResInfo;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                    if (d.dst + out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + out_regs;
+                    fn.uses_tex = true;
+                } else {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
+                }
+                break;
+            }
+
             case Encoding::EXP:
                 ir.op = IrOp::Exp;
                 ir.subop = "exp";

@@ -300,7 +300,7 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.src0 = w1 & 0xFFu;          // vaddr
             const char* n = flat_name(d.opcode);
             d.mnemonic = n ? n : std::format("flat_{}", d.opcode);
-        } else if ((w0 >> 26) == 0x3Cu && i + 1 < count) {
+        } else if ((w0 >> 26) == 0x3Du && i + 1 < count) {
             d.size = 8;
             d.enc = Encoding::SMEM;
             d.opcode = (w0 >> 18) & 0xFFu;
@@ -312,11 +312,65 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             else if (d.opcode == 2) d.mnemonic = "s_load_dwordx4";
             else d.mnemonic = std::format("smem_{}", d.opcode);
         } else if ((w0 >> 26) == 0x38u && i + 1 < count) {
+            const uint32_t w1 = words[i + 1];
             d.size = 8;
             d.enc = Encoding::MUBUF;
             d.opcode = (w0 >> 18) & 0x7Fu;
             d.offset = w0 & 0xFFFu;
-            d.mnemonic = std::format("mubuf_{}", d.opcode);
+            d.src0 = w1 & 0xFFu;                  // vaddr
+            d.dst = (w1 >> 8) & 0xFFu;            // vdata (load dst)
+            d.src1 = d.dst;                       // vdata (store src)
+            d.src2 = ((w1 >> 16) & 0x1Fu) << 2;   // srsrc (V# SGPR base)
+            d.src3 = (w1 >> 24) & 0xFFu;          // soffset
+            switch (d.opcode) {
+                case 12: d.mnemonic = "buffer_load_dword"; break;
+                case 13: d.mnemonic = "buffer_load_dwordx2"; break;
+                case 14: d.mnemonic = "buffer_load_dwordx4"; break;
+                case 28: d.mnemonic = "buffer_store_dword"; break;
+                case 29: d.mnemonic = "buffer_store_dwordx2"; break;
+                case 30: d.mnemonic = "buffer_store_dwordx4"; break;
+                default: d.mnemonic = std::format("mubuf_{}", d.opcode); break;
+            }
+        } else if ((w0 >> 26) == 0x3Au && i + 1 < count) {
+            const uint32_t w1 = words[i + 1];
+            d.size = 8;
+            d.enc = Encoding::MTBUF;
+            d.mtbuf_format = static_cast<uint8_t>((w0 >> 19) & 0x7Fu);
+            d.opcode = (w0 >> 16) & 0x7u;
+            d.offset = w0 & 0xFFFu;
+            d.src0 = w1 & 0xFFu;                  // vaddr
+            d.dst = (w1 >> 8) & 0xFFu;            // vdata
+            d.src1 = d.dst;
+            d.src2 = ((w1 >> 16) & 0x1Fu) << 2;   // srsrc
+            d.src3 = (w1 >> 24) & 0xFFu;          // soffset
+            switch (d.opcode) {
+                case 0: d.mnemonic = "tbuffer_load_format_x"; break;
+                case 1: d.mnemonic = "tbuffer_load_format_xy"; break;
+                case 3: d.mnemonic = "tbuffer_load_format_xyzw"; break;
+                case 4: d.mnemonic = "tbuffer_store_format_x"; break;
+                case 7: d.mnemonic = "tbuffer_store_format_xyzw"; break;
+                default: d.mnemonic = std::format("mtbuf_{}", d.opcode); break;
+            }
+        } else if ((w0 >> 26) == 0x3Cu && i + 1 < count) {
+            const uint32_t w1 = words[i + 1];
+            d.size = 8;
+            d.enc = Encoding::MIMG;
+            d.opcode = (w0 >> 18) & 0x7Fu;
+            d.dmask = static_cast<uint8_t>((w0 >> 8) & 0xFu);
+            d.img_dim = static_cast<uint8_t>((w0 >> 3) & 0x7u);
+            d.src0 = w1 & 0xFFu;                  // vaddr (UV / coords)
+            d.dst = (w1 >> 8) & 0xFFu;            // vdata (RGBA dst)
+            d.src1 = d.dst;
+            d.src2 = ((w1 >> 16) & 0x1Fu) << 2;   // srsrc (T# SGPR base)
+            d.src3 = ((w1 >> 21) & 0x1Fu) << 2;   // ssamp (S# SGPR base)
+            switch (d.opcode) {
+                case 0x00: d.mnemonic = "image_load"; break;
+                case 0x08: d.mnemonic = "image_store"; break;
+                case 0x0E: d.mnemonic = "image_get_resinfo"; break;
+                case 0x20: d.mnemonic = "image_sample"; break;
+                case 0x24: d.mnemonic = "image_sample_l"; break;
+                default: d.mnemonic = std::format("mimg_{:#x}", d.opcode); break;
+            }
         } else if ((w0 >> 26) == 0x36u && i + 1 < count) {
             const uint32_t w1 = words[i + 1];
             d.size = 8;
@@ -409,6 +463,13 @@ std::string disassemble_inst(const DecodedInst& d) {
                                format_rdna2_operand(d.src2, d.has_literal, d.literal));
         case Encoding::FLAT:
             return std::format("{} v{}, v{}, off:{:#x}", d.mnemonic, d.dst, d.src0, d.offset);
+        case Encoding::MUBUF:
+        case Encoding::MTBUF:
+            return std::format("{} v{}, v{}, s[{}:{}], off:{:#x}",
+                               d.mnemonic, d.dst, d.src0, d.src2, d.src2 + 3, d.offset);
+        case Encoding::MIMG:
+            return std::format("{} v{}, v{}, s[{}:{}], s[{}:{}] dmask:{:#x}",
+                               d.mnemonic, d.dst, d.src0, d.src2, d.src2 + 7, d.src3, d.src3 + 3, d.dmask);
         case Encoding::EXP: {
             std::string tgt = (d.opcode <= 7) ? std::format("mrt{}", d.opcode)
                               : (d.opcode >= 12 && d.opcode <= 15) ? std::format("pos{}", d.opcode - 12)

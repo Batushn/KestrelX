@@ -9,6 +9,7 @@
 #include "kestrel/gpu/shader_cache.hpp"
 #include "kestrel/gpu/shader_container.hpp"
 #include "kestrel/gpu/vrs.hpp"
+#include "kestrel/gpu/work_graph.hpp"
 #include "kestrel/hle/d3d12x.hpp"
 #include "kestrel/hle/dstorage.hpp"
 #include "kestrel/hle/gameinput.hpp"
@@ -3341,6 +3342,323 @@ void test_gameinput_hotplug_callbacks_and_telemetry() {
 
 }  // namespace
 
+void test_work_graph_program_validation_and_ring_allocator() {
+    using namespace gpu::encode;
+    const std::vector<uint32_t> minimal_cs = {sopp(1)};  // s_endpgm
+
+    // 1. Valid 3-node DAG (Broadcasting -> Coalescing -> Thread)
+    gpu::WorkGraphProgram dag{};
+    dag.name = "CleanRoomTestDAG";
+    const uint32_t n0 = dag.add_node({
+        .name = "ProducerBroadcast",
+        .kind = gpu::WorkGraphNodeKind::Broadcasting,
+        .group_size_x = 64,
+        .group_size_y = 1,
+        .group_size_z = 1,
+        .record_stride_bytes = 32,
+        .max_output_records = 64,
+        .rdna2_dwords = minimal_cs,
+    });
+    const uint32_t n1 = dag.add_node({
+        .name = "MiddleCoalesce",
+        .kind = gpu::WorkGraphNodeKind::Coalescing,
+        .group_size_x = 32,
+        .group_size_y = 1,
+        .group_size_z = 1,
+        .record_stride_bytes = 16,
+        .max_output_records = 32,
+        .kxrn_bytecode = gpu::pack_kxrn_compute_bytecode(32, minimal_cs),
+    });
+    const uint32_t n2 = dag.add_node({
+        .name = "LeafThread",
+        .kind = gpu::WorkGraphNodeKind::Thread,
+        .group_size_x = 1,
+        .group_size_y = 1,
+        .group_size_z = 1,
+        .record_stride_bytes = 0,
+        .max_output_records = 0,
+        .rdna2_dwords = minimal_cs,
+    });
+    dag.add_edge(n0, n1, 0, 16, 1);
+    dag.add_edge(n1, n2, 16, 64, 1);
+
+    auto valid = dag.validate();
+    KX_CHECK(valid.has_value(), valid.error().message);
+    auto order = dag.topological_order();
+    KX_CHECK(order.has_value() && order->size() == 3 &&
+             (*order)[0] == 0 && (*order)[1] == 1 && (*order)[2] == 2,
+             "Deterministic topological order [0, 1, 2]");
+
+    // 2. Empty program rejected
+    gpu::WorkGraphProgram empty_prog{};
+    KX_CHECK(!empty_prog.validate().has_value(), "Empty WorkGraphProgram must be rejected");
+
+    // 3. Duplicate node names rejected
+    gpu::WorkGraphProgram dup_names = dag;
+    dup_names.nodes[1].name = dup_names.nodes[0].name;
+    KX_CHECK(!dup_names.validate().has_value(), "Duplicate node names must be rejected");
+
+    // 4. Out-of-range edge target rejected
+    gpu::WorkGraphProgram bad_target = dag;
+    bad_target.add_edge(0, 99, 0, 16, 1);
+    KX_CHECK(!bad_target.validate().has_value(), "Out-of-range edge target must be rejected");
+
+    // 5. Cycle rejected (2 -> 0 closes cycle 0 -> 1 -> 2 -> 0)
+    gpu::WorkGraphProgram cyclic = dag;
+    cyclic.add_edge(n2, n0, 32, 128, 1);
+    KX_CHECK(!cyclic.validate().has_value(), "Cyclic WorkGraphProgram must be rejected");
+
+    // 6. Self-loop rejected
+    gpu::WorkGraphProgram self_loop = dag;
+    self_loop.add_edge(n0, n0, 32, 128, 1);
+    KX_CHECK(!self_loop.validate().has_value(), "Self-loop edge must be rejected");
+
+    // 7. Unaligned record stride & edge offsets rejected
+    gpu::WorkGraphProgram bad_stride = dag;
+    bad_stride.nodes[0].record_stride_bytes = 12;
+    KX_CHECK(!bad_stride.validate().has_value(), "Non-16B-aligned record_stride_bytes must be rejected");
+
+    gpu::WorkGraphProgram bad_edge_align = dag;
+    bad_edge_align.edges[0].record_buffer_byte_offset = 8;
+    KX_CHECK(!bad_edge_align.validate().has_value(), "Non-16B-aligned record_buffer_byte_offset must be rejected");
+
+    gpu::WorkGraphProgram bad_args_align = dag;
+    bad_args_align.edges[0].dispatch_args_byte_offset = 2;
+    KX_CHECK(!bad_args_align.validate().has_value(), "Non-4B-aligned dispatch_args_byte_offset must be rejected");
+
+    // 8. Record backing memory overflow rejected
+    gpu::WorkGraphProgram overflow_prog = dag;
+    overflow_prog.nodes[0].record_stride_bytes = 0x10000000u;
+    overflow_prog.nodes[0].max_output_records = 64u;
+    KX_CHECK(!overflow_prog.validate().has_value(), "Record buffer size overflow must be rejected");
+
+    // 9. RecordRingAllocator: 16B alignment, bounds checking, FIFO release, wrap & reset
+    constexpr uint64_t kBaseVa = 0x100000000ull;
+    gpu::RecordRingAllocator ring(256, kBaseVa);
+    KX_CHECK(ring.capacity_bytes() == 256, "Ring capacity");
+
+    auto a0 = ring.allocate(1);   // aligns up to 16B @ offset 0
+    KX_CHECK(a0.has_value() && a0->offset == 0 && a0->aligned_size_bytes == 16 && a0->gpu_va == kBaseVa,
+             "First allocation 16B aligned at offset 0");
+
+    auto a1 = ring.allocate(113);  // aligns up to 128B @ offset 16
+    KX_CHECK(a1.has_value() && a1->offset == 16 && a1->aligned_size_bytes == 128 &&
+             a1->gpu_va == kBaseVa + 16 && !a1->wrapped,
+             "Second allocation 16B aligned at offset 16");
+
+    auto a2 = ring.allocate(80);  // 80B @ offset 144 -> head = 224
+    KX_CHECK(a2.has_value() && a2->offset == 144 && a2->aligned_size_bytes == 80,
+             "Third allocation at offset 144");
+
+    // Only 32B left at tail, 0B at front -> 64B must fail
+    auto oom = ring.allocate(64);
+    KX_CHECK(!oom.has_value(), "Allocation exceeding contiguous free space must fail");
+
+    // Release a0 (16B) and a1 (128B) -> tail advances to 144
+    KX_CHECK(ring.release(*a0).has_value(), "FIFO release a0");
+    KX_CHECK(ring.release(*a1).has_value(), "FIFO release a1");
+
+    // Now allocate 64B: does not fit in remaining 32B at end (224..256), so wraps to offset 0!
+    auto a3 = ring.allocate(64);
+    KX_CHECK(a3.has_value() && a3->offset == 0 && a3->wrapped && a3->gpu_va == kBaseVa,
+             "Allocation wraps contiguously to offset 0");
+
+    const auto m_mid = ring.metrics();
+    KX_CHECK(m_mid.wrap_count == 1 && m_mid.failed_allocations == 1 &&
+             m_mid.used_bytes == 144 && m_mid.peak_used_bytes == 224 &&
+             m_mid.utilization > 0.50 && m_mid.utilization < 0.60,
+             "Ring allocator utilization, peak, wrap & failure metrics");
+
+    // Release a2 (at 144) -> tail wraps cleanly to 0, then release a3 (at 0)
+    KX_CHECK(ring.release(*a2).has_value(), "FIFO release a2 across wrap boundary");
+    KX_CHECK(ring.release(*a3).has_value(), "FIFO release wrapped a3");
+    KX_CHECK(ring.metrics().used_bytes == 0 && ring.metrics().free_bytes == 256, "Empty after all releases");
+
+    // Allocate & reset
+    auto a4 = ring.allocate(128);
+    KX_CHECK(a4.has_value() && a4->offset == 0, "Re-allocate at offset 0");
+    ring.reset();
+    const auto m_reset = ring.metrics();
+    KX_CHECK(m_reset.used_bytes == 0 && m_reset.free_bytes == 256 && m_reset.peak_used_bytes == 224,
+             "Ring reset restores full free capacity while preserving peak telemetry");
+}
+
+void test_work_graph_rdna2_execute_indirect_dual_gpu() {
+    using namespace gpu::encode;
+    hle::reset_d3d12x_stats();
+
+    // Shared GPU buffer layout (128 uint32s = 512 bytes):
+    //   [0..2]   (byte 0..11)   : D3D12_DISPATCH_ARGUMENTS written on GPU by Node 0 ({2, 1, 1})
+    //   [3]      (byte 12..15)  : reserved padding
+    //   [4..35]  (byte 16..143) : 32 input uint32 values (10 + i * 3)
+    //   [36..67] (byte 144..271): 32 producer -> consumer records (2 * input[i] + 5)
+    //   [68..99] (byte 272..399): 32 consumer final outputs (record[i] + 100 + i)
+
+    // Node 0 ("ProducerNode", Broadcasting, numthreads(32,1,1)):
+    //   v1 = v0 << 2
+    //   v2 = g_mem[16 + v1]
+    //   v3 = v2 + v2
+    //   v3 = 5 + v3
+    //   g_mem[144 + v1] = v3
+    //   vcc = (0 == v0)
+    //   if (!vcc) goto end
+    //   g_mem[0] = s0  (ThreadGroupCountX = 2)
+    //   g_mem[4] = 1   (ThreadGroupCountY = 1)
+    //   g_mem[8] = 1   (ThreadGroupCountZ = 1)
+    // end: s_endpgm
+    std::vector<uint32_t> producer_dwords;
+    producer_dwords.push_back(vop2(26, 1, 130, 0));         // v_lshlrev_b32 v1, 2, v0
+    global_mem(producer_dwords, 12, 2, 1, 127, 16);         // global_load_dword v2, v1, off offset:16
+    producer_dwords.push_back(vop2(37, 3, 256 + 2, 2));     // v_add_nc_u32 v3, v2, v2
+    producer_dwords.push_back(vop2(37, 3, 128 + 5, 3));     // v_add_nc_u32 v3, 5, v3
+    global_mem(producer_dwords, 28, 3, 1, 127, 144);        // global_store_dword v1, v3, off offset:144
+    producer_dwords.push_back(vopc(0xC2, 128, 0));          // v_cmp_eq_u32 vcc, 0, v0
+    producer_dwords.push_back(sopp(6, 10));                 // s_cbranch_vccz +10 -> skip 10 dwords to s_endpgm
+    producer_dwords.push_back(vop1(1, 4, 128));             // v_mov_b32 v4, 0
+    producer_dwords.push_back(vop1(1, 5, 0));               // v_mov_b32 v5, s0
+    producer_dwords.push_back(vop1(1, 6, 129));             // v_mov_b32 v6, 1
+    producer_dwords.push_back(vop1(1, 7, 129));             // v_mov_b32 v7, 1
+    global_mem(producer_dwords, 28, 5, 4, 127, 0);          // global_store_dword v4, v5, off offset:0
+    global_mem(producer_dwords, 28, 6, 4, 127, 4);          // global_store_dword v4, v6, off offset:4
+    global_mem(producer_dwords, 28, 7, 4, 127, 8);          // global_store_dword v4, v7, off offset:8
+    producer_dwords.push_back(sopp(1));                     // s_endpgm
+
+    // Node 1 ("ConsumerNode", Coalescing, numthreads(16,1,1), packed as "KXRN"):
+    //   Dispatched via ExecuteIndirect using GPU-generated {2, 1, 1} -> 32 threads!
+    //   v1 = v0 << 2
+    //   v2 = g_mem[144 + v1]
+    //   v3 = s0 + v2
+    //   v3 = v0 + v3
+    //   g_mem[272 + v1] = v3
+    //   s_endpgm
+    std::vector<uint32_t> consumer_dwords;
+    consumer_dwords.push_back(vop2(26, 1, 130, 0));         // v_lshlrev_b32 v1, 2, v0
+    global_mem(consumer_dwords, 12, 2, 1, 127, 144);        // global_load_dword v2, v1, off offset:144
+    consumer_dwords.push_back(vop2(37, 3, 0, 2));           // v_add_nc_u32 v3, s0, v2
+    consumer_dwords.push_back(vop2(37, 3, 256 + 0, 3));     // v_add_nc_u32 v3, v0, v3
+    global_mem(consumer_dwords, 28, 3, 1, 127, 272);        // global_store_dword v1, v3, off offset:272
+    consumer_dwords.push_back(sopp(1));                     // s_endpgm
+
+    gpu::WorkGraphProgram prog{};
+    prog.name = "Rdna2ProducerConsumerDispatchGraph";
+    const uint32_t prod_idx = prog.add_node({
+        .name = "ProducerNode",
+        .kind = gpu::WorkGraphNodeKind::Broadcasting,
+        .group_size_x = 32,
+        .group_size_y = 1,
+        .group_size_z = 1,
+        .record_stride_bytes = 16,
+        .max_output_records = 32,
+        .rdna2_dwords = producer_dwords,
+    });
+    const uint32_t cons_idx = prog.add_node({
+        .name = "ConsumerNode",
+        .kind = gpu::WorkGraphNodeKind::Coalescing,
+        .group_size_x = 16,
+        .group_size_y = 1,
+        .group_size_z = 1,
+        .record_stride_bytes = 0,
+        .max_output_records = 0,
+        .kxrn_bytecode = gpu::pack_kxrn_compute_bytecode(16, consumer_dwords),
+    });
+    prog.add_edge(prod_idx, cons_idx, 0, 144, 1);
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "D3D12 adapters available");
+
+    constexpr uint32_t kRecords = 32;
+    std::vector<uint32_t> init_buf(128, 0u);
+    for (uint32_t i = 0; i < kRecords; ++i) {
+        init_buf[4 + i] = 10u + i * 3u;
+        init_buf[68 + i] = 0xDEAD0000u + i;  // Sentinel overwritten only if ExecuteIndirect runs
+    }
+
+    gpu::WorkGraphDispatchDesc dispatch_desc{};
+    dispatch_desc.entry_groups_x = 1;
+    dispatch_desc.entry_groups_y = 1;
+    dispatch_desc.entry_groups_z = 1;
+    dispatch_desc.initial_buffer_u32 = init_buf;
+    dispatch_desc.node_root_constants = {
+        std::array<uint32_t, 8>{2u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},    // Node 0: emit ThreadGroupCountX = 2
+        std::array<uint32_t, 8>{100u, 0u, 0u, 0u, 0u, 0u, 0u, 0u},  // Node 1: consumer bias = 100
+    };
+
+    IDXGIFactory6* factory = nullptr;
+    KX_CHECK(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))), "CreateDXGIFactory1");
+
+    uint64_t hw_verified = 0;
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        IDXGIAdapter1* dxgi_ad = nullptr;
+        if (FAILED(factory->EnumAdapters1(ad.index, &dxgi_ad))) continue;
+
+        ID3D12Device* raw_dev = nullptr;
+        HRESULT hr = D3D12CreateDevice(dxgi_ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&raw_dev));
+        dxgi_ad->Release();
+        if (FAILED(hr) || !raw_dev) continue;
+
+        auto* dev_proxy = new hle::KxDeviceProxy(raw_dev);
+        raw_dev->Release();
+
+        const auto cap = gpu::WorkGraphExecutor::CheckWorkGraphSupport(dev_proxy);
+        KX_CHECK(cap.selected_mode == gpu::WorkGraphExecutionMode::FallbackExecuteIndirect,
+                 "SDK 10.0.22621.0 selects clean-room ExecuteIndirect fallback scheduler");
+
+        {
+            gpu::WorkGraphExecutor exec;
+            auto comp = exec.compile(dev_proxy, prog, dxc);
+            KX_CHECK(comp.has_value(), comp.error().message);
+            KX_CHECK(exec.is_compiled() && exec.compiled_node_dxil().size() == 2, "2 compiled node DXIL blobs");
+
+            auto res = exec.execute(dispatch_desc);
+            KX_CHECK(res.has_value(), res.error().message);
+            KX_CHECK(res->direct_dispatches == 1 && res->indirect_dispatches == 1 && res->uav_barriers >= 2,
+                     "1 entry dispatch + 1 GPU ExecuteIndirect consumer dispatch + UAV barriers");
+            KX_CHECK(res->executed_node_order.size() == 2 &&
+                     res->executed_node_order[0] == 0 && res->executed_node_order[1] == 1,
+                     "Executed in topological order [0, 1]");
+            KX_CHECK(res->allocator_metrics.allocation_count >= 1 && res->allocator_metrics.used_bytes > 0,
+                     "RecordRingAllocator tracked edge record backing");
+
+            // Verify GPU-generated D3D12_DISPATCH_ARGUMENTS {2, 1, 1}
+            KX_CHECK(res->output_u32[0] == 2u && res->output_u32[1] == 1u && res->output_u32[2] == 1u,
+                     std::format("GPU-generated dispatch args mismatch on {}: {{{}, {}, {}}}",
+                                 ad.name, res->output_u32[0], res->output_u32[1], res->output_u32[2]));
+
+            // Verify all 32 intermediate producer records and all 32 consumer outputs bit-exact
+            for (uint32_t i = 0; i < kRecords; ++i) {
+                const uint32_t expected_rec = init_buf[4 + i] * 2u + 5u;
+                const uint32_t expected_out = expected_rec + 100u + i;
+                KX_CHECK(res->output_u32[36 + i] == expected_rec,
+                         std::format("Producer record[{}] mismatch on {}: got {} != {}",
+                                     i, ad.name, res->output_u32[36 + i], expected_rec));
+                KX_CHECK(res->output_u32[68 + i] == expected_out,
+                         std::format("Consumer output[{}] mismatch on {}: got {} != {}",
+                                     i, ad.name, res->output_u32[68 + i], expected_out));
+            }
+
+            ++hw_verified;
+            std::cout << std::format(
+                "    -> Hardware [{}] {} PASS (2-node RDNA2 Work Graph -> GPU ExecuteIndirect {{2,1,1}} | 32/32 records bit-exact | {:.2f} ms | Driver WG Tier={})\n",
+                ad.index, ad.name, res->gpu_ms, cap.driver_work_graphs_tier);
+        }
+        dev_proxy->Release();
+    }
+    factory->Release();
+
+    KX_CHECK(hw_verified >= 1, "At least one hardware GPU verified for RDNA2 Work Graph execution");
+    const auto stats = hle::d3d12x_stats();
+    KX_CHECK(stats.work_graphs_created == hw_verified, "D3D12XStats::work_graphs_created matches verified GPUs");
+    KX_CHECK(stats.work_graph_dispatches == hw_verified, "D3D12XStats::work_graph_dispatches matches verified GPUs");
+    KX_CHECK(stats.pso_binds >= hw_verified * 2 && stats.dispatch_calls >= hw_verified && stats.barrier_calls >= hw_verified * 2,
+             "KxDeviceProxy / KxGraphicsCommandListProxy telemetry recorded Work Graph dispatches and barriers");
+}
+
+}  // namespace
+
 int main() {
     std::cout << "KestrelX Verification Suite\n";
     std::cout << "===========================\n";
@@ -3378,6 +3696,8 @@ int main() {
     run_test("D3D12.X ID3D12GraphicsCommandList5 VRS Tier 2 Hardware Render & Telemetry", test_vrs_tier2_hardware_render_and_proxy_telemetry);
     run_test("GameInput Multi-Controller Slot Management (0..3) & Rumble Isolation", test_gameinput_multi_controller_slots_and_rumble);
     run_test("GameInput Device Hotplug Callbacks, Re-Entrancy & Telemetry", test_gameinput_hotplug_callbacks_and_telemetry);
+    run_test("D3D12 Work Graph DAG Validation & 16B-Aligned RecordRingAllocator", test_work_graph_program_validation_and_ring_allocator);
+    run_test("D3D12 Work Graph 2-Node RDNA2 ExecuteIndirect Producer->Consumer on Dual-GPU Hardware", test_work_graph_rdna2_execute_indirect_dual_gpu);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

@@ -9,10 +9,14 @@ namespace kestrel::hle {
 Registry::Registry() = default;
 
 Registry::~Registry() {
-    if (thunk_page_) {
-        VirtualFree(thunk_page_, 0, MEM_RELEASE);
-        thunk_page_ = nullptr;
+    for (uint8_t* page : thunk_pages_) {
+        if (page) {
+            VirtualFree(page, 0, MEM_RELEASE);
+        }
     }
+    thunk_pages_.clear();
+    thunk_used_ = 0;
+    thunk_capacity_ = 0;
 }
 
 void Registry::register_module(std::string_view dll_name) {
@@ -65,18 +69,20 @@ void* Registry::get_or_create_stub(std::string_view dll_name, std::string_view s
     if (auto it = stubs_.find(key); it != stubs_.end()) return it->second->code;
 
     constexpr size_t kThunkSize = 32;
-    if (!thunk_page_ || thunk_used_ + kThunkSize > thunk_capacity_) {
-        thunk_capacity_ = 65536;
+    if (thunk_pages_.empty() || thunk_used_ + kThunkSize > thunk_capacity_) {
+        constexpr size_t kPageBytes = 65536;
+        auto* page = static_cast<uint8_t*>(
+            VirtualAlloc(nullptr, kPageBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (!page) return nullptr;
+        thunk_pages_.push_back(page);
+        thunk_capacity_ = kPageBytes;
         thunk_used_ = 0;
-        thunk_page_ = static_cast<uint8_t*>(
-            VirtualAlloc(nullptr, thunk_capacity_, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     }
-    if (!thunk_page_) return nullptr;
 
     auto slot = std::make_unique<StubSlot>();
     slot->dll = std::string(dll_name);
     slot->symbol = std::string(symbol);
-    uint8_t* code = thunk_page_ + thunk_used_;
+    uint8_t* code = thunk_pages_.back() + thunk_used_;
     thunk_used_ += kThunkSize;
 
     const uint64_t slot_addr = reinterpret_cast<uint64_t>(slot.get());
@@ -102,6 +108,11 @@ std::vector<StubCallRecord> Registry::called_stubs() const {
         if (slot->count > 0) out.push_back({slot->dll, slot->symbol, slot->count});
     }
     return out;
+}
+
+size_t Registry::thunk_page_count() const {
+    std::lock_guard lock(mutex_);
+    return thunk_pages_.size();
 }
 
 }  // namespace kestrel::hle

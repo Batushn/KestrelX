@@ -5162,6 +5162,541 @@ void test_xaudio2_pitch_resampling_submix_and_x3daudio() {
     xa->Release();
 }
 
+void test_pe_delay_load_import_parsing_and_loading() {
+    // 1. Parse both RVA-based (grAttrs=1) and legacy VA-based (grAttrs=0) delay-load descriptors
+    constexpr uint64_t kBase = 0x10000000ull;
+    SynthPeBuilder pe(false, kBase);
+
+    // RVA-based descriptor (delay_hle.dll: named "DelayFunc" + ordinal #42)
+    const uint32_t dll0_rva = pe.write_cstring("delay_hle.dll");
+    const uint32_t hn0_rva = pe.write_hint_name("DelayFunc");
+    const uint32_t int0_rva = pe.alloc_data(3 * 8, 8);
+    const uint32_t iat0_rva = pe.alloc_data(3 * 8, 8);
+    pe.write_at_data_rva<uint64_t>(int0_rva + 0, hn0_rva);
+    pe.write_at_data_rva<uint64_t>(int0_rva + 8, IMAGE_ORDINAL_FLAG64 | 42ull);
+    pe.write_at_data_rva<uint64_t>(int0_rva + 16, 0ull);
+
+    // VA-based descriptor (grAttrs=0, delay_va.dll: named "LegacyVaFunc")
+    const uint32_t dll1_rva = pe.write_cstring("delay_va.dll");
+    const uint32_t hn1_rva = pe.write_hint_name("LegacyVaFunc");
+    const uint32_t int1_rva = pe.alloc_data(2 * 8, 8);
+    const uint32_t iat1_rva = pe.alloc_data(2 * 8, 8);
+    pe.write_at_data_rva<uint64_t>(int1_rva + 0, kBase + hn1_rva);
+    pe.write_at_data_rva<uint64_t>(int1_rva + 8, 0ull);
+
+    const uint32_t delay_table_rva = pe.alloc_data(3 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR), 8);
+    IMAGE_DELAYLOAD_DESCRIPTOR d0{};
+    d0.Attributes.AllAttributes = 1;  // RVA-based
+    d0.DllNameRVA = dll0_rva;
+    d0.ImportAddressTableRVA = iat0_rva;
+    d0.ImportNameTableRVA = int0_rva;
+
+    IMAGE_DELAYLOAD_DESCRIPTOR d1{};
+    d1.Attributes.AllAttributes = 0;  // Legacy VA-based
+    d1.DllNameRVA = static_cast<uint32_t>(kBase + dll1_rva);
+    d1.ImportAddressTableRVA = static_cast<uint32_t>(kBase + iat1_rva);
+    d1.ImportNameTableRVA = static_cast<uint32_t>(kBase + int1_rva);
+
+    IMAGE_DELAYLOAD_DESCRIPTOR d_null{};
+    pe.write_at_data_rva(delay_table_rva + 0 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR), d0);
+    pe.write_at_data_rva(delay_table_rva + 1 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR), d1);
+    pe.write_at_data_rva(delay_table_rva + 2 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR), d_null);
+    pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, delay_table_rva, 3 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR));
+
+    auto parsed = loader::parse_pe64(pe.raw, "delay_test.exe");
+    KX_CHECK(parsed.has_value(), parsed.error().message);
+    KX_CHECK(parsed->imports.size() == 2, "expected 2 delay-load import modules");
+
+    KX_CHECK(parsed->imports[0].is_delay_load, "module 0 is_delay_load");
+    KX_CHECK(parsed->imports[0].dll_name == "delay_hle.dll", "module 0 name");
+    KX_CHECK(parsed->imports[0].symbols.size() == 2, "module 0 symbol count");
+    KX_CHECK(!parsed->imports[0].symbols[0].by_ordinal && parsed->imports[0].symbols[0].name == "DelayFunc", "delay named sym");
+    KX_CHECK(parsed->imports[0].symbols[0].iat_rva == iat0_rva, "delay sym 0 iat_rva");
+    KX_CHECK(parsed->imports[0].symbols[1].by_ordinal && parsed->imports[0].symbols[1].ordinal == 42, "delay ordinal sym");
+    KX_CHECK(parsed->imports[0].symbols[1].iat_rva == iat0_rva + 8, "delay sym 1 iat_rva");
+
+    KX_CHECK(parsed->imports[1].is_delay_load, "module 1 is_delay_load");
+    KX_CHECK(parsed->imports[1].dll_name == "delay_va.dll", "module 1 name");
+    KX_CHECK(parsed->imports[1].symbols.size() == 1 && parsed->imports[1].symbols[0].name == "LegacyVaFunc", "legacy VA delay sym");
+    KX_CHECK(parsed->imports[1].symbols[0].iat_rva == iat1_rva, "legacy VA iat_rva");
+
+    // 2. Also verify PeLoader resolves delay-load imports into IAT slots
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestDelayLoad";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp);
+
+    // Add minimal empty reloc table so image can relocate anywhere cleanly
+    const uint32_t reloc_rva = pe.alloc_data(sizeof(IMAGE_BASE_RELOCATION), 4);
+    IMAGE_BASE_RELOCATION empty_reloc{SynthPeBuilder::kDataRva, sizeof(IMAGE_BASE_RELOCATION)};
+    pe.write_at_data_rva(reloc_rva, empty_reloc);
+    pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, sizeof(IMAGE_BASE_RELOCATION));
+
+    const fs::path exe_path = tmp / "delay_test.exe";
+    pe.write_file(exe_path);
+
+    hle::Registry reg;
+    reg.register_export("delay_hle.dll", "DelayFunc", reinterpret_cast<void*>(&mock_delay_func));
+    reg.register_ordinal("delay_hle.dll", 42, "DelayOrd42", reinterpret_cast<void*>(&mock_delay_ord_func));
+    reg.register_export("delay_va.dll", "LegacyVaFunc", reinterpret_cast<void*>(&mock_delay_func));
+
+    loader::PeLoader loader(reg, tmp);
+    auto mod = loader.load_image(exe_path);
+    KX_CHECK(mod.has_value(), mod.error().message);
+    KX_CHECK((*mod)->hle_imports == 3, "all 3 delay-load HLE imports resolved");
+
+    uint64_t slot0 = 0, slot1 = 0, slot2 = 0;
+    std::memcpy(&slot0, (*mod)->base + iat0_rva, 8);
+    std::memcpy(&slot1, (*mod)->base + iat0_rva + 8, 8);
+    std::memcpy(&slot2, (*mod)->base + iat1_rva, 8);
+    KX_CHECK(slot0 == reinterpret_cast<uint64_t>(&mock_delay_func), "delay named IAT patched");
+    KX_CHECK(slot1 == reinterpret_cast<uint64_t>(&mock_delay_ord_func), "delay ordinal IAT patched");
+    KX_CHECK(slot2 == reinterpret_cast<uint64_t>(&mock_delay_func), "legacy VA delay IAT patched");
+
+    fs::remove_all(tmp, ec);
+}
+
+void test_pe_export_forwarders_and_cycle_guard() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestForwarders";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp);
+
+    auto add_empty_reloc = [](SynthPeBuilder& pe) {
+        const uint32_t r = pe.alloc_data(sizeof(IMAGE_BASE_RELOCATION), 4);
+        IMAGE_BASE_RELOCATION blk{SynthPeBuilder::kDataRva, sizeof(IMAGE_BASE_RELOCATION)};
+        pe.write_at_data_rva(r, blk);
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, r, sizeof(IMAGE_BASE_RELOCATION));
+    };
+
+    // 1. target_guest.dll: exports TargetAdd (ord 10) -> returns 0x1234, and ord 25 -> returns 0x5678
+    {
+        SynthPeBuilder dll(true);
+        const uint8_t fn_add[] = {0xB8, 0x34, 0x12, 0x00, 0x00, 0xC3};  // mov eax, 0x1234; ret
+        const uint8_t fn_ord[] = {0xB8, 0x78, 0x56, 0x00, 0x00, 0xC3};  // mov eax, 0x5678; ret
+        dll.write_text(0x00, fn_add, sizeof(fn_add));
+        dll.write_text(0x20, fn_ord, sizeof(fn_ord));
+
+        // Export directory: Base=10, NumberOfFunctions=16 (ordinals 10..25), 1 named ("TargetAdd" -> idx 0)
+        const uint32_t exp_start = dll.alloc_data(sizeof(IMAGE_EXPORT_DIRECTORY), 4);
+        const uint32_t funcs_rva = dll.alloc_data(16 * 4, 4);
+        const uint32_t names_rva = dll.alloc_data(4, 4);
+        const uint32_t ords_rva = dll.alloc_data(2, 2);
+        const uint32_t dll_name_rva = dll.write_cstring("target_guest.dll");
+        const uint32_t sym_name_rva = dll.write_cstring("TargetAdd");
+
+        dll.write_at_data_rva<uint32_t>(funcs_rva + 0 * 4, SynthPeBuilder::kTextRva + 0x00);
+        dll.write_at_data_rva<uint32_t>(funcs_rva + 15 * 4, SynthPeBuilder::kTextRva + 0x20);
+        dll.write_at_data_rva<uint32_t>(names_rva, sym_name_rva);
+        dll.write_at_data_rva<uint16_t>(ords_rva, 0);
+
+        IMAGE_EXPORT_DIRECTORY ed{};
+        ed.Name = dll_name_rva;
+        ed.Base = 10;
+        ed.NumberOfFunctions = 16;
+        ed.NumberOfNames = 1;
+        ed.AddressOfFunctions = funcs_rva;
+        ed.AddressOfNames = names_rva;
+        ed.AddressOfNameOrdinals = ords_rva;
+        dll.write_at_data_rva(exp_start, ed);
+        const uint32_t exp_size = (SynthPeBuilder::kDataRva + dll.data_cursor) - exp_start;
+        dll.set_data_dir(IMAGE_DIRECTORY_ENTRY_EXPORT, exp_start, exp_size);
+        add_empty_reloc(dll);
+        dll.write_file(tmp / "target_guest.dll");
+    }
+
+    // 2. fwd_mid.dll: 4 forwarded exports covering guest name, guest ordinal, HLE, and host DLL
+    {
+        SynthPeBuilder dll(true);
+        const uint32_t exp_start = dll.alloc_data(sizeof(IMAGE_EXPORT_DIRECTORY), 4);
+        const uint32_t funcs_rva = dll.alloc_data(4 * 4, 4);
+        const uint32_t names_rva = dll.alloc_data(4 * 4, 4);
+        const uint32_t ords_rva = dll.alloc_data(4 * 2, 2);
+        const uint32_t dll_name_rva = dll.write_cstring("fwd_mid.dll");
+
+        const char* sym_names[4] = {"FwdGuestName", "FwdGuestOrd", "FwdHle", "FwdHost"};
+        const char* fwd_targets[4] = {
+            "target_guest.TargetAdd",
+            "target_guest.#25",
+            "mock_hle.MockApi",
+            "KERNEL32.GetCurrentProcessId",
+        };
+        for (uint32_t i = 0; i < 4; ++i) {
+            const uint32_t s_rva = dll.write_cstring(sym_names[i]);
+            const uint32_t f_rva = dll.write_cstring(fwd_targets[i]);
+            dll.write_at_data_rva<uint32_t>(funcs_rva + i * 4, f_rva);
+            dll.write_at_data_rva<uint32_t>(names_rva + i * 4, s_rva);
+            dll.write_at_data_rva<uint16_t>(ords_rva + i * 2, static_cast<uint16_t>(i));
+        }
+
+        IMAGE_EXPORT_DIRECTORY ed{};
+        ed.Name = dll_name_rva;
+        ed.Base = 1;
+        ed.NumberOfFunctions = 4;
+        ed.NumberOfNames = 4;
+        ed.AddressOfFunctions = funcs_rva;
+        ed.AddressOfNames = names_rva;
+        ed.AddressOfNameOrdinals = ords_rva;
+        dll.write_at_data_rva(exp_start, ed);
+        const uint32_t exp_size = (SynthPeBuilder::kDataRva + dll.data_cursor) - exp_start;
+        dll.set_data_dir(IMAGE_DIRECTORY_ENTRY_EXPORT, exp_start, exp_size);
+        add_empty_reloc(dll);
+        dll.write_file(tmp / "fwd_mid.dll");
+    }
+
+    // 3. client.exe importing all 4 forwarded symbols from fwd_mid.dll
+    uint32_t client_iat_rva = 0;
+    {
+        SynthPeBuilder exe(false);
+        const uint32_t dll_str = exe.write_cstring("fwd_mid.dll");
+        const uint32_t hn0 = exe.write_hint_name("FwdGuestName");
+        const uint32_t hn1 = exe.write_hint_name("FwdGuestOrd");
+        const uint32_t hn2 = exe.write_hint_name("FwdHle");
+        const uint32_t hn3 = exe.write_hint_name("FwdHost");
+        const uint32_t ilt_rva = exe.alloc_data(5 * 8, 8);
+        client_iat_rva = exe.alloc_data(5 * 8, 8);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 0, hn0);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 8, hn1);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 16, hn2);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 24, hn3);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 32, 0ull);
+
+        const uint32_t imp_rva = exe.alloc_data(2 * sizeof(IMAGE_IMPORT_DESCRIPTOR), 4);
+        IMAGE_IMPORT_DESCRIPTOR desc{};
+        desc.OriginalFirstThunk = ilt_rva;
+        desc.Name = dll_str;
+        desc.FirstThunk = client_iat_rva;
+        exe.write_at_data_rva(imp_rva, desc);
+        exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_IMPORT, imp_rva, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        add_empty_reloc(exe);
+        exe.write_file(tmp / "client.exe");
+    }
+
+    hle::Registry reg;
+    reg.register_export("mock_hle.dll", "MockApi", reinterpret_cast<void*>(&mock_hle_fwd_func));
+
+    loader::PeLoader loader(reg, tmp);
+    auto mod = loader.load_image(tmp / "client.exe");
+    KX_CHECK(mod.has_value(), mod.error().message);
+    KX_CHECK((*mod)->guest_imports == 4, "all 4 forwarded imports resolved");
+    KX_CHECK((*mod)->stub_imports == 0, "no fallback stubs expected");
+
+    uint64_t slots[4]{};
+    std::memcpy(slots, (*mod)->base + client_iat_rva, sizeof(slots));
+
+    using FnU32 = uint32_t(__cdecl*)();
+    using FnPid = DWORD(WINAPI*)();
+    KX_CHECK(reinterpret_cast<FnU32>(slots[0])() == 0x1234u, "DLL.Symbol guest forwarder executed");
+    KX_CHECK(reinterpret_cast<FnU32>(slots[1])() == 0x5678u, "DLL.#Ordinal guest forwarder executed");
+    KX_CHECK(slots[2] == reinterpret_cast<uint64_t>(&mock_hle_fwd_func), "HLE forwarder matched");
+    KX_CHECK(reinterpret_cast<FnPid>(slots[3])() == GetCurrentProcessId(), "Host DLL forwarder matched");
+
+    // 4. Forwarder cycle guard: cycle_a.dll!Ping -> cycle_b.Pong -> cycle_a.Ping
+    auto write_cycle_dll = [&](const char* filename, const char* sym, const char* fwd) {
+        SynthPeBuilder dll(true);
+        const uint32_t exp_start = dll.alloc_data(sizeof(IMAGE_EXPORT_DIRECTORY), 4);
+        const uint32_t funcs_rva = dll.alloc_data(4, 4);
+        const uint32_t names_rva = dll.alloc_data(4, 4);
+        const uint32_t ords_rva = dll.alloc_data(2, 2);
+        const uint32_t dname_rva = dll.write_cstring(filename);
+        const uint32_t sname_rva = dll.write_cstring(sym);
+        const uint32_t fwd_rva = dll.write_cstring(fwd);
+        dll.write_at_data_rva<uint32_t>(funcs_rva, fwd_rva);
+        dll.write_at_data_rva<uint32_t>(names_rva, sname_rva);
+        dll.write_at_data_rva<uint16_t>(ords_rva, 0);
+
+        IMAGE_EXPORT_DIRECTORY ed{};
+        ed.Name = dname_rva;
+        ed.Base = 1;
+        ed.NumberOfFunctions = 1;
+        ed.NumberOfNames = 1;
+        ed.AddressOfFunctions = funcs_rva;
+        ed.AddressOfNames = names_rva;
+        ed.AddressOfNameOrdinals = ords_rva;
+        dll.write_at_data_rva(exp_start, ed);
+        const uint32_t exp_size = (SynthPeBuilder::kDataRva + dll.data_cursor) - exp_start;
+        dll.set_data_dir(IMAGE_DIRECTORY_ENTRY_EXPORT, exp_start, exp_size);
+        add_empty_reloc(dll);
+        dll.write_file(tmp / filename);
+    };
+    write_cycle_dll("cycle_a.dll", "Ping", "cycle_b.Pong");
+    write_cycle_dll("cycle_b.dll", "Pong", "cycle_a.Ping");
+
+    {
+        SynthPeBuilder exe(false);
+        const uint32_t dll_str = exe.write_cstring("cycle_a.dll");
+        const uint32_t hn = exe.write_hint_name("Ping");
+        const uint32_t ilt_rva = exe.alloc_data(2 * 8, 8);
+        const uint32_t iat_rva = exe.alloc_data(2 * 8, 8);
+        exe.write_at_data_rva<uint64_t>(ilt_rva, hn);
+        const uint32_t imp_rva = exe.alloc_data(2 * sizeof(IMAGE_IMPORT_DESCRIPTOR), 4);
+        IMAGE_IMPORT_DESCRIPTOR desc{};
+        desc.OriginalFirstThunk = ilt_rva;
+        desc.Name = dll_str;
+        desc.FirstThunk = iat_rva;
+        exe.write_at_data_rva(imp_rva, desc);
+        exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_IMPORT, imp_rva, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        add_empty_reloc(exe);
+        exe.write_file(tmp / "cycle_client.exe");
+    }
+
+    auto cyc_res = loader.load_image(tmp / "cycle_client.exe");
+    KX_CHECK(!cyc_res.has_value(), "cyclic export forwarder must fail cleanly");
+    for (const auto& m : loader.modules()) {
+        KX_CHECK(m->name != "cycle_client.exe", "failed cycle_client.exe must be rolled back from modules_");
+    }
+
+    fs::remove_all(tmp, ec);
+}
+
+void test_registry_ordinal_import_resolution() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestOrdinalImport";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp);
+
+    SynthPeBuilder exe(false);
+    const uint32_t dll_str = exe.write_cstring("ord_hle.dll");
+    const uint32_t hn_alias = exe.write_hint_name("OrdAliasFunc");
+    const uint32_t ilt_rva = exe.alloc_data(3 * 8, 8);
+    const uint32_t iat_rva = exe.alloc_data(3 * 8, 8);
+    exe.write_at_data_rva<uint64_t>(ilt_rva + 0, IMAGE_ORDINAL_FLAG64 | 77ull);
+    exe.write_at_data_rva<uint64_t>(ilt_rva + 8, hn_alias);
+    exe.write_at_data_rva<uint64_t>(ilt_rva + 16, 0ull);
+
+    const uint32_t imp_rva = exe.alloc_data(2 * sizeof(IMAGE_IMPORT_DESCRIPTOR), 4);
+    IMAGE_IMPORT_DESCRIPTOR desc{};
+    desc.OriginalFirstThunk = ilt_rva;
+    desc.Name = dll_str;
+    desc.FirstThunk = iat_rva;
+    exe.write_at_data_rva(imp_rva, desc);
+    exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_IMPORT, imp_rva, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+
+    const uint32_t reloc_rva = exe.alloc_data(sizeof(IMAGE_BASE_RELOCATION), 4);
+    IMAGE_BASE_RELOCATION empty_reloc{SynthPeBuilder::kDataRva, sizeof(IMAGE_BASE_RELOCATION)};
+    exe.write_at_data_rva(reloc_rva, empty_reloc);
+    exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, sizeof(IMAGE_BASE_RELOCATION));
+
+    const fs::path exe_path = tmp / "ord_client.exe";
+    exe.write_file(exe_path);
+
+    hle::Registry reg;
+    reg.register_ordinal("ord_hle.dll", 77, "OrdAliasFunc", reinterpret_cast<void*>(&mock_ord_reg_func));
+
+    loader::PeLoader loader(reg, tmp);
+    auto mod = loader.load_image(exe_path);
+    KX_CHECK(mod.has_value(), mod.error().message);
+    KX_CHECK((*mod)->hle_imports == 2 && (*mod)->stub_imports == 0, "ordinal + alias HLE resolution");
+
+    uint64_t slot0 = 0, slot1 = 0;
+    std::memcpy(&slot0, (*mod)->base + iat_rva, 8);
+    std::memcpy(&slot1, (*mod)->base + iat_rva + 8, 8);
+    KX_CHECK(slot0 == reinterpret_cast<uint64_t>(&mock_ord_reg_func), "ordinal #77 IAT slot matched");
+    KX_CHECK(slot1 == reinterpret_cast<uint64_t>(&mock_ord_reg_func), "alias name IAT slot matched");
+
+    fs::remove_all(tmp, ec);
+}
+
+void test_pe_dir64_and_highlow_relocations() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestRelocs";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp);
+
+    // Reserve a real address so using it as ImageBase forces VirtualAlloc to relocate (delta != 0).
+    void* blocker = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+    KX_CHECK(blocker != nullptr, "reserve blocker page");
+    const uint64_t preferred_base = reinterpret_cast<uint64_t>(blocker);
+
+    SynthPeBuilder exe(false, preferred_base);
+    const uint32_t slot64_rva = exe.alloc_data(8, 8);
+    const uint32_t slot32_rva = exe.alloc_data(4, 4);
+    const uint64_t init64 = preferred_base + 0x1234ull;
+    const uint32_t init32 = static_cast<uint32_t>(preferred_base) + 0x5678u;
+    exe.write_at_data_rva<uint64_t>(slot64_rva, init64);
+    exe.write_at_data_rva<uint32_t>(slot32_rva, init32);
+
+    // Build base relocation block with DIR64, HIGHLOW, and ABSOLUTE (padding)
+    const uint32_t block_size = sizeof(IMAGE_BASE_RELOCATION) + 4 * sizeof(uint16_t);
+    const uint32_t reloc_rva = exe.alloc_data(block_size, 4);
+    IMAGE_BASE_RELOCATION blk{};
+    blk.VirtualAddress = SynthPeBuilder::kDataRva;
+    blk.SizeOfBlock = block_size;
+    exe.write_at_data_rva(reloc_rva, blk);
+
+    const uint16_t entries[4] = {
+        static_cast<uint16_t>((IMAGE_REL_BASED_DIR64 << 12) | ((slot64_rva - SynthPeBuilder::kDataRva) & 0x0FFFu)),
+        static_cast<uint16_t>((IMAGE_REL_BASED_HIGHLOW << 12) | ((slot32_rva - SynthPeBuilder::kDataRva) & 0x0FFFu)),
+        static_cast<uint16_t>(IMAGE_REL_BASED_ABSOLUTE << 12),
+        static_cast<uint16_t>(IMAGE_REL_BASED_ABSOLUTE << 12),
+    };
+    exe.write_at_data_rva(reloc_rva + sizeof(IMAGE_BASE_RELOCATION), entries);
+    exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, block_size);
+
+    const fs::path exe_path = tmp / "reloc_test.exe";
+    exe.write_file(exe_path);
+
+    hle::Registry reg;
+    loader::PeLoader loader(reg, tmp);
+    auto mod = loader.load_image(exe_path);
+    VirtualFree(blocker, 0, MEM_RELEASE);
+
+    KX_CHECK(mod.has_value(), mod.error().message);
+    const int64_t delta = reinterpret_cast<int64_t>((*mod)->base) - static_cast<int64_t>(preferred_base);
+    KX_CHECK(delta != 0, "expected forced relocation with non-zero delta");
+    KX_CHECK((*mod)->relocs_applied == 2, "expected exact 2 relocations applied (DIR64 + HIGHLOW)");
+
+    uint64_t got64 = 0;
+    uint32_t got32 = 0;
+    std::memcpy(&got64, (*mod)->base + slot64_rva, 8);
+    std::memcpy(&got32, (*mod)->base + slot32_rva, 4);
+    KX_CHECK(got64 == static_cast<uint64_t>(static_cast<int64_t>(init64) + delta), "DIR64 relocation exact");
+    KX_CHECK(got32 == static_cast<uint32_t>(init32 + static_cast<int32_t>(delta)), "HIGHLOW relocation exact");
+
+    fs::remove_all(tmp, ec);
+}
+
+void test_pe_bounds_hardening_and_rollback() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestHardening";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp);
+
+    hle::Registry reg;
+    loader::PeLoader loader(reg, tmp);
+
+    // 1. Out-of-bounds BASERELOC directory -> fails & rolls back (no lingering by_name_/modules_)
+    {
+        SynthPeBuilder pe(false);
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, 0x2F00, 0x400);  // exceeds SizeOfImage=0x3000
+        const fs::path p = tmp / "bad_reloc_dir.exe";
+        pe.write_file(p);
+        auto r1 = loader.load_image(p);
+        KX_CHECK(!r1.has_value(), "OOB BASERELOC dir must fail");
+        KX_CHECK(loader.modules().empty(), "modules_ empty after BASERELOC rollback");
+        auto r2 = loader.load_image(p);
+        KX_CHECK(!r2.has_value(), "by_name_ must be rolled back (second load also fails)");
+    }
+
+    // 2. Out-of-bounds DIR64 target RVA -> fails & rolls back
+    {
+        void* blocker = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+        KX_CHECK(blocker != nullptr, "reserve blocker");
+        SynthPeBuilder pe(false, reinterpret_cast<uint64_t>(blocker));
+        const uint32_t block_size = sizeof(IMAGE_BASE_RELOCATION) + 2 * sizeof(uint16_t);
+        const uint32_t reloc_rva = pe.alloc_data(block_size, 4);
+        IMAGE_BASE_RELOCATION blk{SynthPeBuilder::kDataRva, block_size};
+        pe.write_at_data_rva(reloc_rva, blk);
+        const uint16_t entries[2] = {
+            static_cast<uint16_t>((IMAGE_REL_BASED_DIR64 << 12) | 0x0FFCu),  // 0x2FFC + 8 > 0x3000
+            0,
+        };
+        pe.write_at_data_rva(reloc_rva + sizeof(IMAGE_BASE_RELOCATION), entries);
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, block_size);
+        const fs::path p = tmp / "bad_reloc_target.exe";
+        pe.write_file(p);
+        auto r1 = loader.load_image(p);
+        VirtualFree(blocker, 0, MEM_RELEASE);
+        KX_CHECK(!r1.has_value(), "OOB DIR64 target must fail");
+        KX_CHECK(loader.modules().empty(), "modules_ empty after DIR64 rollback");
+    }
+
+    // 3. Out-of-bounds IAT entry during resolve_imports -> fails & rolls back
+    {
+        SynthPeBuilder pe(false);
+        const uint32_t dll_str = pe.write_cstring("missing_iat_test.dll");
+        const uint32_t hn = pe.write_hint_name("SomeFn");
+        const uint32_t ilt_rva = pe.alloc_data(2 * 8, 8);
+        pe.write_at_data_rva<uint64_t>(ilt_rva, hn);
+        const uint32_t imp_rva = pe.alloc_data(2 * sizeof(IMAGE_IMPORT_DESCRIPTOR), 4);
+        IMAGE_IMPORT_DESCRIPTOR desc{};
+        desc.OriginalFirstThunk = ilt_rva;
+        desc.Name = dll_str;
+        desc.FirstThunk = 0x2FFCu;  // 0x2FFC + 8 > 0x3000 (SizeOfImage)
+        pe.write_at_data_rva(imp_rva, desc);
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_IMPORT, imp_rva, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        const uint32_t reloc_rva = pe.alloc_data(sizeof(IMAGE_BASE_RELOCATION), 4);
+        IMAGE_BASE_RELOCATION empty_reloc{SynthPeBuilder::kDataRva, sizeof(IMAGE_BASE_RELOCATION)};
+        pe.write_at_data_rva(reloc_rva, empty_reloc);
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, sizeof(IMAGE_BASE_RELOCATION));
+
+        const fs::path p = tmp / "bad_iat.exe";
+        pe.write_file(p);
+        auto r1 = loader.load_image(p);
+        KX_CHECK(!r1.has_value(), "OOB IAT entry must fail");
+        KX_CHECK(loader.modules().empty(), "modules_ empty after resolve_imports rollback");
+        auto r2 = loader.load_image(p);
+        KX_CHECK(!r2.has_value(), "by_name_ rolled back after resolve_imports failure");
+    }
+
+    // 4. Out-of-bounds section virtual_size (even with raw_size=0) & SizeOfImage=0
+    {
+        SynthPeBuilder pe(false);
+        pe.sec_hdr(1).SizeOfRawData = 0;
+        pe.sec_hdr(1).Misc.VirtualSize = 0x5000;  // 0x2000 + 0x5000 > 0x3000
+        const fs::path p = tmp / "bad_sec_vsize.exe";
+        pe.write_file(p);
+        KX_CHECK(!loader.load_image(p).has_value(), "OOB section virtual_size must fail");
+        KX_CHECK(loader.modules().empty(), "modules_ empty after OOB section");
+    }
+    {
+        SynthPeBuilder pe(false);
+        pe.opt_hdr().SizeOfImage = 0;
+        const fs::path p = tmp / "zero_img_size.exe";
+        pe.write_file(p);
+        KX_CHECK(!loader.load_image(p).has_value(), "SizeOfImage == 0 must fail");
+        KX_CHECK(loader.modules().empty(), "modules_ empty after zero SizeOfImage");
+    }
+
+    // 5. Out-of-bounds EXCEPTION & TLS directories must not crash (safely skipped)
+    {
+        SynthPeBuilder pe(false);
+        const uint32_t reloc_rva = pe.alloc_data(sizeof(IMAGE_BASE_RELOCATION), 4);
+        IMAGE_BASE_RELOCATION empty_reloc{SynthPeBuilder::kDataRva, sizeof(IMAGE_BASE_RELOCATION)};
+        pe.write_at_data_rva(reloc_rva, empty_reloc);
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, sizeof(IMAGE_BASE_RELOCATION));
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_EXCEPTION, 0x2FF8, 0x40);  // OOB
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_TLS, 0x2FE0, sizeof(IMAGE_TLS_DIRECTORY64));  // OOB
+        const fs::path p = tmp / "oob_exc_tls.exe";
+        pe.write_file(p);
+        auto mod = loader.load_image(p);
+        KX_CHECK(mod.has_value(), mod.error().message);
+        KX_CHECK((*mod)->pdata == nullptr, "OOB exception table must be skipped");
+        KX_CHECK((*mod)->tls_callbacks_run == 0, "OOB TLS directory must be skipped");
+    }
+
+    fs::remove_all(tmp, ec);
+}
+
+void test_registry_multipage_thunk_cleanup() {
+    void* stub_page0 = nullptr;
+    void* stub_page1 = nullptr;
+    {
+        hle::Registry reg;
+        constexpr size_t kNumStubs = 2100;  // > 2048 (65536 / 32) -> forces 2 RWX thunk pages
+        for (size_t i = 0; i < kNumStubs; ++i) {
+            void* fn = reg.get_or_create_stub("bulk_stub.dll", "Stub_" + std::to_string(i));
+            KX_CHECK(fn != nullptr, "stub thunk allocation succeeded");
+            if (i == 0) stub_page0 = fn;
+            if (i == kNumStubs - 1) stub_page1 = fn;
+        }
+        KX_CHECK(reg.thunk_page_count() == 2, "expected 2 thunk pages allocated for 2100 stubs");
+
+        using StubFn = uint64_t(__cdecl*)();
+        KX_CHECK(reinterpret_cast<StubFn>(stub_page0)() == 0, "page 0 stub callable");
+        KX_CHECK(reinterpret_cast<StubFn>(stub_page1)() == 0, "page 1 stub callable");
+        KX_CHECK(reg.called_stubs().size() == 2, "both stubs recorded hits");
+    }
+
+    // After ~Registry(), both allocated thunk pages must be released (MEM_FREE)
+    MEMORY_BASIC_INFORMATION mbi0{};
+    MEMORY_BASIC_INFORMATION mbi1{};
+    KX_CHECK(VirtualQuery(stub_page0, &mbi0, sizeof(mbi0)) != 0 && mbi0.State == MEM_FREE,
+             "thunk page 0 freed by ~Registry()");
+    KX_CHECK(VirtualQuery(stub_page1, &mbi1, sizeof(mbi1)) != 0 && mbi1.State == MEM_FREE,
+             "thunk page 1 freed by ~Registry()");
+}
+
 }  // namespace
 
 int main() {
@@ -5211,6 +5746,12 @@ int main() {
     run_test("RDNA2 VCmp + Bitfield + Scalar64 + GlobalX4 Compute on Dual-GPU Hardware", test_rdna2_vcmp_bitfield_scalar64_globalx4_dual_gpu);
     run_test("XAudio2 Multi-Voice Software Mixer, Mastering Volume, Start/Stop Gating & Flush", test_xaudio2_multivoice_mixer_volume_gating_and_flush);
     run_test("XAudio2 Pitch Resampling, Non-48kHz Upsampling, Submix Routing & X3DAudio Panning", test_xaudio2_pitch_resampling_submix_and_x3daudio);
+    run_test("PE32+ Delay-Load Import Parsing (RVA & Legacy VA) & IAT Resolution", test_pe_delay_load_import_parsing_and_loading);
+    run_test("PE32+ Export Forwarders (DLL.Symbol, DLL.#Ordinal, HLE, Host) & Cycle Guard", test_pe_export_forwarders_and_cycle_guard);
+    run_test("HLE Registry::register_ordinal Import Resolution", test_registry_ordinal_import_resolution);
+    run_test("PE32+ DIR64 & HIGHLOW Base Relocations", test_pe_dir64_and_highlow_relocations);
+    run_test("PE32+ Loader Bounds Hardening & Error Rollback", test_pe_bounds_hardening_and_rollback);
+    run_test("HLE Registry Multi-Page (>2048 Stubs) Thunk Cleanup", test_registry_multipage_thunk_cleanup);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

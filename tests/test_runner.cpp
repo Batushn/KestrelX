@@ -4845,6 +4845,323 @@ void test_rdna2_vcmp_bitfield_scalar64_globalx4_dual_gpu() {
 }
 
 
+void test_xaudio2_multivoice_mixer_volume_gating_and_flush() {
+    hle::reset_xaudio2_stats();
+    hle::Registry reg;
+    hle::register_xaudio2(reg);
+
+    auto* create_fn = reinterpret_cast<HRESULT(__stdcall*)(hle::IKxXAudio2**, uint32_t, uint32_t)>(
+        reg.resolve_name("xaudio2_9.dll", "XAudio2Create"));
+    KX_CHECK(create_fn != nullptr, "XAudio2Create export resolved");
+
+    hle::IKxXAudio2* xa = nullptr;
+    KX_CHECK(SUCCEEDED(create_fn(&xa, 0, 0)) && xa != nullptr, "XAudio2Create S_OK");
+    hle::IKxMasteringVoice* mv = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateMasteringVoice(&mv, 2, 48000)) && mv != nullptr, "CreateMasteringVoice");
+
+    hle::KxWaveFormat fmt{3, 2, 48000, 32};
+    hle::IKxSourceVoice* sv_a = nullptr;
+    hle::IKxSourceVoice* sv_b = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSourceVoice(&sv_a, &fmt)) && sv_a != nullptr, "CreateSourceVoice A");
+    KX_CHECK(SUCCEEDED(xa->CreateSourceVoice(&sv_b, &fmt)) && sv_b != nullptr, "CreateSourceVoice B");
+
+    // 1. Simultaneous 2-voice additive mixing (A=240 frames @ 0.30, B=120 frames @ 0.45)
+    std::vector<float> buf_a(240 * 2, 0.30f);
+    std::vector<float> buf_b(120 * 2, 0.45f);
+    hle::KxAudioBuffer ab_a{0, static_cast<uint32_t>(buf_a.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(buf_a.data())};
+    hle::KxAudioBuffer ab_b{0, static_cast<uint32_t>(buf_b.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(buf_b.data())};
+
+    KX_CHECK(SUCCEEDED(sv_a->Start(0)) && SUCCEEDED(sv_b->Start(0)), "Start voices A & B");
+    KX_CHECK(SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_a)), "Submit A");
+    KX_CHECK(SUCCEEDED(sv_b->SubmitSourceBuffer(&ab_b)), "Submit B");
+    KX_CHECK(sv_a->GetBuffersQueued() == 1 && sv_b->GetBuffersQueued() == 1, "Both voices report 1 queued buffer");
+
+    std::vector<float> out(240 * 2, 0.0f);
+    const size_t got_mix = hle::xaudio2_drain_stereo_f32(out.data(), 240);
+    KX_CHECK(got_mix == 240, "Drained 240 mixed frames");
+    KX_CHECK(sv_a->GetBuffersQueued() == 0 && sv_b->GetBuffersQueued() == 0, "Queued buffer counts decremented to 0");
+    KX_CHECK(std::fabs(out[0] - 0.75f) < 1e-5f && std::fabs(out[119 * 2 + 1] - 0.75f) < 1e-5f,
+             "First 120 frames sum A (0.30) + B (0.45) == 0.75");
+    KX_CHECK(std::fabs(out[120 * 2 + 0] - 0.30f) < 1e-5f && std::fabs(out[239 * 2 + 1] - 0.30f) < 1e-5f,
+             "Remaining 120 frames carry voice A (0.30) after voice B completes");
+
+    // 2. Output limiter clamp [-1.0, 1.0]
+    std::vector<float> hot_pos(32 * 2, 0.80f);
+    std::vector<float> hot_neg(32 * 2, -0.85f);
+    hle::KxAudioBuffer ab_hp{0, static_cast<uint32_t>(hot_pos.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(hot_pos.data())};
+    hle::KxAudioBuffer ab_hn{0, static_cast<uint32_t>(hot_neg.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(hot_neg.data())};
+    KX_CHECK(SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_hp)) && SUCCEEDED(sv_b->SubmitSourceBuffer(&ab_hp)), "Submit hot positive");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 32) == 32, "Drain clamped positive");
+    KX_CHECK(std::fabs(out[0] - 1.0f) < 1e-6f && std::fabs(out[1] - 1.0f) < 1e-6f, "Additive overflow clamped to +1.0");
+
+    KX_CHECK(SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_hn)) && SUCCEEDED(sv_b->SubmitSourceBuffer(&ab_hn)), "Submit hot negative");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 32) == 32, "Drain clamped negative");
+    KX_CHECK(std::fabs(out[0] - (-1.0f)) < 1e-6f && std::fabs(out[1] - (-1.0f)) < 1e-6f, "Additive underflow clamped to -1.0");
+
+    // 3. Mastering volume attenuation, channel volumes & output matrix swap
+    KX_CHECK(SUCCEEDED(mv->SetVolume(0.5f)), "Mastering SetVolume(0.5)");
+    float mv_vol = 0.0f;
+    mv->GetVolume(&mv_vol);
+    KX_CHECK(std::fabs(mv_vol - 0.5f) < 1e-6f, "Mastering GetVolume == 0.5");
+
+    KX_CHECK(SUCCEEDED(sv_a->SetVolume(0.8f)), "Source A SetVolume(0.8)");
+    std::vector<float> unit(32 * 2, 1.0f);
+    hle::KxAudioBuffer ab_u{0, static_cast<uint32_t>(unit.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(unit.data())};
+    KX_CHECK(SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_u)), "Submit unit buffer");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 32) == 32, "Drain attenuated frames");
+    KX_CHECK(std::fabs(out[0] - 0.40f) < 1e-5f && std::fabs(out[1] - 0.40f) < 1e-5f,
+             "Mastering volume (0.5) * source volume (0.8) == 0.40");
+
+    KX_CHECK(SUCCEEDED(mv->SetVolume(1.0f)) && SUCCEEDED(sv_a->SetVolume(1.0f)), "Reset volumes to 1.0");
+    const float ch_vols[2] = {0.50f, 0.25f};
+    const float swap_mat[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+    KX_CHECK(SUCCEEDED(sv_a->SetChannelVolumes(2, ch_vols)), "SetChannelVolumes");
+    KX_CHECK(SUCCEEDED(sv_a->SetOutputMatrix(nullptr, 2, 2, swap_mat)), "SetOutputMatrix swap L/R");
+    KX_CHECK(SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_u)), "Submit unit buffer for matrix test");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 32) == 32, "Drain matrix-swapped frames");
+    KX_CHECK(std::fabs(out[0] - 0.25f) < 1e-5f && std::fabs(out[1] - 0.50f) < 1e-5f,
+             "Channel volumes + L/R swap matrix produce L=0.25, R=0.50");
+
+    // Reset matrix & channel volumes
+    const float ident_ch[2] = {1.0f, 1.0f};
+    const float ident_mat[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    KX_CHECK(SUCCEEDED(sv_a->SetChannelVolumes(2, ident_ch)), "Reset channel volumes");
+    KX_CHECK(SUCCEEDED(sv_a->SetOutputMatrix(nullptr, 2, 2, ident_mat)), "Reset output matrix");
+
+    // 4. Start/Stop voice gating & StartEngine/StopEngine gating with exact cursor preservation
+    KX_CHECK(SUCCEEDED(sv_a->Stop(0)), "Stop voice A");
+    std::vector<float> ramp(200 * 2, 0.0f);
+    for (size_t i = 0; i < 200; ++i) {
+        const float v = static_cast<float>(i) / 200.0f;
+        ramp[i * 2 + 0] = v;
+        ramp[i * 2 + 1] = v;
+    }
+    hle::KxAudioBuffer ab_ramp{0, static_cast<uint32_t>(ramp.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(ramp.data())};
+    KX_CHECK(SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_ramp)), "Submit ramp while stopped");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 64) == 0, "Stopped voice yields 0 frames");
+    KX_CHECK(sv_a->GetBuffersQueued() == 1, "Stopped voice keeps buffer queued");
+
+    KX_CHECK(SUCCEEDED(sv_a->Start(0)), "Start voice A");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 80) == 80, "Drain first 80 frames of ramp");
+    KX_CHECK(std::fabs(out[79 * 2 + 0] - (79.0f / 200.0f)) < 1e-5f, "Ramp sample 79 matches");
+    KX_CHECK(sv_a->GetBuffersQueued() == 1, "Mid-buffer still queued");
+
+    KX_CHECK(SUCCEEDED(sv_a->Stop(0)), "Pause voice A mid-buffer");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 64) == 0, "Paused voice yields 0 frames");
+
+    KX_CHECK(SUCCEEDED(sv_a->Start(0)), "Resume voice A");
+    xa->StopEngine();
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 64) == 0, "StopEngine gates active voice");
+    KX_CHECK(SUCCEEDED(xa->StartEngine()), "StartEngine resumes engine");
+
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 120) == 120, "Drain remaining 120 frames of ramp");
+    KX_CHECK(std::fabs(out[0] - (80.0f / 200.0f)) < 1e-5f && std::fabs(out[119 * 2 + 0] - (199.0f / 200.0f)) < 1e-5f,
+             "Cursor resumed at exact frame 80..199");
+    KX_CHECK(sv_a->GetBuffersQueued() == 0, "Ramp buffer completed");
+
+    // 5. FlushSourceBuffers
+    KX_CHECK(SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_u)) && SUCCEEDED(sv_a->SubmitSourceBuffer(&ab_u)), "Queue 2 buffers");
+    KX_CHECK(sv_a->GetBuffersQueued() == 2, "2 buffers queued before flush");
+    KX_CHECK(SUCCEEDED(sv_a->FlushSourceBuffers()), "FlushSourceBuffers S_OK");
+    KX_CHECK(sv_a->GetBuffersQueued() == 0, "0 buffers queued after flush");
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out.data(), 32) == 0, "Drain after flush yields 0 frames");
+
+    sv_b->DestroyVoice();
+    sv_a->DestroyVoice();
+    mv->DestroyVoice();
+    xa->Release();
+}
+
+void test_xaudio2_pitch_resampling_submix_and_x3daudio() {
+    hle::reset_xaudio2_stats();
+    hle::Registry reg;
+    hle::register_xaudio2(reg);
+
+    auto* create_fn = reinterpret_cast<HRESULT(__stdcall*)(hle::IKxXAudio2**, uint32_t, uint32_t)>(
+        reg.resolve_name("xaudio2_9.dll", "XAudio2Create"));
+    auto* x3d_init = reinterpret_cast<HRESULT(__stdcall*)(uint32_t, float, hle::KxX3DAudioHandle*)>(
+        reg.resolve_name("x3daudio1_7.dll", "X3DAudioInitialize"));
+    auto* x3d_calc = reinterpret_cast<void(__stdcall*)(
+        const hle::KxX3DAudioHandle*, const hle::KxX3DAudioListener*, const hle::KxX3DAudioEmitter*,
+        uint32_t, hle::KxX3DAudioDspSettings*)>(
+        reg.resolve_name("x3daudio1_7.dll", "X3DAudioCalculate"));
+    KX_CHECK(create_fn != nullptr && x3d_init != nullptr && x3d_calc != nullptr,
+             "XAudio2Create and X3DAudio exports resolved from xaudio2_9.dll / x3daudio1_7.dll");
+    KX_CHECK(reg.resolve_name("xaudio2_9.dll", "X3DAudioInitialize") != nullptr &&
+             reg.resolve_name("xaudio2_9.dll", "X3DAudioCalculate") != nullptr,
+             "X3DAudio also exported on xaudio2_9.dll");
+
+    hle::IKxXAudio2* xa = nullptr;
+    KX_CHECK(SUCCEEDED(create_fn(&xa, 0, 0)) && xa != nullptr, "XAudio2Create S_OK");
+    hle::IKxMasteringVoice* mv = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateMasteringVoice(&mv, 2, 48000)) && mv != nullptr, "CreateMasteringVoice");
+
+    auto count_pos_zero_crossings = [](const std::vector<float>& stereo, size_t frames) -> uint32_t {
+        uint32_t zc = 0;
+        for (size_t i = 1; i < frames; ++i) {
+            if (stereo[(i - 1) * 2] <= 0.0f && stereo[i * 2] > 0.0f) ++zc;
+        }
+        return zc;
+    };
+
+    // 1. SetFrequencyRatio (2.0x pitch shift -> half output frames, double frequency)
+    hle::KxWaveFormat fmt48{3, 2, 48000, 32};
+    hle::IKxSourceVoice* sv_pitch = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSourceVoice(&sv_pitch, &fmt48)) && sv_pitch != nullptr, "CreateSourceVoice 48kHz");
+    KX_CHECK(SUCCEEDED(sv_pitch->SetFrequencyRatio(2.0f)), "SetFrequencyRatio(2.0)");
+    float got_ratio = 0.0f;
+    sv_pitch->GetFrequencyRatio(&got_ratio);
+    KX_CHECK(std::fabs(got_ratio - 2.0f) < 1e-6f, "GetFrequencyRatio == 2.0");
+
+    constexpr size_t kSineFrames = 4800;  // 100 ms @ 48 kHz = 44 cycles of 440 Hz
+    std::vector<float> sine48(kSineFrames * 2, 0.0f);
+    for (size_t i = 0; i < kSineFrames; ++i) {
+        const float s = 0.5f * std::sin(2.0f * 3.14159265358979323846f * 440.0f * static_cast<float>(i) / 48000.0f);
+        sine48[i * 2 + 0] = s;
+        sine48[i * 2 + 1] = s;
+    }
+    hle::KxAudioBuffer ab_s48{0, static_cast<uint32_t>(sine48.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(sine48.data())};
+    KX_CHECK(SUCCEEDED(sv_pitch->Start(0)) && SUCCEEDED(sv_pitch->SubmitSourceBuffer(&ab_s48)), "Submit 48kHz sine");
+
+    std::vector<float> out(kSineFrames * 2, 0.0f);
+    const size_t got_2x = hle::xaudio2_drain_stereo_f32(out.data(), kSineFrames);
+    KX_CHECK(got_2x == 2400, "2.0x frequency ratio produces exact 2400 output frames from 4800 input frames");
+    const uint32_t zc_2x = count_pos_zero_crossings(out, got_2x);
+    // 2400 frames = 50 ms @ 48 kHz, at 880 Hz = 44 cycles
+    KX_CHECK(zc_2x >= 42 && zc_2x <= 45, std::format("2.0x pitch shift cycles ~44 in 50ms, got {}", zc_2x));
+
+    // Verify 0.5x linear interpolation midpoint accuracy
+    KX_CHECK(SUCCEEDED(sv_pitch->SetFrequencyRatio(0.5f)), "SetFrequencyRatio(0.5)");
+    std::vector<float> ramp4(4 * 2, 0.0f);
+    for (size_t i = 0; i < 4; ++i) {
+        ramp4[i * 2 + 0] = static_cast<float>(i) * 0.25f;
+        ramp4[i * 2 + 1] = ramp4[i * 2 + 0];
+    }
+    hle::KxAudioBuffer ab_r4{0, static_cast<uint32_t>(ramp4.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(ramp4.data())};
+    KX_CHECK(SUCCEEDED(sv_pitch->SubmitSourceBuffer(&ab_r4)), "Submit 4-frame ramp");
+    std::vector<float> out_half(16 * 2, 0.0f);
+    const size_t got_half = hle::xaudio2_drain_stereo_f32(out_half.data(), 16);
+    KX_CHECK(got_half == 8, "0.5x ratio doubles 4 input frames to 8 output frames");
+    KX_CHECK(std::fabs(out_half[0] - 0.0f) < 1e-5f &&
+             std::fabs(out_half[1 * 2] - 0.125f) < 1e-5f &&
+             std::fabs(out_half[2 * 2] - 0.25f) < 1e-5f &&
+             std::fabs(out_half[3 * 2] - 0.375f) < 1e-5f,
+             "Linear interpolation midpoints exact");
+    sv_pitch->DestroyVoice();
+
+    // 2. Non-48kHz source resampling (24 kHz mono -> 48 kHz stereo)
+    hle::KxWaveFormat fmt24{3, 1, 24000, 32};
+    hle::IKxSourceVoice* sv_24k = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSourceVoice(&sv_24k, &fmt24)) && sv_24k != nullptr, "CreateSourceVoice 24kHz mono");
+    constexpr size_t kFrames24 = 2400;  // 100 ms @ 24 kHz = 44 cycles of 440 Hz
+    std::vector<float> sine24(kFrames24, 0.0f);
+    for (size_t i = 0; i < kFrames24; ++i) {
+        sine24[i] = 0.5f * std::sin(2.0f * 3.14159265358979323846f * 440.0f * static_cast<float>(i) / 24000.0f);
+    }
+    hle::KxAudioBuffer ab_s24{0, static_cast<uint32_t>(sine24.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(sine24.data())};
+    KX_CHECK(SUCCEEDED(sv_24k->Start(0)) && SUCCEEDED(sv_24k->SubmitSourceBuffer(&ab_s24)), "Submit 24kHz sine");
+
+    std::vector<float> out24(6000 * 2, 0.0f);
+    const size_t got_24 = hle::xaudio2_drain_stereo_f32(out24.data(), 6000);
+    KX_CHECK(got_24 == 4800, "24kHz -> 48kHz upsampling produces exact 4800 output frames (100ms)");
+    const uint32_t zc_24 = count_pos_zero_crossings(out24, got_24);
+    KX_CHECK(zc_24 >= 42 && zc_24 <= 45, std::format("24kHz -> 48kHz preserves 440Hz pitch (~44 cycles), got {}", zc_24));
+    sv_24k->DestroyVoice();
+
+    // 3. Multi-stage IKxSubmixVoice routing: sv -> sub0 (stage 0, vol 0.5) -> sub1 (stage 1, vol 0.5) -> mv (vol 0.8)
+    hle::IKxSubmixVoice* sub1 = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSubmixVoice(&sub1, 2, 48000, 0, 1, nullptr)) && sub1 != nullptr, "CreateSubmixVoice stage 1");
+    KX_CHECK(SUCCEEDED(sub1->SetVolume(0.5f)), "sub1 SetVolume(0.5)");
+
+    hle::KxSendDescriptor send_to_sub1{0, sub1};
+    hle::KxVoiceSends sends_sub1{1, &send_to_sub1};
+    hle::IKxSubmixVoice* sub0 = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSubmixVoice(&sub0, 2, 48000, 0, 0, &sends_sub1)) && sub0 != nullptr, "CreateSubmixVoice stage 0");
+    KX_CHECK(SUCCEEDED(sub0->SetVolume(0.5f)), "sub0 SetVolume(0.5)");
+
+    KX_CHECK(SUCCEEDED(mv->SetVolume(0.8f)), "mv SetVolume(0.8)");
+    hle::IKxSourceVoice* sv_sub = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSourceVoice(&sv_sub, &fmt48)) && sv_sub != nullptr, "CreateSourceVoice for submix");
+    hle::KxSendDescriptor send_to_sub0{0, sub0};
+    hle::KxVoiceSends sends_sub0{1, &send_to_sub0};
+    KX_CHECK(SUCCEEDED(sv_sub->SetOutputVoices(&sends_sub0)), "Route sv_sub -> sub0");
+
+    std::vector<float> ones(64 * 2, 1.0f);
+    hle::KxAudioBuffer ab_ones{0, static_cast<uint32_t>(ones.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(ones.data())};
+    KX_CHECK(SUCCEEDED(sv_sub->Start(0)) && SUCCEEDED(sv_sub->SubmitSourceBuffer(&ab_ones)), "Submit to submix chain");
+
+    std::vector<float> sub_out(64 * 2, 0.0f);
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(sub_out.data(), 64) == 64, "Drain submix chain");
+    KX_CHECK(std::fabs(sub_out[0] - 0.20f) < 1e-5f && std::fabs(sub_out[63 * 2 + 1] - 0.20f) < 1e-5f,
+             "Chained submix gain 1.0 * 0.5 * 0.5 * 0.8 == 0.20");
+
+    sv_sub->DestroyVoice();
+    sub0->DestroyVoice();
+    sub1->DestroyVoice();
+    KX_CHECK(SUCCEEDED(mv->SetVolume(1.0f)), "Reset mastering volume to 1.0");
+
+    // 4. X3DAudioInitialize + X3DAudioCalculate stereo panning, distance attenuation, Doppler & voice matrix integration
+    hle::KxX3DAudioHandle x3d{};
+    KX_CHECK(SUCCEEDED(x3d_init(hle::KxSpeakerStereo, 343.5f, &x3d)), "X3DAudioInitialize S_OK");
+
+    hle::KxX3DAudioListener listener{};
+    listener.orient_front = {0.0f, 0.0f, 1.0f};
+    listener.orient_top = {0.0f, 1.0f, 0.0f};
+    listener.position = {0.0f, 0.0f, 0.0f};
+
+    hle::KxX3DAudioEmitter emitter{};
+    emitter.channel_count = 1;
+    emitter.curve_distance_scaler = 1.0f;
+    emitter.doppler_scaler = 1.0f;
+
+    float matrix[2]{};
+    hle::KxX3DAudioDspSettings dsp{};
+    dsp.matrix_coefficients = matrix;
+    dsp.src_channel_count = 1;
+    dsp.dst_channel_count = 2;
+
+    const uint32_t calc_flags = hle::KxX3DAudioCalculateMatrix | hle::KxX3DAudioCalculateDoppler;
+
+    // Hard left at (-2, 0, 0) -> dist=2, atten=0.5, L=0.5, R=0.0
+    emitter.position = {-2.0f, 0.0f, 0.0f};
+    x3d_calc(&x3d, &listener, &emitter, calc_flags, &dsp);
+    KX_CHECK(std::fabs(dsp.emitter_to_listener_distance - 2.0f) < 1e-4f, "Left emitter distance == 2.0");
+    KX_CHECK(std::fabs(matrix[0] - 0.5f) < 1e-4f && matrix[1] < 1e-4f, "Hard-left stereo pan L=0.5, R=0.0");
+
+    // Hard right at (+2, 0, 0) -> dist=2, atten=0.5, L=0.0, R=0.5
+    emitter.position = {2.0f, 0.0f, 0.0f};
+    x3d_calc(&x3d, &listener, &emitter, calc_flags, &dsp);
+    KX_CHECK(matrix[0] < 1e-4f && std::fabs(matrix[1] - 0.5f) < 1e-4f, "Hard-right stereo pan L=0.0, R=0.5");
+
+    // Feed X3DAudio right-pan matrix directly into a mono source voice and verify mixed stereo output
+    hle::KxWaveFormat fmt_mono{3, 1, 48000, 32};
+    hle::IKxSourceVoice* sv_3d = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSourceVoice(&sv_3d, &fmt_mono)) && sv_3d != nullptr, "Create mono 3D source voice");
+    KX_CHECK(SUCCEEDED(sv_3d->SetOutputMatrix(nullptr, 1, 2, matrix)), "Apply X3DAudio matrix to mono source voice");
+    std::vector<float> mono_ones(32, 1.0f);
+    hle::KxAudioBuffer ab_m{0, static_cast<uint32_t>(mono_ones.size() * sizeof(float)), reinterpret_cast<const uint8_t*>(mono_ones.data())};
+    KX_CHECK(SUCCEEDED(sv_3d->Start(0)) && SUCCEEDED(sv_3d->SubmitSourceBuffer(&ab_m)), "Submit mono 3D buffer");
+    std::vector<float> out_3d(32 * 2, 0.0f);
+    KX_CHECK(hle::xaudio2_drain_stereo_f32(out_3d.data(), 32) == 32, "Drain 3D panned voice");
+    KX_CHECK(out_3d[0] < 1e-4f && std::fabs(out_3d[1] - 0.5f) < 1e-4f, "Mixed stereo output reflects X3DAudio right pan");
+    sv_3d->DestroyVoice();
+
+    // Centered emitter approaching listener -> equal L/R power + Doppler > 1.0
+    emitter.position = {0.0f, 0.0f, 4.0f};
+    emitter.velocity = {0.0f, 0.0f, -34.35f};  // moving toward listener at 10% speed of sound
+    x3d_calc(&x3d, &listener, &emitter, calc_flags, &dsp);
+    KX_CHECK(std::fabs(matrix[0] - matrix[1]) < 1e-4f && matrix[0] > 0.15f && matrix[0] < 0.20f,
+             "Centered emitter at dist=4 has equal L/R attenuated gain (~0.1768)");
+    KX_CHECK(dsp.doppler_factor > 1.10f && dsp.doppler_factor < 1.12f,
+             std::format("Approaching emitter Doppler shift ~1.111, got {:.4f}", dsp.doppler_factor));
+
+    const auto st = hle::xaudio2_stats();
+    KX_CHECK(st.submix_voices_created >= 2 && st.x3daudio_calls >= 3, "Submix & X3DAudio telemetry counters recorded");
+
+    mv->DestroyVoice();
+    xa->Release();
+}
+
 }  // namespace
 
 int main() {
@@ -4892,6 +5209,8 @@ int main() {
     run_test("D3D12.X KxDeviceProxy KXRM/KXRA/KXRP Stream PSO Recompilation & Disk Cache", test_d3d12x_mesh_stream_pso_recompilation);
     run_test("RDNA2 VCmp/SCmp All Predicates & Lifted Scalar/Branch/ALU/GlobalX4 Emission", test_rdna2_vcmp_scmp_and_lifted_opcodes_emission);
     run_test("RDNA2 VCmp + Bitfield + Scalar64 + GlobalX4 Compute on Dual-GPU Hardware", test_rdna2_vcmp_bitfield_scalar64_globalx4_dual_gpu);
+    run_test("XAudio2 Multi-Voice Software Mixer, Mastering Volume, Start/Stop Gating & Flush", test_xaudio2_multivoice_mixer_volume_gating_and_flush);
+    run_test("XAudio2 Pitch Resampling, Non-48kHz Upsampling, Submix Routing & X3DAudio Panning", test_xaudio2_pitch_resampling_submix_and_x3daudio);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

@@ -41,16 +41,25 @@ public:
 
     Result<MappedModule*> load_image(const std::filesystem::path& path);
     Result<int> execute_entry(MappedModule& mod);
+    Result<void*> resolve_export_by_name(MappedModule& mod, std::string_view sym);
+    Result<void*> resolve_export_by_ordinal(MappedModule& mod, uint16_t ord);
 
     const std::vector<std::unique_ptr<MappedModule>>& modules() const { return modules_; }
 
 private:
+    static constexpr int kMaxForwarderDepth = 8;
+
     Result<MappedModule*> find_or_load_guest_dll(std::string_view dll_name);
+    Result<void*> resolve_export_symbol(MappedModule& mod, const PeExportSymbol& exp, int depth);
+    Result<void*> resolve_guest_export_by_name(MappedModule& mod, std::string_view sym, int depth);
+    Result<void*> resolve_guest_export_by_ordinal(MappedModule& mod, uint16_t ord, int depth);
+    Result<void*> resolve_forwarder(std::string_view forwarder, int depth);
     Result<void> apply_relocations(MappedModule& mod);
     Result<void> resolve_imports(MappedModule& mod);
     Result<void> protect_sections(MappedModule& mod);
     void register_exception_table(MappedModule& mod);
     void run_tls_callbacks(MappedModule& mod);
+    void rollback_module(const std::string& key, MappedModule* target);
 
     hle::Registry& hle_;
     std::filesystem::path search_dir_;

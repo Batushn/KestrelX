@@ -1,6 +1,7 @@
 #include "kestrel/loader/pe_image.hpp"
 
 #include <Windows.h>
+#include <algorithm>
 #include <cstring>
 
 namespace kestrel::loader {
@@ -114,7 +115,9 @@ Result<PeImage> parse_pe64(std::vector<uint8_t> bytes, std::string filename) {
     const auto imp_dir = img.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (imp_dir.rva != 0 && imp_dir.size != 0) {
         for (uint32_t idx = 0;; ++idx) {
-            const uint32_t desc_rva = imp_dir.rva + idx * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            const uint64_t desc_off_rva = static_cast<uint64_t>(idx) * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            if (desc_off_rva > 0xFFFFFFFFull - imp_dir.rva) break;
+            const uint32_t desc_rva = static_cast<uint32_t>(imp_dir.rva + desc_off_rva);
             auto desc_off = img.rva_to_file_offset(desc_rva);
             if (!desc_off) break;
             IMAGE_IMPORT_DESCRIPTOR desc{};
@@ -131,21 +134,126 @@ Result<PeImage> parse_pe64(std::vector<uint8_t> bytes, std::string filename) {
             const uint32_t ilt_rva = desc.OriginalFirstThunk ? desc.OriginalFirstThunk : desc.FirstThunk;
             const uint32_t iat_rva = desc.FirstThunk;
             for (uint32_t k = 0;; ++k) {
-                auto t_off = img.rva_to_file_offset(ilt_rva + k * 8);
+                const uint64_t stride = static_cast<uint64_t>(k) * 8u;
+                if (stride > 0xFFFFFFFFull - ilt_rva || stride > 0xFFFFFFFFull - iat_rva) break;
+                auto t_off = img.rva_to_file_offset(static_cast<uint32_t>(ilt_rva + stride));
                 if (!t_off) break;
                 uint64_t thunk = 0;
                 if (!read_pod(img.raw, *t_off, thunk) || thunk == 0) break;
 
                 PeImportSymbol sym;
-                sym.iat_rva = iat_rva + k * 8;
+                sym.iat_rva = static_cast<uint32_t>(iat_rva + stride);
                 if (thunk & IMAGE_ORDINAL_FLAG64) {
                     sym.by_ordinal = true;
-                    sym.ordinal = static_cast<uint16_t>(thunk & 0xFFFF);
+                    sym.ordinal = static_cast<uint16_t>(thunk & 0xFFFFu);
                 } else {
                     sym.by_ordinal = false;
+                    if (thunk > 0xFFFFFFFDull) {
+                        return fail("Out-of-range import hint/name RVA");
+                    }
                     const uint32_t hint_rva = static_cast<uint32_t>(thunk);
                     auto sname = img.read_cstring_at_rva(hint_rva + 2);
                     if (!sname) return fail("Unreadable import symbol name at RVA " + hex32(hint_rva));
+                    sym.name = *sname;
+                }
+                mod.symbols.push_back(std::move(sym));
+            }
+            img.imports.push_back(std::move(mod));
+        }
+    }
+
+    // Parse delay-load imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT / ImgDelayDescr)
+    const auto delay_dir = img.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (delay_dir.rva != 0 && delay_dir.size != 0) {
+        for (uint32_t idx = 0;; ++idx) {
+            const uint64_t desc_byte_off = static_cast<uint64_t>(idx) * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+            if (desc_byte_off + sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) > delay_dir.size) break;
+            if (desc_byte_off > 0xFFFFFFFFull - delay_dir.rva) break;
+            const uint32_t desc_rva = static_cast<uint32_t>(delay_dir.rva + desc_byte_off);
+            auto desc_off = img.rva_to_file_offset(desc_rva);
+            if (!desc_off) break;
+            IMAGE_DELAYLOAD_DESCRIPTOR desc{};
+            if (!read_pod(img.raw, *desc_off, desc)) break;
+            if (desc.DllNameRVA == 0 && desc.ImportAddressTableRVA == 0 && desc.ImportNameTableRVA == 0) {
+                break;
+            }
+            if (desc.DllNameRVA == 0) break;
+
+            const bool is_rva_based = (desc.Attributes.AllAttributes & 1u) != 0;
+            auto field_to_rva = [&](uint32_t val) -> std::optional<uint32_t> {
+                if (val == 0) return std::nullopt;
+                if (is_rva_based) return val;
+                const uint64_t val64 = static_cast<uint64_t>(val);
+                if (val64 >= img.image_base) {
+                    const uint64_t diff = val64 - img.image_base;
+                    if (diff <= 0xFFFFFFFFull) return static_cast<uint32_t>(diff);
+                    return std::nullopt;
+                }
+                if (img.rva_to_file_offset(val).has_value()) return val;
+                return std::nullopt;
+            };
+            auto thunk_to_rva = [&](uint64_t val) -> std::optional<uint32_t> {
+                if (val == 0) return std::nullopt;
+                if (is_rva_based) {
+                    if (val > 0xFFFFFFFFull) return std::nullopt;
+                    return static_cast<uint32_t>(val);
+                }
+                if (val >= img.image_base) {
+                    const uint64_t diff = val - img.image_base;
+                    if (diff <= 0xFFFFFFFFull) return static_cast<uint32_t>(diff);
+                    return std::nullopt;
+                }
+                if (val <= 0xFFFFFFFFull && img.rva_to_file_offset(static_cast<uint32_t>(val)).has_value()) {
+                    return static_cast<uint32_t>(val);
+                }
+                return std::nullopt;
+            };
+
+            auto dll_name_rva = field_to_rva(desc.DllNameRVA);
+            if (!dll_name_rva) {
+                return fail("Invalid delay-load import DLL name address: " + hex32(desc.DllNameRVA));
+            }
+            auto dll_name = img.read_cstring_at_rva(*dll_name_rva);
+            if (!dll_name) {
+                return fail("Unreadable delay-load import DLL name at RVA " + hex32(*dll_name_rva));
+            }
+
+            auto iat_opt = field_to_rva(desc.ImportAddressTableRVA);
+            auto int_opt = field_to_rva(desc.ImportNameTableRVA);
+            if (!iat_opt && !int_opt) continue;
+            if (!iat_opt) {
+                return fail("Delay-load import descriptor missing IAT for " + *dll_name);
+            }
+            const uint32_t iat_rva = *iat_opt;
+            const uint32_t ilt_rva = int_opt.value_or(iat_rva);
+
+            PeImportModule mod;
+            mod.dll_name = *dll_name;
+            mod.is_delay_load = true;
+
+            for (uint32_t k = 0;; ++k) {
+                const uint64_t stride = static_cast<uint64_t>(k) * 8u;
+                if (stride > 0xFFFFFFFFull - ilt_rva || stride > 0xFFFFFFFFull - iat_rva) break;
+                auto t_off = img.rva_to_file_offset(static_cast<uint32_t>(ilt_rva + stride));
+                if (!t_off) break;
+                uint64_t thunk = 0;
+                if (!read_pod(img.raw, *t_off, thunk) || thunk == 0) break;
+
+                PeImportSymbol sym;
+                sym.iat_rva = static_cast<uint32_t>(iat_rva + stride);
+                if (thunk & IMAGE_ORDINAL_FLAG64) {
+                    sym.by_ordinal = true;
+                    sym.ordinal = static_cast<uint16_t>(thunk & 0xFFFFu);
+                } else {
+                    sym.by_ordinal = false;
+                    auto hint_rva = thunk_to_rva(thunk);
+                    if (!hint_rva || *hint_rva > 0xFFFFFFFDu) {
+                        return fail("Out-of-range delay-load import hint/name RVA in " + *dll_name);
+                    }
+                    auto sname = img.read_cstring_at_rva(*hint_rva + 2);
+                    if (!sname) {
+                        return fail("Unreadable delay-load import symbol name at RVA " + hex32(*hint_rva));
+                    }
                     sym.name = *sname;
                 }
                 mod.symbols.push_back(std::move(sym));
@@ -159,11 +267,18 @@ Result<PeImage> parse_pe64(std::vector<uint8_t> bytes, std::string filename) {
     if (exp_dir.rva != 0 && exp_dir.size != 0) {
         auto exp_off = img.rva_to_file_offset(exp_dir.rva);
         IMAGE_EXPORT_DIRECTORY ed{};
-        if (exp_off && read_pod(img.raw, *exp_off, ed)) {
+        if (exp_off && read_pod(img.raw, *exp_off, ed) &&
+            static_cast<uint64_t>(ed.NumberOfFunctions) * 4u <= std::max<uint64_t>(img.size_of_image, img.raw.size())) {
             std::vector<std::string> names_by_idx(ed.NumberOfFunctions);
             for (uint32_t i = 0; i < ed.NumberOfNames; ++i) {
-                auto nrva_off = img.rva_to_file_offset(ed.AddressOfNames + i * 4);
-                auto ord_off = img.rva_to_file_offset(ed.AddressOfNameOrdinals + i * 2);
+                const uint64_t name_off_delta = static_cast<uint64_t>(i) * 4u;
+                const uint64_t ord_off_delta = static_cast<uint64_t>(i) * 2u;
+                if (name_off_delta > 0xFFFFFFFFull - ed.AddressOfNames ||
+                    ord_off_delta > 0xFFFFFFFFull - ed.AddressOfNameOrdinals) {
+                    break;
+                }
+                auto nrva_off = img.rva_to_file_offset(static_cast<uint32_t>(ed.AddressOfNames + name_off_delta));
+                auto ord_off = img.rva_to_file_offset(static_cast<uint32_t>(ed.AddressOfNameOrdinals + ord_off_delta));
                 uint32_t nrva = 0;
                 uint16_t func_idx = 0;
                 if (!nrva_off || !ord_off || !read_pod(img.raw, *nrva_off, nrva) || !read_pod(img.raw, *ord_off, func_idx)) {
@@ -175,15 +290,18 @@ Result<PeImage> parse_pe64(std::vector<uint8_t> bytes, std::string filename) {
                     }
                 }
             }
+            const uint64_t exp_end = static_cast<uint64_t>(exp_dir.rva) + exp_dir.size;
             for (uint32_t i = 0; i < ed.NumberOfFunctions; ++i) {
-                auto frva_off = img.rva_to_file_offset(ed.AddressOfFunctions + i * 4);
+                const uint64_t fn_off_delta = static_cast<uint64_t>(i) * 4u;
+                if (fn_off_delta > 0xFFFFFFFFull - ed.AddressOfFunctions) break;
+                auto frva_off = img.rva_to_file_offset(static_cast<uint32_t>(ed.AddressOfFunctions + fn_off_delta));
                 uint32_t frva = 0;
                 if (!frva_off || !read_pod(img.raw, *frva_off, frva) || frva == 0) continue;
                 PeExportSymbol es;
                 es.ordinal = ed.Base + i;
                 es.name = names_by_idx[i];
                 es.rva = frva;
-                if (frva >= exp_dir.rva && frva < exp_dir.rva + exp_dir.size) {
+                if (frva >= exp_dir.rva && static_cast<uint64_t>(frva) < exp_end) {
                     if (auto fwd = img.read_cstring_at_rva(frva)) es.forwarder = *fwd;
                 }
                 img.exports.push_back(std::move(es));

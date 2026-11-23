@@ -33,6 +33,7 @@ public:
 
     void* get_or_create_stub(std::string_view dll_name, std::string_view symbol);
     std::vector<StubCallRecord> called_stubs() const;
+    size_t thunk_page_count() const;
 
 private:
     struct StubSlot {
@@ -48,7 +49,7 @@ private:
     std::unordered_map<std::string, std::unordered_map<std::string, void*>> named_;
     std::unordered_map<std::string, std::unordered_map<uint16_t, void*>> ordinals_;
     std::unordered_map<std::string, std::unique_ptr<StubSlot>> stubs_;
-    uint8_t* thunk_page_ = nullptr;
+    std::vector<uint8_t*> thunk_pages_;
     size_t thunk_used_ = 0;
     size_t thunk_capacity_ = 0;
 };

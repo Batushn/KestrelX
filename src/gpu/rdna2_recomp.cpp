@@ -48,6 +48,20 @@ std::string emit_f32(const IrOperand& op) {
     return base;
 }
 
+std::string emit_u64_lo(const IrOperand& op) {
+    if (op.kind == IrOperand::Kind::Exec) return "WaveActiveBallot(true).x";
+    return emit_u32(op);
+}
+
+std::string emit_u64_hi(const IrOperand& op) {
+    switch (op.kind) {
+        case IrOperand::Kind::Sgpr: return std::format("s[{}]", op.reg + 1);
+        case IrOperand::Kind::InlineInt: return (op.imm_i < 0) ? "0xFFFFFFFFu" : "0u";
+        case IrOperand::Kind::Exec: return "WaveActiveBallot(true).y";
+        default: return "0u";
+    }
+}
+
 std::string wrap_clamp(const std::string& expr, bool clamp) {
     return clamp ? std::format("saturate({})", expr) : expr;
 }
@@ -61,11 +75,50 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
         case IrOp::SMov:
             out << ind << std::format("{} = {};\n", emit_sdst(i.dst), emit_u32(i.src0));
             break;
+        case IrOp::SMovB64:
+            out << ind << std::format("{{ uint kx_lo = {}; uint kx_hi = {}; s[{}] = kx_lo; s[{}] = kx_hi; }}\n",
+                                      emit_u64_lo(i.src0), emit_u64_hi(i.src0), i.dst.reg, i.dst.reg + 1);
+            break;
+        case IrOp::SNotB32:
+            out << ind << std::format("{{ uint kx_r = ~({}); s[{}] = kx_r; scc = (kx_r != 0u); }}\n",
+                                      emit_u32(i.src0), i.dst.reg);
+            break;
+        case IrOp::SNotB64:
+            out << ind << std::format("{{ uint kx_lo = ~({}); uint kx_hi = ~({}); s[{}] = kx_lo; s[{}] = kx_hi; scc = ((kx_lo | kx_hi) != 0u); }}\n",
+                                      emit_u64_lo(i.src0), emit_u64_hi(i.src0), i.dst.reg, i.dst.reg + 1);
+            break;
+        case IrOp::SCSelectB32:
+            out << ind << std::format("s[{}] = scc ? ({}) : ({});\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
         case IrOp::SAddU32:
-            out << ind << std::format("{} = {} + {};\n", emit_sdst(i.dst), emit_u32(i.src0), emit_u32(i.src1));
+            if (i.subop == "s_add_u32") {
+                out << ind << std::format("{{ uint kx_a = {}; uint kx_b = {}; uint kx_r = kx_a + kx_b; {} = kx_r; scc = (kx_r < kx_a); }}\n",
+                                          emit_u32(i.src0), emit_u32(i.src1), emit_sdst(i.dst));
+            } else if (i.subop == "s_add_i32") {
+                out << ind << std::format("{{ uint kx_a = {}; uint kx_b = {}; uint kx_r = kx_a + kx_b; {} = kx_r; scc = ((((kx_r ^ kx_a) & (kx_r ^ kx_b)) & 0x80000000u) != 0u); }}\n",
+                                          emit_u32(i.src0), emit_u32(i.src1), emit_sdst(i.dst));
+            } else {
+                out << ind << std::format("{} = {} + {};\n", emit_sdst(i.dst), emit_u32(i.src0), emit_u32(i.src1));
+            }
             break;
         case IrOp::SSubU32:
-            out << ind << std::format("{} = {} - {};\n", emit_sdst(i.dst), emit_u32(i.src0), emit_u32(i.src1));
+            if (i.subop == "s_sub_u32") {
+                out << ind << std::format("{{ uint kx_a = {}; uint kx_b = {}; {} = kx_a - kx_b; scc = (kx_a < kx_b); }}\n",
+                                          emit_u32(i.src0), emit_u32(i.src1), emit_sdst(i.dst));
+            } else if (i.subop == "s_sub_i32") {
+                out << ind << std::format("{{ uint kx_a = {}; uint kx_b = {}; uint kx_r = kx_a - kx_b; {} = kx_r; scc = ((((kx_a ^ kx_b) & (kx_a ^ kx_r)) & 0x80000000u) != 0u); }}\n",
+                                          emit_u32(i.src0), emit_u32(i.src1), emit_sdst(i.dst));
+            } else {
+                out << ind << std::format("{} = {} - {};\n", emit_sdst(i.dst), emit_u32(i.src0), emit_u32(i.src1));
+            }
+            break;
+        case IrOp::SAddCU32:
+            out << ind << std::format("{{ uint kx_a = {}; uint kx_b = {}; uint kx_c = scc ? 1u : 0u; uint kx_ab = kx_a + kx_b; uint kx_r = kx_ab + kx_c; {} = kx_r; scc = (kx_ab < kx_a) || (kx_r < kx_ab); }}\n",
+                                      emit_u32(i.src0), emit_u32(i.src1), emit_sdst(i.dst));
+            break;
+        case IrOp::SSubBU32:
+            out << ind << std::format("{{ uint kx_a = {}; uint kx_b = {}; uint kx_c = scc ? 1u : 0u; uint kx_ab = kx_a - kx_b; uint kx_r = kx_ab - kx_c; {} = kx_r; scc = (kx_a < kx_b) || (kx_ab < kx_c); }}\n",
+                                      emit_u32(i.src0), emit_u32(i.src1), emit_sdst(i.dst));
             break;
         case IrOp::SMulI32:
             out << ind << std::format("{} = asuint(asint({}) * asint({}));\n", emit_sdst(i.dst), emit_u32(i.src0), emit_u32(i.src1));
@@ -99,7 +152,8 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
             else if (i.subop == "s_cmp_lt_u32") out << ind << std::format("scc = ({} < {});\n", a, b);
             else if (i.subop == "s_cmp_le_u32") out << ind << std::format("scc = ({} <= {});\n", a, b);
             else if (i.subop == "s_cmp_gt_u32") out << ind << std::format("scc = ({} > {});\n", a, b);
-            else out << ind << std::format("scc = ({} >= {});\n", a, b);
+            else if (i.subop == "s_cmp_ge_u32") out << ind << std::format("scc = ({} >= {});\n", a, b);
+            else out << ind << std::format("#error Unsupported RDNA2 SCmp predicate: {}\n", i.subop);
             break;
         }
         case IrOp::VMov:
@@ -126,14 +180,41 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
         case IrOp::VMaxF32:
             out << ind << std::format("v[{}] = asuint(max({}, {}));\n", i.dst.reg, emit_f32(i.src0), emit_f32(i.src1));
             break;
+        case IrOp::VMinI32:
+            out << ind << std::format("v[{}] = asuint(min(asint({}), asint({})));\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
+        case IrOp::VMaxI32:
+            out << ind << std::format("v[{}] = asuint(max(asint({}), asint({})));\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
+        case IrOp::VMinU32:
+            out << ind << std::format("v[{}] = min({}, {});\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
+        case IrOp::VMaxU32:
+            out << ind << std::format("v[{}] = max({}, {});\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
         case IrOp::VAddU32:
             out << ind << std::format("v[{}] = {} + {};\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
             break;
         case IrOp::VSubU32:
             out << ind << std::format("v[{}] = {} - {};\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
             break;
+        case IrOp::VSubRevU32:
+            out << ind << std::format("v[{}] = {} - {};\n", i.dst.reg, emit_u32(i.src1), emit_u32(i.src0));
+            break;
         case IrOp::VMulLoU32:
             out << ind << std::format("v[{}] = {} * {};\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
+        case IrOp::VMadU32U24:
+            out << ind << std::format("v[{}] = ((({}) & 0xFFFFFFu) * (({}) & 0xFFFFFFu)) + ({});\n",
+                                      i.dst.reg, emit_u32(i.src0), emit_u32(i.src1), emit_u32(i.src2));
+            break;
+        case IrOp::VBfeU32:
+            out << ind << std::format("{{ uint kx_s0 = {}; uint kx_off = ({}) & 31u; uint kx_w = ({}) & 31u; v[{}] = (kx_w == 0u) ? 0u : ((kx_s0 >> kx_off) & ((1u << kx_w) - 1u)); }}\n",
+                                      emit_u32(i.src0), emit_u32(i.src1), emit_u32(i.src2), i.dst.reg);
+            break;
+        case IrOp::VBfiB32:
+            out << ind << std::format("{{ uint kx_m = {}; v[{}] = (kx_m & ({})) | ((~kx_m) & ({})); }}\n",
+                                      emit_u32(i.src0), i.dst.reg, emit_u32(i.src1), emit_u32(i.src2));
             break;
         case IrOp::VAndB32:
             out << ind << std::format("v[{}] = {} & {};\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
@@ -193,9 +274,9 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
             out << ind << "{\n";
             out << ind << std::format("    float _a = {}; float _b = {}; float _c = {};\n", emit_f32(i.src0), emit_f32(i.src1), emit_f32(i.src2));
             out << ind << "    if (isnan(_a) || isnan(_b) || isnan(_c)) {\n";
-            out << ind << std::format("        v[{}] = asuint(min(min(_a, _b), _c));\n", i.dst.reg);
+            out << ind << std::format("        v[{}] = asuint({});\n", i.dst.reg, wrap_clamp("min(min(_a, _b), _c)", i.clamp));
             out << ind << "    } else {\n";
-            out << ind << std::format("        v[{}] = asuint(max(min(_a, _b), min(max(_a, _b), _c)));\n", i.dst.reg);
+            out << ind << std::format("        v[{}] = asuint({});\n", i.dst.reg, wrap_clamp("max(min(_a, _b), min(max(_a, _b), _c))", i.clamp));
             out << ind << "    }\n";
             out << ind << "}\n";
             break;
@@ -221,10 +302,19 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
             else if (i.subop == "v_cmp_gt_f32") out << ind << std::format("vcc = ({} > {});\n", emit_f32(i.src0), emit_f32(i.src1));
             else if (i.subop == "v_cmp_lg_f32") out << ind << std::format("vcc = ({} != {});\n", emit_f32(i.src0), emit_f32(i.src1));
             else if (i.subop == "v_cmp_ge_f32") out << ind << std::format("vcc = ({} >= {});\n", emit_f32(i.src0), emit_f32(i.src1));
+            else if (i.subop == "v_cmp_lt_i32") out << ind << std::format("vcc = (asint({}) < asint({}));\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_eq_i32") out << ind << std::format("vcc = (asint({}) == asint({}));\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_le_i32") out << ind << std::format("vcc = (asint({}) <= asint({}));\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_gt_i32") out << ind << std::format("vcc = (asint({}) > asint({}));\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_ne_i32") out << ind << std::format("vcc = (asint({}) != asint({}));\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_ge_i32") out << ind << std::format("vcc = (asint({}) >= asint({}));\n", emit_u32(i.src0), emit_u32(i.src1));
             else if (i.subop == "v_cmp_lt_u32") out << ind << std::format("vcc = ({} < {});\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_eq_u32") out << ind << std::format("vcc = ({} == {});\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_le_u32") out << ind << std::format("vcc = ({} <= {});\n", emit_u32(i.src0), emit_u32(i.src1));
             else if (i.subop == "v_cmp_gt_u32") out << ind << std::format("vcc = ({} > {});\n", emit_u32(i.src0), emit_u32(i.src1));
-            else if (i.subop == "v_cmp_eq_i32" || i.subop == "v_cmp_eq_u32") out << ind << std::format("vcc = ({} == {});\n", emit_u32(i.src0), emit_u32(i.src1));
-            else out << ind << std::format("vcc = (asint({}) < asint({}));\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_ne_u32") out << ind << std::format("vcc = ({} != {});\n", emit_u32(i.src0), emit_u32(i.src1));
+            else if (i.subop == "v_cmp_ge_u32") out << ind << std::format("vcc = ({} >= {});\n", emit_u32(i.src0), emit_u32(i.src1));
+            else out << ind << std::format("#error Unsupported RDNA2 VCmp predicate: {}\n", i.subop);
             break;
         }
         case IrOp::VCndMask:
@@ -274,8 +364,24 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
         case IrOp::GlobalLoadDword:
             out << ind << std::format("v[{}] = g_mem.Load({} + {}u);\n", i.dst.reg, emit_u32(i.src0), i.offset);
             break;
+        case IrOp::GlobalLoadDwordx2:
+            out << ind << std::format("{{ uint2 kx_g2 = g_mem.Load2({} + {}u); v[{}] = kx_g2.x; v[{}] = kx_g2.y; }}\n",
+                                      emit_u32(i.src0), i.offset, i.dst.reg, i.dst.reg + 1);
+            break;
+        case IrOp::GlobalLoadDwordx4:
+            out << ind << std::format("{{ uint4 kx_g4 = g_mem.Load4({} + {}u); v[{}] = kx_g4.x; v[{}] = kx_g4.y; v[{}] = kx_g4.z; v[{}] = kx_g4.w; }}\n",
+                                      emit_u32(i.src0), i.offset, i.dst.reg, i.dst.reg + 1, i.dst.reg + 2, i.dst.reg + 3);
+            break;
         case IrOp::GlobalStoreDword:
             out << ind << std::format("g_mem.Store({} + {}u, {});\n", emit_u32(i.src0), i.offset, emit_u32(i.src1));
+            break;
+        case IrOp::GlobalStoreDwordx2:
+            out << ind << std::format("g_mem.Store2({} + {}u, uint2(v[{}], v[{}]));\n",
+                                      emit_u32(i.src0), i.offset, i.src1.reg, i.src1.reg + 1);
+            break;
+        case IrOp::GlobalStoreDwordx4:
+            out << ind << std::format("g_mem.Store4({} + {}u, uint4(v[{}], v[{}], v[{}], v[{}]));\n",
+                                      emit_u32(i.src0), i.offset, i.src1.reg, i.src1.reg + 1, i.src1.reg + 2, i.src1.reg + 3);
             break;
         case IrOp::BufferLoadDword:
         case IrOp::BufferLoadDwordx2:
@@ -840,9 +946,11 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
                     terminated = true;
                 } else if (inst.op == IrOp::CondBranch) {
                     const uint32_t fallthrough = (b + 1 < fn.blocks.size()) ? (b + 1) : 0xFFFFFFFFu;
-                    const char* cond_var = (inst.subop.find("vcc") != std::string::npos) ? "vcc" : "scc";
+                    const char* cond_expr = (inst.subop.find("exec") != std::string::npos)
+                                                ? "any(WaveActiveBallot(true).xy != uint2(0u, 0u))"
+                                                : ((inst.subop.find("vcc") != std::string::npos) ? "vcc" : "scc");
                     out << std::format("            bb = ({}{}) ? {}u : {}u; break;\n",
-                                       inst.branch_on_true ? "" : "!", cond_var, inst.target_block, fallthrough);
+                                       inst.branch_on_true ? "" : "!", cond_expr, inst.target_block, fallthrough);
                     terminated = true;
                 } else if (inst.op == IrOp::EndPgm) {
                     if (opt.stage == ShaderStage::Amplification) {

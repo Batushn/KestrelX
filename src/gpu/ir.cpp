@@ -19,6 +19,8 @@ IrOperand decode_operand(uint32_t code, bool has_lit, uint32_t lit, bool abs = f
         op.reg = code;
     } else if (code == 106 || code == 107) {
         op.kind = IrOperand::Kind::Vcc;
+    } else if (code == 124) {
+        op.kind = IrOperand::Kind::M0;
     } else if (code == 126 || code == 127) {
         op.kind = IrOperand::Kind::Exec;
     } else if (code >= 128 && code <= 192) {
@@ -48,6 +50,15 @@ IrOperand make_sgpr(uint32_t r) {
     op.kind = IrOperand::Kind::Sgpr;
     op.reg = r;
     return op;
+}
+
+IrOperand make_sdst(uint32_t r) {
+    if (r == 124) {
+        IrOperand op{};
+        op.kind = IrOperand::Kind::M0;
+        return op;
+    }
+    return make_sgpr(r);
 }
 
 IrOperand make_vgpr(uint32_t r) {
@@ -123,11 +134,30 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
         return reg;
     };
 
+    // Pre-scan for mesh shader markers (s_sendmsg GS_ALLOC_REQ or EXP prim0)
+    bool is_mesh_shader = false;
+    for (const auto& d : decoded) {
+        if (d.enc == Encoding::SOPP && d.mnemonic == "s_sendmsg" &&
+            ((static_cast<uint16_t>(d.simm16) & 0xFu) == kSendMsgGsAllocReq)) {
+            is_mesh_shader = true;
+            break;
+        }
+        if (d.enc == Encoding::EXP && d.opcode == kExpTargetPrim0) {
+            is_mesh_shader = true;
+            break;
+        }
+    }
+
     uint32_t cur_blk = 0;
+    bool has_const_m0 = false;
+    uint32_t const_m0 = 0;
     for (size_t i = 0; i < decoded.size(); ++i) {
         const auto& d = decoded[i];
         auto it = pc_to_block.find(d.pc);
-        if (it != pc_to_block.end()) cur_blk = it->second;
+        if (it != pc_to_block.end()) {
+            cur_blk = it->second;
+            has_const_m0 = false;
+        }
 
         IrInst ir{};
         ir.pc = d.pc;
@@ -138,6 +168,39 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
             case Encoding::SOPP:
                 if (d.mnemonic == "s_barrier") {
                     ir.op = IrOp::Barrier;
+                } else if (d.mnemonic == "s_sendmsg") {
+                    const uint16_t raw_msg = static_cast<uint16_t>(d.simm16);
+                    const uint16_t msg_id = raw_msg & 0xFu;
+                    ir.offset = raw_msg;
+                    if (msg_id == kSendMsgGsAllocReq) {
+                        ir.op = IrOp::SetMeshOutputCounts;
+                        ir.subop = "gs_alloc_req";
+                        if ((raw_msg >> 4) != 0) {
+                            const uint32_t vcnt = (raw_msg >> 4) & 0x3Fu;
+                            const uint32_t pcnt = (raw_msg >> 10) & 0x3Fu;
+                            ir.src0.kind = IrOperand::Kind::Literal;
+                            ir.src0.lit_u32 = vcnt;
+                            ir.src1.kind = IrOperand::Kind::Literal;
+                            ir.src1.lit_u32 = pcnt;
+                            if (vcnt > fn.max_mesh_verts) fn.max_mesh_verts = vcnt;
+                            if (pcnt > fn.max_mesh_prims) fn.max_mesh_prims = pcnt;
+                        } else {
+                            ir.src0.kind = IrOperand::Kind::M0;
+                            if (has_const_m0) {
+                                const uint32_t vcnt = const_m0 & 0x7FFu;
+                                const uint32_t pcnt = (const_m0 >> 12u) & 0x7FFu;
+                                if (vcnt > fn.max_mesh_verts) fn.max_mesh_verts = vcnt;
+                                if (pcnt > fn.max_mesh_prims) fn.max_mesh_prims = pcnt;
+                            }
+                        }
+                    } else if (msg_id == kSendMsgDispatchMesh) {
+                        ir.op = IrOp::DispatchMeshPayload;
+                        ir.subop = "dispatch_mesh";
+                        ir.src0.kind = IrOperand::Kind::M0;
+                    } else {
+                        ir.op = IrOp::Nop;
+                        ir.subop = d.mnemonic;
+                    }
                 } else if (d.mnemonic == "s_nop" || d.mnemonic == "s_waitcnt" || d.mnemonic == "s_waitcnt_vscnt" ||
                            d.mnemonic == "s_clause") {
                     ir.op = IrOp::Nop;
@@ -159,10 +222,21 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 break;
 
             case Encoding::SOP1:
-                ir.dst = make_sgpr(d.dst);
+                ir.dst = make_sdst(d.dst);
                 ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
                 if (d.mnemonic == "s_mov_b32") {
                     ir.op = IrOp::SMov;
+                    if (ir.dst.kind == IrOperand::Kind::M0) {
+                        if (ir.src0.kind == IrOperand::Kind::Literal) {
+                            const_m0 = ir.src0.lit_u32;
+                            has_const_m0 = true;
+                        } else if (ir.src0.kind == IrOperand::Kind::InlineInt) {
+                            const_m0 = static_cast<uint32_t>(ir.src0.imm_i);
+                            has_const_m0 = true;
+                        } else {
+                            has_const_m0 = false;
+                        }
+                    }
                 } else if (d.mnemonic == "s_and_saveexec_b32" || d.mnemonic == "s_and_saveexec_b64") {
                     ir.op = IrOp::SAndSaveExec;
                     ir.subop = d.mnemonic;
@@ -176,19 +250,35 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 break;
 
             case Encoding::SOPK:
-                ir.dst = make_sgpr(d.dst);
+                ir.dst = make_sdst(d.dst);
                 ir.src0.kind = IrOperand::Kind::InlineInt;
                 ir.src0.imm_i = d.simm16;
-                if (d.mnemonic == "s_movk_i32") ir.op = IrOp::SMov;
-                else if (d.mnemonic == "s_addk_i32") { ir.op = IrOp::SAddU32; ir.src1 = ir.dst; }
-                else if (d.mnemonic == "s_mulk_i32") { ir.op = IrOp::SMulI32; ir.src1 = ir.dst; }
-                else { ir.op = IrOp::Unknown; ir.subop = d.mnemonic; ++fn.unknown_count; }
+                if (d.mnemonic == "s_movk_i32") {
+                    ir.op = IrOp::SMov;
+                    if (ir.dst.kind == IrOperand::Kind::M0) {
+                        const_m0 = static_cast<uint32_t>(d.simm16);
+                        has_const_m0 = true;
+                    }
+                } else if (d.mnemonic == "s_addk_i32") {
+                    ir.op = IrOp::SAddU32;
+                    ir.src1 = ir.dst;
+                    if (ir.dst.kind == IrOperand::Kind::M0) has_const_m0 = false;
+                } else if (d.mnemonic == "s_mulk_i32") {
+                    ir.op = IrOp::SMulI32;
+                    ir.src1 = ir.dst;
+                    if (ir.dst.kind == IrOperand::Kind::M0) has_const_m0 = false;
+                } else {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
+                }
                 break;
 
             case Encoding::SOP2:
-                ir.dst = make_sgpr(d.dst);
+                ir.dst = make_sdst(d.dst);
                 ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
                 ir.src1 = decode_operand(d.src1, d.has_literal, d.literal);
+                if (ir.dst.kind == IrOperand::Kind::M0) has_const_m0 = false;
                 if (d.mnemonic == "s_add_u32" || d.mnemonic == "s_add_i32") ir.op = IrOp::SAddU32;
                 else if (d.mnemonic == "s_sub_u32" || d.mnemonic == "s_sub_i32") ir.op = IrOp::SSubU32;
                 else if (d.mnemonic == "s_mul_i32") ir.op = IrOp::SMulI32;
@@ -452,16 +542,28 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
             }
 
             case Encoding::EXP:
-                ir.op = IrOp::Exp;
-                ir.subop = "exp";
                 ir.exp_target = static_cast<uint8_t>(d.opcode);
-                if (d.opcode <= 7) fn.mrt_mask |= (1u << d.opcode);
                 ir.exp_en = d.exp_en;
                 ir.exp_done = d.exp_done;
                 ir.src0 = make_vgpr(d.src0);
                 ir.src1 = make_vgpr(d.src1);
                 ir.src2 = make_vgpr(d.src2);
                 ir.src3 = make_vgpr(d.src3);
+                if (d.opcode == kExpTargetPrim0) {
+                    ir.op = IrOp::MeshExportPrimitive;
+                    ir.subop = "exp_prim0";
+                } else if (is_mesh_shader && ((d.opcode >= 12 && d.opcode <= 15) || (d.opcode >= 32 && d.opcode <= 63))) {
+                    ir.op = IrOp::MeshExportVertex;
+                    ir.subop = (d.opcode <= 15) ? std::format("exp_pos{}", d.opcode - 12)
+                                                : std::format("exp_param{}", d.opcode - 32);
+                    if (d.opcode >= 32 && d.opcode <= 63) {
+                        fn.mesh_param_mask |= (1u << (d.opcode - 32));
+                    }
+                } else {
+                    ir.op = IrOp::Exp;
+                    ir.subop = "exp";
+                    if (d.opcode <= 7) fn.mrt_mask |= (1u << d.opcode);
+                }
                 break;
 
             default:

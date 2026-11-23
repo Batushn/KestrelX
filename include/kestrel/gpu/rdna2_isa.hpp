@@ -61,10 +61,25 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count);
 std::string format_rdna2_operand(uint32_t op, bool has_lit, uint32_t lit);
 std::string disassemble_inst(const DecodedInst& inst);
 
+// Clean-room GFX10.3 s_sendmsg message IDs (simm16[3:0])
+constexpr uint16_t kSendMsgGs = 2u;
+constexpr uint16_t kSendMsgGsDone = 3u;
+constexpr uint16_t kSendMsgGsAllocReq = 9u;     // Mesh/NGG output count allocation (m0[10:0]=verts, m0[22:12]=prims)
+constexpr uint16_t kSendMsgDispatchMesh = 10u;  // Amplification shader DispatchMesh payload dispatch (m0 packed x/y/z)
+
+// Clean-room GFX10.3 EXP target constants
+constexpr uint8_t kExpTargetMrt0 = 0u;
+constexpr uint8_t kExpTargetPos0 = 12u;
+constexpr uint8_t kExpTargetPrim0 = 20u;
+constexpr uint8_t kExpTargetParam0 = 32u;
+
 // Clean-room GFX10.3 microcode encoders (for self-tests and GPU instruction verification)
 namespace encode {
 constexpr uint32_t sopp(uint32_t op, int16_t simm16 = 0) {
     return (0x17Fu << 23) | ((op & 0x7Fu) << 16) | static_cast<uint16_t>(simm16);
+}
+constexpr uint32_t s_sendmsg(uint16_t msg_id) {
+    return sopp(3, static_cast<int16_t>(msg_id));
 }
 constexpr uint32_t sop1(uint32_t op, uint32_t sdst, uint32_t ssrc0) {
     return (0x17Du << 23) | ((sdst & 0x7Fu) << 16) | ((op & 0xFFu) << 8) | (ssrc0 & 0xFFu);
@@ -148,7 +163,7 @@ inline void ds(std::vector<uint32_t>& out, uint32_t op, uint32_t vdst, uint32_t 
     out.push_back(w0);
     out.push_back(w1);
 }
-// GFX10.3 EXP target constants: 0..7 = mrt0..7, 12..15 = pos0..3, 32..63 = param0..31
+// GFX10.3 EXP target constants: 0..7 = mrt0..7, 12..15 = pos0..3, 20 = prim0, 32..63 = param0..31
 inline void exp(std::vector<uint32_t>& out, uint8_t target, uint8_t en_mask,
                 uint32_t vsrc0, uint32_t vsrc1, uint32_t vsrc2, uint32_t vsrc3,
                 bool done = false, bool compr = false) {
@@ -158,6 +173,28 @@ inline void exp(std::vector<uint32_t>& out, uint8_t target, uint8_t en_mask,
                         ((vsrc1 & 0xFFu) << 8) | (vsrc0 & 0xFFu);
     out.push_back(w0);
     out.push_back(w1);
+}
+// Mesh/NGG vertex + primitive count allocation via m0 + s_sendmsg(GS_ALLOC_REQ)
+inline void mesh_alloc(std::vector<uint32_t>& out, uint32_t verts, uint32_t prims) {
+    const uint32_t packed = ((prims & 0x7FFu) << 12) | (verts & 0x7FFu);
+    out.push_back(sop1(3, 124, 255));  // s_mov_b32 m0, literal
+    out.push_back(packed);
+    out.push_back(s_sendmsg(kSendMsgGsAllocReq));
+}
+// Amplification shader DispatchMesh(x, y, z, payload) via m0 + s_sendmsg(DISPATCH_MESH)
+inline void dispatch_mesh(std::vector<uint32_t>& out, uint32_t group_x, uint32_t group_y = 1, uint32_t group_z = 1) {
+    const uint32_t packed = ((group_z & 0x3FFu) << 20) | ((group_y & 0x3FFu) << 10) | (group_x & 0x3FFu);
+    out.push_back(sop1(3, 124, 255));  // s_mov_b32 m0, literal
+    out.push_back(packed);
+    out.push_back(s_sendmsg(kSendMsgDispatchMesh));
+}
+// Mesh primitive triangle index export (EXP target 20 = prim0, unpacked 3-channel uint3 indices)
+inline void exp_prim0(std::vector<uint32_t>& out, uint32_t v_i0, uint32_t v_i1, uint32_t v_i2, bool done = false) {
+    exp(out, kExpTargetPrim0, 0x7u, v_i0, v_i1, v_i2, 0, done, false);
+}
+// Mesh primitive triangle index export (EXP target 20 = prim0, GFX10.3 packed 1-channel [0]=null [9:1]=i0 [18:10]=i1 [27:19]=i2)
+inline void exp_prim0_packed(std::vector<uint32_t>& out, uint32_t v_packed, bool done = false) {
+    exp(out, kExpTargetPrim0, 0x1u, v_packed, 0, 0, 0, done, false);
 }
 }  // namespace encode
 

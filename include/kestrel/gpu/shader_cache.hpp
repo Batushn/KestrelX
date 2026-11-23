@@ -9,7 +9,7 @@
 namespace kestrel::gpu {
 
 // Bump whenever IR lifting or HLSL emission semantics change to auto-invalidate stale disk entries.
-constexpr uint32_t kShaderCacheCompilerVersion = 0x00040001u;
+constexpr uint32_t kShaderCacheCompilerVersion = 0x00070001u;
 
 struct ShaderCacheStats {
     uint64_t disk_hits = 0;

@@ -16,6 +16,8 @@ enum class ShaderStage : uint8_t {
     Compute,
     Vertex,
     Pixel,
+    Mesh,
+    Amplification,
 };
 
 struct RecompOptions {
@@ -25,6 +27,9 @@ struct RecompOptions {
     uint32_t group_size_y = 1;
     uint32_t group_size_z = 1;
     std::string entry_point = "main";
+    uint32_t max_mesh_verts = 0;   // 0 = auto from IrFunction::max_mesh_verts (default 64)
+    uint32_t max_mesh_prims = 0;   // 0 = auto from IrFunction::max_mesh_prims (default 64)
+    bool mesh_has_payload = false; // true when paired with an Amplification Shader
 };
 
 struct RecompResult {
@@ -36,6 +41,9 @@ struct RecompResult {
     bool uses_cbuf = false;
     bool uses_wave_ops = false;
     uint32_t mrt_mask = 0;
+    uint32_t max_mesh_verts = 0;
+    uint32_t max_mesh_prims = 0;
+    uint32_t mesh_param_mask = 0;
     std::vector<DescriptorSlot> tex_bindings;
     std::vector<DescriptorSlot> samp_bindings;
     std::vector<DescriptorSlot> buf_srv_bindings;

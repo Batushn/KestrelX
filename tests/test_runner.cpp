@@ -25,6 +25,8 @@
 
 #include <dxgi1_6.h>
 #include <array>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -3339,6 +3341,112 @@ void test_gameinput_hotplug_callbacks_and_telemetry() {
     hle::clear_gameinput_mock_slots();
 }
 
+
+void test_shader_cache_lru_quota_multidim_and_threads() {
+    using namespace gpu;
+    const fs::path cache_dir = fs::temp_directory_path() / "KestrelX_LruQuotaTest";
+    std::error_code ec;
+    fs::remove_all(cache_dir, ec);
+
+    // 1. Multi-dimensional & MRT key hardening (plus 5-arg default compatibility)
+    const uint8_t dummy_code[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    const uint64_t k_base = DiskShaderCache::make_key(ShaderStage::Compute, WaveMode::Wave32, 8, dummy_code, sizeof(dummy_code));
+    const uint64_t k_explicit_def = DiskShaderCache::make_key(ShaderStage::Compute, WaveMode::Wave32, 8, dummy_code, sizeof(dummy_code), 1, 1, 0);
+    const uint64_t k_gy = DiskShaderCache::make_key(ShaderStage::Compute, WaveMode::Wave32, 8, dummy_code, sizeof(dummy_code), 4, 1, 0);
+    const uint64_t k_gz = DiskShaderCache::make_key(ShaderStage::Compute, WaveMode::Wave32, 8, dummy_code, sizeof(dummy_code), 1, 2, 0);
+    const uint64_t k_mrt = DiskShaderCache::make_key(ShaderStage::Pixel, WaveMode::Wave32, 1, dummy_code, sizeof(dummy_code), 1, 1, 0x0Fu);
+    const uint64_t k_mrt2 = DiskShaderCache::make_key(ShaderStage::Pixel, WaveMode::Wave32, 1, dummy_code, sizeof(dummy_code), 1, 1, 0x03u);
+    KX_CHECK(k_base == k_explicit_def, "5-arg make_key matches explicit (1,1,0) defaults");
+    KX_CHECK(k_base != k_gy && k_base != k_gz && k_gy != k_gz, "Distinct keys for group_y and group_z");
+    KX_CHECK(k_mrt != k_mrt2, "Distinct keys for mrt_mask");
+
+    auto make_dxbc = [](uint8_t tag) {
+        std::vector<uint8_t> buf(64, tag);
+        buf[0] = 'D'; buf[1] = 'X'; buf[2] = 'B'; buf[3] = 'C';
+        return buf;
+    };
+
+    // 2. LRU eviction preserving recently load()ed entry over older untouched entry (max_entries = 2)
+    {
+        ShaderCacheConfig cfg{};
+        cfg.max_entries = 2;
+        cfg.max_bytes = 0;
+        cfg.enable_lru = true;
+        DiskShaderCache cache(cache_dir, cfg);
+
+        KX_CHECK(cache.store(101, make_dxbc(0x11)), "Store key 101");
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        KX_CHECK(cache.store(102, make_dxbc(0x22)), "Store key 102");
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+        std::vector<uint8_t> out;
+        KX_CHECK(cache.load(101, out) && out[4] == 0x11, "Load key 101 refreshes LRU timestamp");
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+        KX_CHECK(cache.store(103, make_dxbc(0x33)), "Store key 103 triggers LRU eviction");
+        KX_CHECK(cache.stats().evictions == 1, "One LRU eviction recorded");
+        KX_CHECK(cache.load(101, out) && out[4] == 0x11, "Recently loaded key 101 preserved");
+        KX_CHECK(!cache.load(102, out), "Oldest untouched key 102 evicted");
+        KX_CHECK(cache.load(103, out) && out[4] == 0x33, "Newest key 103 preserved");
+
+        // 3. Explicit prune() after tightening max_bytes
+        ShaderCacheConfig tight{};
+        tight.max_entries = 0;
+        tight.max_bytes = 100;  // 1 entry is 24 + 64 = 88 bytes; 2 entries = 176 bytes
+        tight.enable_lru = true;
+        cache.set_config(tight);
+        const size_t pruned = cache.prune();
+        KX_CHECK(pruned == 1, "Explicit prune() evicted 1 entry to satisfy max_bytes");
+
+        // 4. Corrupt entry recovery + clear()
+        const fs::path corrupt_file = cache_dir / std::format("{:016x}.kxdxil", uint64_t{999});
+        {
+            std::ofstream ofs(corrupt_file, std::ios::binary);
+            ofs << "CORRUPT_HEADER_DATA_BYTES_0123456789";
+        }
+        KX_CHECK(!cache.load(999, out), "Corrupt entry rejected on load");
+        KX_CHECK(!fs::exists(corrupt_file), "Corrupt entry removed from disk");
+        KX_CHECK(cache.stats().corrupt_evictions == 1, "Corrupt eviction counted");
+
+        const size_t cleared = cache.clear();
+        KX_CHECK(cleared >= 1, "clear() removed remaining entries");
+        KX_CHECK(!cache.load(103, out), "Cache empty after clear()");
+    }
+
+    // 5. Concurrent multi-threaded store()/load() stress test
+    {
+        fs::remove_all(cache_dir, ec);
+        ShaderCacheConfig cfg{};
+        cfg.max_entries = 16;
+        cfg.max_bytes = 0;
+        cfg.enable_lru = true;
+        DiskShaderCache cache(cache_dir, cfg);
+
+        std::vector<std::thread> workers;
+        for (int t = 0; t < 4; ++t) {
+            workers.emplace_back([&cache, &make_dxbc, t]() {
+                for (int i = 0; i < 20; ++i) {
+                    const uint64_t key = static_cast<uint64_t>((t * 7 + i) % 24 + 1000);
+                    const uint8_t tag = static_cast<uint8_t>((key & 0xFFu) | 0x80u);
+                    (void)cache.store(key, make_dxbc(tag));
+                    std::vector<uint8_t> loaded;
+                    if (cache.load(key, loaded)) {
+                        KX_CHECK(loaded.size() == 64 && loaded[0] == 'D' && loaded[4] == tag,
+                                 "Concurrent load returned valid payload");
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+
+        const auto st = cache.stats();
+        KX_CHECK(st.disk_writes == 80 && st.corrupt_evictions == 0,
+                 "Multi-threaded store/load completed with zero corruption");
+    }
+
+    fs::remove_all(cache_dir, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -3356,6 +3464,7 @@ int main() {
     run_test("RDNA2 MUBUF/MTBUF + MIMG (image_sample) Textured Quad on Dual-GPU Hardware", test_rdna2_mubuf_mimg_textured_quad_dual_gpu);
     run_test("Strict recompiler refusal of unsupported RDNA2 opcodes", test_strict_unsupported_opcode_refusal);
     run_test("Persistent on-disk DXIL shader cache & corruption recovery", test_persistent_disk_shader_cache);
+    run_test("Disk shader cache LRU quota, multi-dim key hardening & thread safety", test_shader_cache_lru_quota_multidim_and_threads);
     run_test("D3D12.X ID3D12Device1..10 QI, Stream PSO Recomp & CmdListProxy Telemetry", test_d3d12_device_qi_stream_pso_and_cmdlist_telemetry);
     run_test("GFX10 2D texture swizzle/deswizzle round-trip (all 7 modes)", test_gfx10_tiling_roundtrip);
     run_test("GFX10 BC1/BC7 block-compressed tiling & 5-level mip-chain layout", test_gfx10_bcn_and_mip_chain);

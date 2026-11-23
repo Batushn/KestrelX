@@ -109,7 +109,8 @@ bool try_recompile_kestrel_rdna2(
     if (code_bytes == 0 || (code_bytes % 4) != 0) return false;
 
     const gpu::WaveMode wave = prefer_wave64 ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
-    const uint64_t cache_key = gpu::DiskShaderCache::make_key(expected_stage, wave, group_x, bytes, length);
+    const uint64_t cache_key = gpu::DiskShaderCache::make_key(
+        expected_stage, wave, group_x, bytes, length, 1u, 1u, 0u);
 
     {
         std::lock_guard lock(g_shader_cache_mtx);

@@ -4548,7 +4548,6 @@ void test_d3d12x_mesh_stream_pso_recompilation() {
     fs::remove_all(cache_dir, ec);
 }
 
-}  // namespace
 
 void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
     using namespace gpu::encode;

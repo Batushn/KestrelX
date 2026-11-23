@@ -5,8 +5,8 @@
   <p><strong>Clean-Room Xbox Series X|S Native Compatibility &amp; Dynamic RDNA2 (GFX10.3) &rarr; SM 6.6 DXIL Shader Recompilation Runtime</strong></p>
 
   <p>
-    <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.6.0"><img src="https://img.shields.io/badge/Release-v0.6.0-2ea44f?style=for-the-badge" alt="Release: v0.6.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-29%2F29_PASS-brightgreen?style=for-the-badge" alt="Tests: 29/29 PASS" /></a>
+    <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0-2ea44f?style=for-the-badge" alt="Release: v0.6.0" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-49%2F49_PASS-brightgreen?style=for-the-badge" alt="Tests: 29/29 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
     <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
@@ -203,7 +203,7 @@ KestrelX Verification Suite
   [PASS] D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization
   [PASS] GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge
 
-Summary: 29 passed, 0 failed
+Summary: 49 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

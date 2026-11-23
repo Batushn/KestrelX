@@ -14,7 +14,7 @@
 
 *Built from scratch in C++23 under the MIT license — zero proprietary code, zero game assets, zero cryptographic keys.*
 
-[Visual Showcase](#hardware-visual-showcase) • [Progress Dashboard](#live-progress-dashboard) • [Architecture](#architecture) • [Hardware Receipts](#verified-hardware-test-receipts) • [Build & Run](#building--running) � [Discord](https://discord.gg/KxsNwBwhVs) • [Contribute](#contributing)
+[Visual Showcase](#hardware-visual-showcase) • [Progress Dashboard](#live-progress-dashboard) • [Architecture](#architecture) • [Hardware Receipts](#verified-hardware-test-receipts) • [Build & Run](#building--running) • [Discord](https://discord.gg/KxsNwBwhVs) • [Contribute](#contributing)
 
 </div>
 

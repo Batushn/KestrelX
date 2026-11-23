@@ -3340,8 +3340,6 @@ void test_gameinput_hotplug_callbacks_and_telemetry() {
     hle::clear_gameinput_mock_slots();
 }
 
-}  // namespace
-
 void test_work_graph_program_validation_and_ring_allocator() {
     using namespace gpu::encode;
     const std::vector<uint32_t> minimal_cs = {sopp(1)};  // s_endpgm

@@ -10,3 +10,5 @@
 *.log
 .vs/
 .vscode/
+
+*.bmp

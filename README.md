@@ -4,8 +4,8 @@
 
 **Clean-Room Xbox Series X|S Native Compatibility & Dynamic RDNA2 (GFX10.3) -> SM 6.6 DXIL Shader Recompilation Runtime**
 
-[![Release: v0.4.0](https://img.shields.io/badge/Release-v0.4.0-2ea44f?style=for-the-badge)](https://github.com/Batushn/KestrelX/releases/tag/v0.4.0)
-[![Tests: 18/18 PASS](https://img.shields.io/badge/Hardware_Tests-18%2F18_PASS-brightgreen?style=for-the-badge)](#verified-hardware-test-receipts)
+[![Release: v0.5.0](https://img.shields.io/badge/Release-v0.5.0-2ea44f?style=for-the-badge)](https://github.com/Batushn/KestrelX/releases/tag/v0.5.0)
+[![Tests: 22/22 PASS](https://img.shields.io/badge/Hardware_Tests-22%2F22_PASS-brightgreen?style=for-the-badge)](#verified-hardware-test-receipts)
 [![Dual-GPU: NVIDIA + AMD](https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge)](#hardware-visual-showcase)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge)](CMakeLists.txt)
 [![D3D12 Ultimate](https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge)](docs/ARCHITECTURE.md)
@@ -25,17 +25,23 @@ Every image below is captured directly from real **D3D12 Ultimate** hardware aft
 
 <table>
   <tr>
-    <td align="center" width="50%">
-      <img src="docs/first_light.png" alt="KestrelX v0.3.0 Visual First Light" width="256"/><br/>
-      <b>v0.3.0 — Visual First Light (RGB Triangle)</b><br/>
+    <td align="center" width="33%">
+      <img src="docs/first_light.png" alt="KestrelX v0.3.0 Visual First Light" width="220"/><br/>
+      <b>v0.3.0 — Visual First Light</b><br/>
       <sub>Raw RDNA2 <code>KXRV</code>/<code>KXRP</code> (<code>EXP pos0/param0/mrt0</code>) via <code>kestrel_test_title.exe</code> -> <code>KxDeviceProxy</code> -> <code>D3D12PresentX</code><br/>
-      Dual-GPU max channel delta: <b>1/255</b> (RTX 4060 vs Radeon 780M)</sub>
+      Dual-GPU max delta: <b>1/255</b></sub>
     </td>
-    <td align="center" width="50%">
-      <img src="docs/textured_quad.png" alt="KestrelX v0.4.0 RDNA2 MUBUF + MIMG Textured Quad" width="256"/><br/>
-      <b>v0.4.0 — Textured Quad (MUBUF + MIMG)</b><br/>
+    <td align="center" width="33%">
+      <img src="docs/textured_quad.png" alt="KestrelX v0.4.0 RDNA2 MUBUF + MIMG Textured Quad" width="220"/><br/>
+      <b>v0.4.0 — Textured Quad</b><br/>
       <sub>Raw RDNA2 <code>buffer_load_dwordx4</code> Vertex Shader (<code>t1</code>) + <code>image_sample</code> Pixel Shader (<code>t0</code>/<code>s0</code>)<br/>
-      Dual-GPU max channel delta: <b>0/255 bit-exact</b> (RTX 4060 vs Radeon 780M)</sub>
+      Dual-GPU max delta: <b>0/255 bit-exact</b></sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="docs/cube_3d.png" alt="KestrelX v0.5.0 RDNA2 3D Depth-Buffered Cube" width="220"/><br/>
+      <b>v0.5.0 — 3D Lit & Textured Cube</b><br/>
+      <sub>3D Perspective Cube with <code>D32_FLOAT</code> Depth-Stencil, Dynamic Descriptors & Wave Intrinsics<br/>
+      Dual-GPU rasterization parity: <b>7222 vs 7224 px (&lt;0.03%)</b></sub>
     </td>
   </tr>
 </table>
@@ -51,18 +57,18 @@ flowchart LR
     M1["✅ v0.1.0<br/>PE32+ Loader, VFS,<br/>VEH Zen 2, RDNA2 CS"]
     M2["✅ v0.2.0<br/>SMEM + LDS + Barrier,<br/>D3D12.X PSO Proxy, BCn"]
     M3["✅ v0.3.0<br/>Visual First Light (VS/PS),<br/>WindowHost, GameInput, XA2"]
-    M4["✅ v0.4.0 (Current)<br/>MUBUF/MTBUF + MIMG Quad,<br/>Disk DXIL Cache, Dev1..10, WASAPI"]
-    M5["🚧 v0.5.0 (Next)<br/>Wave Intrinsics, 3D Cube + Depth,<br/>Root Sig Remap, GDK XUser/XStore"]
-    M6["📋 v0.6.0+<br/>Mesh/Amp Shaders (ms_6_6),<br/>DirectStorage, Commercial Testing"]
+    M4["✅ v0.4.0<br/>MUBUF/MTBUF + MIMG Quad,<br/>Disk DXIL Cache, Dev1..10, WASAPI"]
+    M5["✅ v0.5.0 (Current)<br/>Wave Intrinsics, 3D Depth Cube,<br/>Dynamic Descriptors, DirectStorage"]
+    M6["🚧 v0.6.0 (Next)<br/>Compute Workgroups, PBR Materials,<br/>Async Compute, GameInput Haptics"]
 
     M1 --> M2 --> M3 --> M4 --> M5 --> M6
 
     style M1 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M2 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M3 fill:#1f6f3b,stroke:#2ea44f,color:#fff
-    style M4 fill:#107c10,stroke:#56d364,stroke-width:3px,color:#fff
-    style M5 fill:#9a6700,stroke:#d29922,color:#fff
-    style M6 fill:#30363d,stroke:#8b949e,color:#c9d1d9
+    style M4 fill:#1f6f3b,stroke:#2ea44f,color:#fff
+    style M5 fill:#107c10,stroke:#56d364,stroke-width:3px,color:#fff
+    style M6 fill:#9a6700,stroke:#d29922,color:#fff
 ```
 
 ### Subsystem Completion Matrix
@@ -72,16 +78,16 @@ flowchart LR
 | **PE32+ Loader & Manifest** | `█████████░ 90%` | ✅ Ready | `MicrosoftGame.config` XML, PE32+ relocs, guest DLL chaining, HLE IAT + stub thunks, `.pdata` SEH, TLS callbacks | Delay-load imports & ordinal-heavy GDK DLLs |
 | **CPU VEH Zen 2 Shim** | `█████████░ 90%` | ✅ Ready | `AddVectoredExceptionHandler` decoder & emulator for AMD Zen 2 `CLZERO`, `MONITORX`, `MWAITX` | `RDPRU` / `MCOMMIT` edge cases |
 | **Copy-on-Write Overlay VFS** | `█████████░ 95%` | ✅ Ready | `GAME:\`, `G:\`, `D:\`, `S:\`, `T:\` routing, CoW overlay, whiteouts, `..` traversal rejection | Case-insensitive path lookup cache |
-| **RDNA2 -> IR -> SM 6.6 DXIL** | `███████░░░ 70%` | 🟢 Active | `SOP`/`VOP`/`FLAT`/`SMEM`/`DS` (LDS) + `s_barrier` + `EXP` (VS/PS) + `MUBUF`/`MTBUF` + `MIMG` (`image_sample`/`load`/`resinfo`), dual Wave32/Wave64, strict unsupported-op refusal | Wave intrinsics (`v_readlane_b32`, `s_and_saveexec`), Depth/Cube 3D, `ms_6_6`/`as_6_6` |
+| **RDNA2 -> IR -> SM 6.6 DXIL** | `████████░░ 80%` | 🟢 Active | `SOP`/`VOP`/`FLAT`/`SMEM`/`DS` (LDS) + `s_barrier` + `EXP` (VS/PS) + `MUBUF`/`MTBUF` + `MIMG` + Wave intrinsics (`v_readfirstlane_b32`, `v_readlane_b32`, `v_writelane_b32`, `v_mbcnt_lo_u32_b32`, `s_and_saveexec_b32`), dynamic descriptors (`g_bufN`, `g_texN`, `g_sampN`), 3D depth-buffered perspective pipeline (`D32_FLOAT` DSV) | Compute workgroup shared tiling, PBR materials, mesh/amplification shaders (`ms_6_6`/`as_6_6`) |
 | **Persistent DXIL Shader Cache** | `█████████░ 90%` | ✅ Ready | In-memory + atomic on-disk `.kxdxil` cache (`%LOCALAPPDATA%/KestrelX/cache`), FNV-1a corruption eviction, `--cache-dir` | LRU disk size quota & cache stats CLI |
 | **D3D12.X COM Proxy (`d3d12_xs`)** | `███████░░░ 70%` | 🟢 Active | Pure COM `KxDeviceProxy` (`ID3D12Device`–`Device2` + `Device3..10` QI), `CreatePipelineState` stream auto-recomp, `KxCommandQueueProxy`, `KxGraphicsCommandListProxy` telemetry | Descriptor heap & root-signature translation, enhanced barriers |
 | **WindowHost & PresentX** | `████████░░ 80%` | ✅ Ready | Win32 `WindowHost` + `IDXGISwapChain3` flip-model (`--windowed`), headless GPU readback BMP capture (`--capture`), `D3D12PresentX` | Resize/fullscreen toggle & frame-pacing HUD |
 | **Input (`gameinput.dll`)** | `████████░░ 80%` | ✅ Ready | COM `GameInputCreate`, dynamic `xinput1_4.dll`, Win32 keyboard fallback, deterministic mock provider | Rumble/haptics & multi-controller slots |
 | **Audio (`xaudio2_9.dll`)** | `████████░░ 80%` | ✅ Ready | COM `XAudio2Create`, mastering/source voices, 96k-frame stereo float32/int16 ring buffer, RMS metering, live WASAPI shared-mode thread (`--audio`) | Submix voices & 3D spatialization (`X3DAudio`) |
-| **KernelX & GDK HLE** | `██████░░░░ 60%` | 🟡 Growing | `XMemAlloc`/`Free`/`Size`, `TitleMemoryStatus`, `CreateFileA/W/2`, `ReadFileEx` async overlapped I/O, `XTaskQueue*`, `XGameGetXboxTitleId` | `XUser`, `XStore`, `XPackage`, DirectStorage stubs |
+| **KernelX & GDK HLE** | `████████░░ 80%` | ✅ Ready | `XMemAlloc`/`Free`/`Size`, `TitleMemoryStatus`, `CreateFileA/W/2`, `ReadFileEx`, `XTaskQueue*`, `XGameGetXboxTitleId`, `XUserAddAsync`, `XUserGetGamertag`, `XUserGetId`, `XStoreCreateContext`, `XPackageGetCurrentProcessPackageIdentifier`, DirectStorage VFS async streaming bridge (`dstorage_xs.dll`) | Multi-user management, telemetry event dispatchers |
 | **GFX10 Texture Tiling** | `████████░░ 85%` | ✅ Ready | Clean-room 2D swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block tiling, 256B-aligned multi-level mip-chains | 3D/Array volume tiling & live upload hook |
 
-> **Honest Scope Note (`v0.4.0`):** KestrelX executes our clean-room Xbox-ABI test title, dynamically recompiles RDNA2 Compute/Vertex/Pixel shaders (`SMEM`, `LDS`, `EXP`, `MUBUF`, `MTBUF`, `MIMG`) on real NVIDIA & AMD GPUs, and persists compiled DXIL to disk. It does **not** yet boot commercial retail Xbox Series X|S games — closing that gap requires wave intrinsics, dynamic descriptor/root-signature remapping, mesh shaders, and broader GDK HLE coverage. Pick up any open issue to help build the next milestone!
+> **Honest Scope Note (`v0.5.0`):** KestrelX executes our clean-room Xbox-ABI test title, dynamically recompiles RDNA2 Compute/Vertex/Pixel shaders (`SMEM`, `LDS`, `EXP`, `MUBUF`, `MTBUF`, `MIMG`, Wave Intrinsics) on real NVIDIA & AMD GPUs, renders depth-buffered 3D perspective geometry, and provides DirectStorage async streaming bridges. It does **not** yet boot commercial retail Xbox Series X|S games — closing that gap requires multi-workgroup compute tiling, PBR materials, async compute queues, and broader GDK HLE coverage. Pick up any open issue to help build the next milestone!
 
 ---
 
@@ -126,14 +132,17 @@ KestrelX Verification Suite
     -> Hardware verified: [0] NVIDIA GeForce RTX 4060 Laptop GPU | Wave32 | DXIL=4020 B | both CFG branches bit-exact
     -> Hardware verified: [1] AMD Radeon(TM) 780M | Wave32 | DXIL=4020 B | both CFG branches bit-exact
     -> Hardware verified: [1] AMD Radeon(TM) 780M | Wave64 | DXIL=4020 B | both CFG branches bit-exact
+    -> Hardware verified: [2] NVIDIA GeForce RTX 4060 Laptop GPU | Wave32 | DXIL=4020 B | both CFG branches bit-exact
   [PASS] End-to-end RDNA2 -> IR -> HLSL -> DXC -> Real Dual-GPU Hardware Execution
     -> Hardware verified LDS+SMEM: [0] NVIDIA GeForce RTX 4060 Laptop GPU | Wave32 | 64/64 reversed+added bit-exact
     -> Hardware verified LDS+SMEM: [1] AMD Radeon(TM) 780M | Wave32 | 64/64 reversed+added bit-exact
     -> Hardware verified LDS+SMEM: [1] AMD Radeon(TM) 780M | Wave64 | 64/64 reversed+added bit-exact
+    -> Hardware verified LDS+SMEM: [2] NVIDIA GeForce RTX 4060 Laptop GPU | Wave32 | 64/64 reversed+added bit-exact
   [PASS] RDNA2 SMEM + DS (LDS) + s_barrier Workgroup Shuffle on Dual-GPU Hardware
   [PASS] RDNA2 EXP Vertex & Pixel (vs_6_6 / ps_6_6) Decode, IR Lift & DXC Compile
     -> Textured Quad verified: [0] NVIDIA GeForce RTX 4060 Laptop GPU | MUBUF VS + MIMG PS | 256x256 4-quadrant checkerboard | max_delta=0/255
     -> Textured Quad verified: [1] AMD Radeon(TM) 780M | MUBUF VS + MIMG PS | 256x256 4-quadrant checkerboard | max_delta=0/255
+    -> Textured Quad verified: [2] NVIDIA GeForce RTX 4060 Laptop GPU | MUBUF VS + MIMG PS | 256x256 4-quadrant checkerboard | max_delta=0/255
   [PASS] RDNA2 MUBUF/MTBUF + MIMG (image_sample) Textured Quad on Dual-GPU Hardware
   [PASS] Strict recompiler refusal of unsupported RDNA2 opcodes
   [PASS] Persistent on-disk DXIL shader cache & corruption recovery
@@ -145,8 +154,18 @@ KestrelX Verification Suite
   [PASS] KernelX CreateFile2/ReadFileEx Async VFS I/O & WASAPI Thread Lifecycle
     -> Guest title PASS: HLE_imports=22, GuestDLL_imports=2, TLS=1, D3D12X(dev=1, q=1, res=2, draws=1, barriers=2, cs_pso=1, gfx_pso=2, cache_hit=3, present=1), GI(reads=1), XA2(frames=64)
   [PASS] End-to-end PE32+ Loader + Guest DLL + Wide-VFS + GameInput + XAudio2 + RDNA2 VS/PS First Light
+    -> Hardware [0] NVIDIA GeForce RTX 4060 Laptop GPU PASS (Wave Intrinsics bit-exact across 32 lanes)
+    -> Hardware [1] AMD Radeon(TM) 780M PASS (Wave Intrinsics bit-exact across 32 lanes)
+    -> Hardware [2] NVIDIA GeForce RTX 4060 Laptop GPU PASS (Wave Intrinsics bit-exact across 32 lanes)
+  [PASS] RDNA2 Wave Intrinsics (WaveReadLaneFirst/At, WavePrefixCountBits, Ballot) on Dual-GPU Hardware
+  [PASS] RDNA2 Multi-Texture & Multi-Buffer Dynamic Descriptor Remapping
+    -> Hardware [0] NVIDIA GeForce RTX 4060 Laptop GPU PASS (3D Perspective Cube: 7222 lit pixels, DSV D32_FLOAT verified)
+    -> Hardware [1] AMD Radeon(TM) 780M PASS (3D Perspective Cube: 7224 lit pixels, DSV D32_FLOAT verified)
+    -> Hardware [2] NVIDIA GeForce RTX 4060 Laptop GPU PASS (3D Perspective Cube: 7222 lit pixels, DSV D32_FLOAT verified)
+  [PASS] RDNA2 Depth-Buffered 3D Lit & Textured Perspective Cube on Dual-GPU Hardware
+  [PASS] GDK XUser/XStore/XPackage & DirectStorage VFS Async Bridge
 
-Summary: 18 passed, 0 failed
+Summary: 22 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

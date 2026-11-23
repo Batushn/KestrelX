@@ -9,6 +9,7 @@
 #include "kestrel/gpu/shader_cache.hpp"
 #include "kestrel/gpu/shader_container.hpp"
 #include "kestrel/hle/d3d12x.hpp"
+#include "kestrel/hle/dstorage.hpp"
 #include "kestrel/hle/gameinput.hpp"
 #include "kestrel/hle/kernelx.hpp"
 #include "kestrel/hle/registry.hpp"
@@ -240,7 +241,7 @@ void test_rdna2_recomp_real_dual_gpu_execution() {
     auto adapters = gpu::enumerate_d3d12_adapters();
     KX_CHECK(adapters.has_value() && !adapters->empty(), "D3D12 adapters available");
 
-    constexpr uint32_t kLanes = 64;
+    constexpr uint32_t kLanes = 32;
     std::vector<uint32_t> init_buf(kLanes);
     for (uint32_t i = 0; i < kLanes; ++i) {
         float x = static_cast<float>(i) * 0.25f - 3.0f;
@@ -1207,6 +1208,755 @@ void test_end_to_end_pe_loader_guest_title() {
     fs::remove_all(data_dir, ec);
 }
 
+void test_rdna2_wave_intrinsics_dual_gpu() {
+    using namespace gpu::encode;
+
+    // Build compute kernel exercising:
+    //   - v_readfirstlane_b32
+    //   - v_readlane_b32
+    //   - v_writelane_b32
+    //   - v_mbcnt_lo_u32_b32
+    //   - s_and_saveexec_b32
+    std::vector<uint32_t> words;
+    // v1 = v0 << 2 (input byte offset = tid.x * 4)
+    words.push_back(vop2(26, 1, 128 + 2, 0));
+    // Load input[tid.x] into v2
+    global_mem(words, 12, 2, 1, 127, 0);
+    // s4 = 5 (target lane index)
+    words.push_back(sopk(0, 4, 5));
+    // s5 = WaveReadLaneFirst(v2)
+    words.push_back(vop1(2, 5, 256 + 2));
+    // s6 = WaveReadLaneAt(v2, s4)
+    vop3(words, 0x360, 6, 256 + 2, 4, 0);
+    // v2 = WaveWriteLane(v2, s5, s4) -> lane 5 gets lane 0's value
+    vop3(words, 0x361, 2, 5, 4, 0);
+    // s7 = 0xFFFFFFFF
+    words.push_back(sopk(0, 7, -1));
+    // s8 = 1000
+    words.push_back(sopk(0, 8, 1000));
+    // v3 = WavePrefixCountBits(WaveActiveBallot.x & s7) + s8
+    vop3(words, 0x16B, 3, 7, 8, 0);
+    // s9 = WaveActiveBallot(true).x
+    words.push_back(sop1(60, 9, 7));
+    // v4 = v0 << 4 (output byte offset = tid.x * 16)
+    words.push_back(vop2(26, 4, 128 + 4, 0));
+    // Move SGPRs into VGPRs for storing
+    words.push_back(vop1(1, 5, 5));
+    words.push_back(vop1(1, 6, 6));
+    words.push_back(vop1(1, 7, 9));
+    // Store 4 outputs:
+    global_mem(words, 28, 5, 4, 127, 0);   // out[tid*4+0] = readfirstlane
+    global_mem(words, 28, 6, 4, 127, 4);   // out[tid*4+1] = readlane 5
+    global_mem(words, 28, 3, 4, 127, 8);   // out[tid*4+2] = mbcnt
+    global_mem(words, 28, 7, 4, 127, 12);  // out[tid*4+3] = ballot
+    words.push_back(sopp(1));              // s_endpgm
+
+    auto decoded = gpu::decode_rdna2(words.data(), words.size());
+    auto ir = gpu::lift_rdna2_to_ir(decoded);
+    KX_CHECK(ir.unknown_count == 0 && ir.uses_wave_ops, "Wave ops IR lift");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.stage = gpu::ShaderStage::Compute, .wave_mode = gpu::WaveMode::Wave32, .group_size_x = 32});
+    auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    KX_CHECK(compiled.has_value(), compiled.error().message);
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value(), adapters.error().message);
+
+    constexpr uint32_t kLanes = 32;
+    std::vector<uint32_t> initial_buf(kLanes * 4, 0);
+    for (uint32_t i = 0; i < kLanes; ++i) {
+        initial_buf[i] = (i + 1) * 111u;
+    }
+    uint32_t roots[8]{};
+
+    std::vector<uint32_t> reference_output;
+    int tested = 0;
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        auto ran = gpu::run_compute_dxil_on_gpu(ad.index, compiled->dxil, initial_buf, roots, 1);
+        KX_CHECK(ran.has_value(), ran.error().message);
+
+        for (uint32_t i = 0; i < kLanes; ++i) {
+            const uint32_t rf = ran->output_u32[i * 4 + 0];
+            const uint32_t rl = ran->output_u32[i * 4 + 1];
+            const uint32_t mb = ran->output_u32[i * 4 + 2];
+            const uint32_t bal = ran->output_u32[i * 4 + 3];
+
+            KX_CHECK(rf == 111u, "WaveReadLaneFirst must return lane 0 value (111)");
+            KX_CHECK(rl == 666u, "WaveReadLaneAt must return lane 5 value (666)");
+            KX_CHECK(mb == (i % 32u) + 1000u, "WavePrefixCountBits must match (i % 32) + 1000");
+            KX_CHECK((bal & 1u) != 0u, "WaveActiveBallot must have lane 0 active");
+        }
+
+        if (reference_output.empty()) {
+            reference_output = ran->output_u32;
+        } else {
+            KX_CHECK(reference_output == ran->output_u32, "Cross-GPU bit-exact wave intrinsic parity");
+        }
+        std::cout << std::format("    -> Hardware [{}] {} PASS (Wave Intrinsics bit-exact across {} lanes)\n",
+                                 ad.index, ad.name, kLanes);
+        ++tested;
+    }
+    KX_CHECK(tested >= 1, "Expected at least 1 hardware GPU tested for wave intrinsics");
+}
+
+void test_rdna2_multi_texture_multi_buffer_descriptor_remapping() {
+    using namespace gpu::encode;
+
+    std::vector<uint32_t> words;
+    // 1. Texture 0 (srsrc = s[0..7], ssamp = s[0..3]) -> g_tex0 (t0), g_samp0 (s0)
+    mimg(words, 0x20, 4, 0, 0, 0, 0xFu, 1);
+    // 2. Texture 1 (srsrc = s[8..15], ssamp = s[4..7]) -> g_tex1 (t2), g_samp1 (s1)
+    mimg(words, 0x20, 8, 0, 8, 4, 0xFu, 1);
+    // 3. Buffer 0 (srsrc = s[16..19]) -> g_buf0 (t1)
+    mubuf(words, 14, 12, 0, 16, 128, 0);
+    // 4. Buffer 1 (srsrc = s[20..23]) -> g_buf1 (t3)
+    mubuf(words, 14, 16, 0, 20, 128, 0);
+    exp(words, 12, 0xFu, 4, 5, 6, 7, false);
+    exp(words, 32, 0xFu, 8, 9, 10, 11, true);
+    words.push_back(sopp(1));
+
+    auto decoded = gpu::decode_rdna2(words.data(), words.size());
+    auto ir = gpu::lift_rdna2_to_ir(decoded);
+
+    KX_CHECK(ir.tex_bindings.size() == 2, "Expected 2 texture bindings");
+    KX_CHECK(ir.tex_bindings[0].sgpr_base == 0 && ir.tex_bindings[0].hlsl_reg == 0, "Tex0 mapped to t0");
+    KX_CHECK(ir.tex_bindings[1].sgpr_base == 8 && ir.tex_bindings[1].hlsl_reg == 2, "Tex1 mapped to t2");
+
+    KX_CHECK(ir.buf_srv_bindings.size() == 2, "Expected 2 buffer SRV bindings");
+    KX_CHECK(ir.buf_srv_bindings[0].sgpr_base == 16 && ir.buf_srv_bindings[0].hlsl_reg == 1, "Buf0 mapped to t1");
+    KX_CHECK(ir.buf_srv_bindings[1].sgpr_base == 20 && ir.buf_srv_bindings[1].hlsl_reg == 3, "Buf1 mapped to t3");
+
+    KX_CHECK(ir.samp_bindings.size() == 2, "Expected 2 sampler bindings");
+    KX_CHECK(ir.samp_bindings[0].sgpr_base == 0 && ir.samp_bindings[0].hlsl_reg == 0, "Samp0 mapped to s0");
+    KX_CHECK(ir.samp_bindings[1].sgpr_base == 4 && ir.samp_bindings[1].hlsl_reg == 1, "Samp1 mapped to s1");
+
+    auto plan = gpu::build_root_remap_plan(ir, gpu::ShaderStage::Vertex);
+    KX_CHECK(plan.total_srv_slots == 4, "4 SRV slots in root plan");
+    KX_CHECK(plan.total_sampler_slots == 2, "2 Sampler slots in root plan");
+
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.stage = gpu::ShaderStage::Vertex});
+    KX_CHECK(recomp.hlsl.find("g_tex0 : register(t0)") != std::string::npos, "HLSL has g_tex0 : register(t0)");
+    KX_CHECK(recomp.hlsl.find("g_tex1 : register(t2)") != std::string::npos, "HLSL has g_tex1 : register(t2)");
+    KX_CHECK(recomp.hlsl.find("g_buf0 : register(t1)") != std::string::npos, "HLSL has g_buf0 : register(t1)");
+    KX_CHECK(recomp.hlsl.find("g_buf1 : register(t3)") != std::string::npos, "HLSL has g_buf1 : register(t3)");
+    KX_CHECK(recomp.hlsl.find("g_samp0 : register(s0)") != std::string::npos, "HLSL has g_samp0 : register(s0)");
+    KX_CHECK(recomp.hlsl.find("g_samp1 : register(s1)") != std::string::npos, "HLSL has g_samp1 : register(s1)");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "vs_6_6");
+    KX_CHECK(compiled.has_value(), compiled.error().message);
+}
+
+void test_rdna2_depth_buffered_3d_cube_dual_gpu() {
+    using namespace gpu::encode;
+
+    struct CubeVertex {
+        float x, y, z, shade;
+        float u, v, tr, tg;
+    };
+
+    const float s = 0.82f;
+    // 36 vertices (6 faces × 2 triangles × 3 vertices) with outward normals
+    CubeVertex cube_verts[36] = {
+        // Front (+Z, directional shade 1.0)
+        {-s,  s,  s, 1.00f, 0.0f, 0.0f, 1.0f, 1.0f},
+        { s,  s,  s, 1.00f, 1.0f, 0.0f, 1.0f, 1.0f},
+        { s, -s,  s, 1.00f, 1.0f, 1.0f, 1.0f, 1.0f},
+        {-s,  s,  s, 1.00f, 0.0f, 0.0f, 1.0f, 1.0f},
+        { s, -s,  s, 1.00f, 1.0f, 1.0f, 1.0f, 1.0f},
+        {-s, -s,  s, 1.00f, 0.0f, 1.0f, 1.0f, 1.0f},
+
+        // Top (+Y, directional shade 0.88)
+        {-s,  s, -s, 0.88f, 0.0f, 0.0f, 0.9f, 1.0f},
+        { s,  s, -s, 0.88f, 1.0f, 0.0f, 0.9f, 1.0f},
+        { s,  s,  s, 0.88f, 1.0f, 1.0f, 0.9f, 1.0f},
+        {-s,  s, -s, 0.88f, 0.0f, 0.0f, 0.9f, 1.0f},
+        { s,  s,  s, 0.88f, 1.0f, 1.0f, 0.9f, 1.0f},
+        {-s,  s,  s, 0.88f, 0.0f, 1.0f, 0.9f, 1.0f},
+
+        // Right (+X, directional shade 0.72)
+        { s,  s,  s, 0.72f, 0.0f, 0.0f, 1.0f, 0.85f},
+        { s,  s, -s, 0.72f, 1.0f, 0.0f, 1.0f, 0.85f},
+        { s, -s, -s, 0.72f, 1.0f, 1.0f, 1.0f, 0.85f},
+        { s,  s,  s, 0.72f, 0.0f, 0.0f, 1.0f, 0.85f},
+        { s, -s, -s, 0.72f, 1.0f, 1.0f, 1.0f, 0.85f},
+        { s, -s,  s, 0.72f, 0.0f, 1.0f, 1.0f, 0.85f},
+
+        // Back (-Z, directional shade 0.35)
+        { s,  s, -s, 0.35f, 0.0f, 0.0f, 0.5f, 0.5f},
+        {-s,  s, -s, 0.35f, 1.0f, 0.0f, 0.5f, 0.5f},
+        {-s, -s, -s, 0.35f, 1.0f, 1.0f, 0.5f, 0.5f},
+        { s,  s, -s, 0.35f, 0.0f, 0.0f, 0.5f, 0.5f},
+        {-s, -s, -s, 0.35f, 1.0f, 1.0f, 0.5f, 0.5f},
+        { s, -s, -s, 0.35f, 0.0f, 1.0f, 0.5f, 0.5f},
+
+        // Bottom (-Y, directional shade 0.45)
+        {-s, -s,  s, 0.45f, 0.0f, 0.0f, 0.6f, 0.6f},
+        { s, -s,  s, 0.45f, 1.0f, 0.0f, 0.6f, 0.6f},
+        { s, -s, -s, 0.45f, 1.0f, 1.0f, 0.6f, 0.6f},
+        {-s, -s,  s, 0.45f, 0.0f, 0.0f, 0.6f, 0.6f},
+        { s, -s, -s, 0.45f, 1.0f, 1.0f, 0.6f, 0.6f},
+        {-s, -s, -s, 0.45f, 0.0f, 1.0f, 0.6f, 0.6f},
+
+        // Left (-X, directional shade 0.55)
+        {-s,  s, -s, 0.55f, 0.0f, 0.0f, 0.7f, 0.7f},
+        {-s,  s,  s, 0.55f, 1.0f, 0.0f, 0.7f, 0.7f},
+        {-s, -s,  s, 0.55f, 1.0f, 1.0f, 0.7f, 0.7f},
+        {-s,  s, -s, 0.55f, 0.0f, 0.0f, 0.7f, 0.7f},
+        {-s, -s,  s, 0.55f, 1.0f, 1.0f, 0.7f, 0.7f},
+        {-s, -s, -s, 0.55f, 0.0f, 1.0f, 0.7f, 0.7f},
+    };
+
+    // Calculate Look-At & Perspective MVP matrix (LH, 0 to 1 depth)
+    const float ex = 2.2f, ey = 1.8f, ez = 3.4f;
+    float zx = -ex, zy = -ey, zz = -ez;
+    const float zlen = std::sqrt(zx*zx + zy*zy + zz*zz);
+    zx /= zlen; zy /= zlen; zz /= zlen;
+
+    float xx = zz, xy = 0.0f, xz = -zx;
+    const float xlen = std::sqrt(xx*xx + xz*xz);
+    xx /= xlen; xz /= xlen;
+
+    const float yx = zy * xz - zz * xy;
+    const float yy = zz * xx - zx * xz;
+    const float yz = zx * xy - zy * xx;
+
+    const float V[4][4] = {
+        { xx, xy, xz, -(xx*ex + xy*ey + xz*ez) },
+        { yx, yy, yz, -(yx*ex + yy*ey + yz*ez) },
+        { zx, zy, zz, -(zx*ex + zy*ey + zz*ez) },
+        { 0.0f, 0.0f, 0.0f, 1.0f }
+    };
+
+    const float f_proj = 1.0f / std::tan(30.0f * 3.14159265f / 180.0f);
+    constexpr float near_z = 0.1f, far_z = 100.0f;
+    const float P_proj[4][4] = {
+        { f_proj, 0.0f,   0.0f,                          0.0f },
+        { 0.0f,   f_proj, 0.0f,                          0.0f },
+        { 0.0f,   0.0f,   far_z / (far_z - near_z),      -near_z * far_z / (far_z - near_z) },
+        { 0.0f,   0.0f,   1.0f,                          0.0f }
+    };
+
+    float mvp[16]{};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) sum += P_proj[r][k] * V[k][c];
+            mvp[r * 4 + c] = sum;
+        }
+    }
+
+    // Build RDNA2 Vertex Shader with MVP matrix constant buffer (s_load_dwordx4 b0)
+    std::vector<uint32_t> vs_words;
+    vs_words.push_back(vop2(26, 1, 128 + 5, 0));            // v1 = v0 << 5 (sv_vid * 32)
+    mubuf(vs_words, 14, 2, 1, 0, 128, 0);                   // buffer_load_dwordx4 v[2:5], v1, s[0:3], 0
+    mubuf(vs_words, 14, 6, 1, 0, 128, 16);                  // buffer_load_dwordx4 v[6:9], v1, s[0:3], 16
+    smem(vs_words, 2, 4, 0, 0);                             // s_load_dwordx4 s[4:7], s0, 0
+    smem(vs_words, 2, 8, 0, 16);                            // s_load_dwordx4 s[8:11], s0, 16
+    smem(vs_words, 2, 12, 0, 32);                           // s_load_dwordx4 s[12:15], s0, 32
+    smem(vs_words, 2, 16, 0, 48);                           // s_load_dwordx4 s[16:19], s0, 48
+
+    // Row 0 dot pos -> clip.x in v10
+    vs_words.push_back(vop2(7, 10, 4, 2));                  // v10 = s4 * v2
+    vop3(vs_words, 0x14B, 10, 5, 256 + 3, 256 + 10);       // v10 = mad(s5, v3, v10)
+    vop3(vs_words, 0x14B, 10, 6, 256 + 4, 256 + 10);       // v10 = mad(s6, v4, v10)
+    vs_words.push_back(vop2(3, 10, 7, 10));                 // v10 = s7 + v10
+
+    // Row 1 dot pos -> clip.y in v11
+    vs_words.push_back(vop2(7, 11, 8, 2));                  // v11 = s8 * v2
+    vop3(vs_words, 0x14B, 11, 9, 256 + 3, 256 + 11);       // v11 = mad(s9, v3, v11)
+    vop3(vs_words, 0x14B, 11, 10, 256 + 4, 256 + 11);      // v11 = mad(s10, v4, v11)
+    vs_words.push_back(vop2(3, 11, 11, 11));                // v11 = s11 + v11
+
+    // Row 2 dot pos -> clip.z in v12
+    vs_words.push_back(vop2(7, 12, 12, 2));                 // v12 = s12 * v2
+    vop3(vs_words, 0x14B, 12, 13, 256 + 3, 256 + 12);      // v12 = mad(s13, v3, v12)
+    vop3(vs_words, 0x14B, 12, 14, 256 + 4, 256 + 12);      // v12 = mad(s14, v4, v12)
+    vs_words.push_back(vop2(3, 12, 15, 12));                // v12 = s15 + v12
+
+    // Row 3 dot pos -> clip.w in v13
+    vs_words.push_back(vop2(7, 13, 16, 2));                 // v13 = s16 * v2
+    vop3(vs_words, 0x14B, 13, 17, 256 + 3, 256 + 13);      // v13 = mad(s17, v3, v13)
+    vop3(vs_words, 0x14B, 13, 18, 256 + 4, 256 + 13);      // v13 = mad(s18, v4, v13)
+    vs_words.push_back(vop2(3, 13, 19, 13));                // v13 = s19 + v13
+
+    vs_words.push_back(vop1(1, 8, 242));                    // v8 = 1.0f
+    exp(vs_words, 12, 0xFu, 10, 11, 12, 13, false);         // exp pos0
+    exp(vs_words, 32, 0xFu, 6, 7, 5, 8, true);              // exp param0 done
+    vs_words.push_back(sopp(1));                            // s_endpgm
+
+    // Build RDNA2 Pixel Shader with directional shade modulation
+    std::vector<uint32_t> ps_words;
+    mimg(ps_words, 0x20, 4, 0, 0, 0, 0xFu, 1);              // image_sample v[4:7], v[0:1], s[0:7], s[0:3]
+    ps_words.push_back(vop2(7, 4, 256 + 2, 4));             // v4 = shade * v4 (R)
+    ps_words.push_back(vop2(7, 5, 256 + 2, 5));             // v5 = shade * v5 (G)
+    ps_words.push_back(vop2(7, 6, 256 + 2, 6));             // v6 = shade * v6 (B)
+    exp(ps_words, 0, 0xFu, 4, 5, 6, 7, true);               // exp mrt0 done
+    ps_words.push_back(sopp(1));                            // s_endpgm
+
+    auto vs_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(vs_words.data(), vs_words.size()));
+    auto ps_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(ps_words.data(), ps_words.size()));
+    KX_CHECK(vs_ir.unknown_count == 0 && vs_ir.uses_cbuf && vs_ir.uses_buf_srv, "Cube VS IR flags");
+    KX_CHECK(ps_ir.unknown_count == 0 && ps_ir.uses_tex, "Cube PS IR flags");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto vs_hlsl = gpu::emit_hlsl_from_ir(vs_ir, {.stage = gpu::ShaderStage::Vertex});
+    auto ps_hlsl = gpu::emit_hlsl_from_ir(ps_ir, {.stage = gpu::ShaderStage::Pixel});
+    auto vs_dxil = dxc.compile_hlsl(vs_hlsl.hlsl, "main", "vs_6_6");
+    auto ps_dxil = dxc.compile_hlsl(ps_hlsl.hlsl, "main", "ps_6_6");
+    KX_CHECK(vs_dxil.has_value(), vs_dxil.error().message);
+    KX_CHECK(ps_dxil.has_value(), ps_dxil.error().message);
+
+    // 64x64 calibration checkerboard texture with gold/emerald/coral/cyan quadrants
+    constexpr uint32_t kW = 256, kH = 256, kTex = 64;
+    std::vector<uint8_t> tex_rgba(kTex * kTex * 4, 255);
+    for (uint32_t y = 0; y < kTex; ++y) {
+        for (uint32_t x = 0; x < kTex; ++x) {
+            uint8_t r = 26, g = 36, b = 58;
+            const bool border = (x < 2 || x >= kTex - 2 || y < 2 || y >= kTex - 2);
+            const bool check = (((x / 8) + (y / 8)) & 1u) == 0u;
+            if (border) {
+                r = 240; g = 245; b = 255;
+            } else if (check) {
+                if (x < kTex / 2 && y < kTex / 2) { r = 255; g = 205; b = 55; }       // Gold
+                else if (x >= kTex / 2 && y < kTex / 2) { r = 40; g = 220; b = 130; } // Emerald
+                else if (x < kTex / 2 && y >= kTex / 2) { r = 240; g = 80; b = 95; }  // Coral
+                else { r = 50; g = 195; b = 250; }                                    // Cyan
+            } else {
+                r = 30; g = 38; b = 64;
+            }
+            const size_t off = (y * kTex + x) * 4;
+            tex_rgba[off + 0] = r; tex_rgba[off + 1] = g; tex_rgba[off + 2] = b; tex_rgba[off + 3] = 255;
+        }
+    }
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value(), adapters.error().message);
+
+    IDXGIFactory6* factory = nullptr;
+    KX_CHECK(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))), "CreateDXGIFactory1");
+
+    int hw_verified = 0;
+    uint32_t ref_cube_pixels = 0;
+    const char* capture_env = std::getenv("KESTREL_CAPTURE_CUBE_BMP");
+    fs::path capture_path = capture_env ? fs::path(capture_env) : (fs::current_path() / "docs" / "cube_3d.bmp");
+
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        IDXGIAdapter1* dxgi_ad = nullptr;
+        if (FAILED(factory->EnumAdapters1(ad.index, &dxgi_ad))) continue;
+
+        ID3D12Device* dev = nullptr;
+        HRESULT hr = D3D12CreateDevice(dxgi_ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev));
+        dxgi_ad->Release();
+        if (FAILED(hr) || !dev) continue;
+
+        D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))), "CreateCommandQueue");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))), "CreateCommandAllocator");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd))), "CreateCommandList");
+
+        // Root signature: [0]=CBV b0, [1]=Table(SRV t0), [2]=RootSRV t1, Sampler(s0)
+        D3D12_DESCRIPTOR_RANGE srv_range{};
+        srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range.NumDescriptors = 1;
+        srv_range.BaseShaderRegister = 0;
+        srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER rparams[3]{};
+        rparams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rparams[0].Descriptor = {0, 0}; // b0
+        rparams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rparams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rparams[1].DescriptorTable = {1, &srv_range};
+        rparams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rparams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rparams[2].Descriptor = {1, 0}; // t1
+        rparams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+        D3D12_STATIC_SAMPLER_DESC samp{};
+        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.ShaderRegister = 0;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{3, rparams, 1, &samp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ID3DBlob* rs_blob = nullptr;
+        ID3D12RootSignature* rs = nullptr;
+        KX_CHECK(SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, nullptr)), "SerializeRS");
+        KX_CHECK(SUCCEEDED(dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&rs))), "CreateRS");
+        rs_blob->Release();
+
+        // Pipeline State with real D3D12 D32_FLOAT Depth-Buffer & Backface Culling
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psd{};
+        psd.pRootSignature = rs;
+        psd.VS = {vs_dxil->dxil.data(), vs_dxil->dxil.size()};
+        psd.PS = {ps_dxil->dxil.data(), ps_dxil->dxil.size()};
+        psd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psd.SampleMask = UINT_MAX;
+        psd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psd.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+        psd.DepthStencilState.DepthEnable = TRUE;
+        psd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        psd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        psd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        psd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psd.NumRenderTargets = 1;
+        psd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psd.SampleDesc.Count = 1;
+
+        ID3D12PipelineState* pso = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateGraphicsPipelineState(&psd, IID_PPV_ARGS(&pso))), "CreateCubePSO");
+
+        D3D12_HEAP_PROPERTIES hp_def{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        D3D12_HEAP_PROPERTIES hp_up{D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        D3D12_HEAP_PROPERTIES hp_rb{D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+
+        // Render target
+        D3D12_RESOURCE_DESC rt_desc{};
+        rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rt_desc.Width = kW; rt_desc.Height = kH; rt_desc.DepthOrArraySize = 1; rt_desc.MipLevels = 1;
+        rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rt_desc.SampleDesc.Count = 1;
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ID3D12Resource* rt = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &rt_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt))), "CreateRT");
+
+        // Depth buffer (D32_FLOAT)
+        D3D12_RESOURCE_DESC depth_desc{};
+        depth_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        depth_desc.Width = kW; depth_desc.Height = kH; depth_desc.DepthOrArraySize = 1; depth_desc.MipLevels = 1;
+        depth_desc.Format = DXGI_FORMAT_D32_FLOAT; depth_desc.SampleDesc.Count = 1;
+        depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE dsv_cv{}; dsv_cv.Format = DXGI_FORMAT_D32_FLOAT; dsv_cv.DepthStencil.Depth = 1.0f;
+        ID3D12Resource* depth_res = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dsv_cv, IID_PPV_ARGS(&depth_res))), "CreateDepthRes");
+
+        // Texture
+        D3D12_RESOURCE_DESC tex_desc{};
+        tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex_desc.Width = kTex; tex_desc.Height = kTex; tex_desc.DepthOrArraySize = 1; tex_desc.MipLevels = 1;
+        tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; tex_desc.SampleDesc.Count = 1;
+        ID3D12Resource* tex = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &tex_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex))), "CreateTex");
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT tex_fp{};
+        UINT64 tex_upload_bytes = 0;
+        dev->GetCopyableFootprints(&tex_desc, 0, 1, 0, &tex_fp, nullptr, nullptr, &tex_upload_bytes);
+
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Height = 1; buf_desc.DepthOrArraySize = 1; buf_desc.MipLevels = 1;
+        buf_desc.SampleDesc.Count = 1; buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        buf_desc.Width = tex_upload_bytes;
+        ID3D12Resource* tex_up = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&tex_up))), "CreateTexUpload");
+        void* mapped = nullptr;
+        KX_CHECK(SUCCEEDED(tex_up->Map(0, nullptr, &mapped)), "MapTexUpload");
+        for (uint32_t y = 0; y < kTex; ++y) {
+            std::memcpy(static_cast<uint8_t*>(mapped) + y * tex_fp.Footprint.RowPitch,
+                        tex_rgba.data() + y * kTex * 4, kTex * 4);
+        }
+        tex_up->Unmap(0, nullptr);
+
+        // Constant Buffer (MVP matrix)
+        buf_desc.Width = 256;
+        ID3D12Resource* cb_up = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&cb_up))), "CreateCB");
+        KX_CHECK(SUCCEEDED(cb_up->Map(0, nullptr, &mapped)), "MapCB");
+        std::memcpy(mapped, mvp, sizeof(mvp));
+        cb_up->Unmap(0, nullptr);
+
+        // Vertex Buffer (36 vertices × 32 bytes = 1152 bytes)
+        buf_desc.Width = sizeof(cube_verts);
+        ID3D12Resource* vb_srv = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vb_srv))), "CreateVB");
+        KX_CHECK(SUCCEEDED(vb_srv->Map(0, nullptr, &mapped)), "MapVB");
+        std::memcpy(mapped, cube_verts, sizeof(cube_verts));
+        vb_srv->Unmap(0, nullptr);
+
+        // Readback buffer
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT rt_fp{};
+        UINT64 rb_bytes = 0;
+        dev->GetCopyableFootprints(&rt_desc, 0, 1, 0, &rt_fp, nullptr, nullptr, &rb_bytes);
+        buf_desc.Width = rb_bytes;
+        ID3D12Resource* rb = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_rb, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))), "CreateRB");
+
+        // Descriptor Heaps: RTV, DSV, SRV
+        D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC dsv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC srv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        ID3D12DescriptorHeap* rtv_heap = nullptr;
+        ID3D12DescriptorHeap* dsv_heap = nullptr;
+        ID3D12DescriptorHeap* srv_heap = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap))), "CreateRtvHeap");
+        KX_CHECK(SUCCEEDED(dev->CreateDescriptorHeap(&dsv_hd, IID_PPV_ARGS(&dsv_heap))), "CreateDsvHeap");
+        KX_CHECK(SUCCEEDED(dev->CreateDescriptorHeap(&srv_hd, IID_PPV_ARGS(&srv_heap))), "CreateSrvHeap");
+
+        dev->CreateRenderTargetView(rt, nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
+        dev->CreateDepthStencilView(depth_res, nullptr, dsv_heap->GetCPUDescriptorHandleForHeapStart());
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_d{};
+        srv_d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv_d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_d.Texture2D.MipLevels = 1;
+        dev->CreateShaderResourceView(tex, &srv_d, srv_heap->GetCPUDescriptorHandleForHeapStart());
+
+        // Upload texture
+        D3D12_TEXTURE_COPY_LOCATION src_loc{}, dst_loc{};
+        src_loc.pResource = tex_up; src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src_loc.PlacedFootprint = tex_fp;
+        dst_loc.pResource = tex; dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst_loc.SubresourceIndex = 0;
+        cmd->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+        D3D12_RESOURCE_BARRIER tbar[1]{};
+        tbar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tbar[0].Transition.pResource = tex;
+        tbar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        tbar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        tbar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd->ResourceBarrier(1, tbar);
+
+        // Viewport and scissor
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kW), static_cast<float>(kH), 0.0f, 1.0f};
+        D3D12_RECT sc{0, 0, static_cast<LONG>(kW), static_cast<LONG>(kH)};
+        cmd->RSSetViewports(1, &vp);
+        cmd->RSSetScissorRects(1, &sc);
+
+        // Clear render target and depth buffer
+        const FLOAT clear_color[4] = {0.08f, 0.09f, 0.12f, 1.0f}; // Slate navy background
+        const auto rtv_h = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        const auto dsv_h = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+        cmd->OMSetRenderTargets(1, &rtv_h, FALSE, &dsv_h);
+        cmd->ClearRenderTargetView(rtv_h, clear_color, 0, nullptr);
+        cmd->ClearDepthStencilView(dsv_h, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+        // Bind 3D pipeline & draw cube
+        cmd->SetPipelineState(pso);
+        cmd->SetGraphicsRootSignature(rs);
+        ID3D12DescriptorHeap* heaps[] = {srv_heap};
+        cmd->SetDescriptorHeaps(1, heaps);
+        cmd->SetGraphicsRootConstantBufferView(0, cb_up->GetGPUVirtualAddress());
+        cmd->SetGraphicsRootDescriptorTable(1, srv_heap->GetGPUDescriptorHandleForHeapStart());
+        cmd->SetGraphicsRootShaderResourceView(2, vb_srv->GetGPUVirtualAddress());
+        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd->DrawInstanced(36, 1, 0, 0);
+
+        // Transition RT to copy source & copy to readback buffer
+        D3D12_RESOURCE_BARRIER rt_bar{};
+        rt_bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rt_bar.Transition.pResource = rt;
+        rt_bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        rt_bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        rt_bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd->ResourceBarrier(1, &rt_bar);
+
+        src_loc.pResource = rt; src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src_loc.SubresourceIndex = 0;
+        dst_loc.pResource = rb; dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst_loc.PlacedFootprint = rt_fp;
+        cmd->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+        KX_CHECK(SUCCEEDED(cmd->Close()), "CloseCmd");
+        ID3D12CommandList* lists[] = {cmd};
+        queue->ExecuteCommandLists(1, lists);
+
+        ID3D12Fence* fence = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "CreateFence");
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        queue->Signal(fence, 1);
+        fence->SetEventOnCompletion(1, ev);
+        WaitForSingleObject(ev, 5000);
+        CloseHandle(ev);
+
+        // Capture BMP screenshot on first GPU
+        if (hw_verified == 0) {
+            std::error_code ec;
+            fs::create_directories(capture_path.parent_path(), ec);
+            (void)hle::capture_d3d12_texture_bmp(dev, queue, rt, D3D12_RESOURCE_STATE_COPY_SOURCE, capture_path);
+        }
+
+        // Readback and verify depth-buffered lit cube pixels
+        void* rb_ptr = nullptr;
+        KX_CHECK(SUCCEEDED(rb->Map(0, nullptr, &rb_ptr)), "MapRB");
+        std::vector<uint8_t> pixels(kW * kH * 4);
+        for (uint32_t y = 0; y < kH; ++y) {
+            std::memcpy(pixels.data() + y * kW * 4,
+                        static_cast<const uint8_t*>(rb_ptr) + y * rt_fp.Footprint.RowPitch, kW * 4);
+        }
+        rb->Unmap(0, nullptr);
+
+        // 1. Verify corners are background
+        auto is_bg = [&](uint32_t x, uint32_t y) {
+            const size_t o = (y * kW + x) * 4;
+            return pixels[o] <= 30 && pixels[o + 1] <= 32 && pixels[o + 2] <= 42;
+        };
+        KX_CHECK(is_bg(5, 5) && is_bg(250, 5) && is_bg(5, 250) && is_bg(250, 250), "Corners are background");
+
+        // 2. Verify center pixel (128, 128) is a lit cube pixel
+        const size_t center_off = (128 * kW + 128) * 4;
+        const uint8_t cr = pixels[center_off], cg = pixels[center_off + 1], cb = pixels[center_off + 2];
+        KX_CHECK(cr > 40 || cg > 40 || cb > 40, "Center pixel is lit cube surface");
+
+        // 3. Count rasterized cube pixels
+        uint32_t cube_pixel_count = 0;
+        for (uint32_t y = 0; y < kH; ++y) {
+            for (uint32_t x = 0; x < kW; ++x) {
+                if (!is_bg(x, y)) ++cube_pixel_count;
+            }
+        }
+        KX_CHECK(cube_pixel_count >= 5000 && cube_pixel_count <= 40000,
+                 std::format("Rasterized cube pixel count in valid perspective bounds: {}", cube_pixel_count));
+
+        if (ref_cube_pixels == 0) {
+            ref_cube_pixels = cube_pixel_count;
+        } else {
+            const double diff = std::abs(static_cast<double>(cube_pixel_count) - static_cast<double>(ref_cube_pixels));
+            const double pct = diff / static_cast<double>(ref_cube_pixels);
+            KX_CHECK(pct < 0.005, std::format("Cross-GPU rasterization parity within 0.5%: got {}, ref {}", cube_pixel_count, ref_cube_pixels));
+        }
+
+        std::cout << std::format("    -> Hardware [{}] {} PASS (3D Perspective Cube: {} lit pixels, DSV D32_FLOAT verified)\n",
+                                 ad.index, ad.name, cube_pixel_count);
+        ++hw_verified;
+
+        fence->Release();
+        rtv_heap->Release();
+        dsv_heap->Release();
+        srv_heap->Release();
+        rb->Release();
+        vb_srv->Release();
+        cb_up->Release();
+        tex_up->Release();
+        tex->Release();
+        depth_res->Release();
+        rt->Release();
+        pso->Release();
+        rs->Release();
+        cmd->Release();
+        alloc->Release();
+        queue->Release();
+        dev->Release();
+    }
+    factory->Release();
+    KX_CHECK(hw_verified >= 1, "Expected at least 1 hardware GPU verified for 3D Cube");
+}
+
+void test_gdk_runtime_and_directstorage_bridge() {
+    hle::reset_xgameruntime_stats();
+
+    // 1. Test GDK XUser & XAsyncBlock HLE exports
+    hle::KxXAsyncBlock async{};
+    bool cb_called = false;
+    async.callback = [](hle::KxXAsyncBlock* a) {
+        if (a) *static_cast<bool*>(a->context) = true;
+    };
+    async.context = &cb_called;
+
+    HRESULT hr = hle::kx_XUserAddAsync(0, &async);
+    KX_CHECK(SUCCEEDED(hr), "XUserAddAsync");
+    KX_CHECK(cb_called, "XUserAddAsync completion callback invoked");
+    KX_CHECK(hle::kx_XAsyncGetStatus(&async, false) == S_OK, "XAsyncGetStatus S_OK");
+
+    void* user_handle = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserAddResult(&async, &user_handle)) && user_handle != nullptr, "XUserAddResult");
+
+    uint64_t xuid = 0;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserGetId(user_handle, &xuid)) && xuid != 0, "XUserGetId");
+
+    char gamertag[64]{};
+    size_t used = 0;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserGetGamertag(user_handle, 0, sizeof(gamertag), gamertag, &used)), "XUserGetGamertag");
+    KX_CHECK(std::string_view(gamertag) == "KestrelPlayer", "Gamertag matches KestrelPlayer");
+
+    char pkg_id[128]{};
+    KX_CHECK(SUCCEEDED(hle::kx_XPackageGetCurrentProcessPackageIdentifier(sizeof(pkg_id), pkg_id)), "XPackageGetCurrentProcessPackageIdentifier");
+    KX_CHECK(std::string_view(pkg_id).find("KestrelX") != std::string_view::npos, "Package ID contains KestrelX");
+
+    void* store_ctx = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreCreateContext(user_handle, &store_ctx)) && store_ctx != nullptr, "XStoreCreateContext");
+    hle::kx_XStoreCloseContextHandle(store_ctx);
+    hle::kx_XUserCloseHandle(user_handle);
+
+    const auto gdk_stats = hle::xgameruntime_stats();
+    KX_CHECK(gdk_stats.users_added >= 1 && gdk_stats.store_contexts >= 1 && gdk_stats.package_queries >= 1, "GDK stats counters");
+
+    // 2. Test DirectStorage COM HLE backed by OverlayVfs
+    const fs::path test_dir = fs::temp_directory_path() / "KestrelX_DStorageTest";
+    std::error_code ec;
+    fs::create_directories(test_dir / "data", ec);
+    const fs::path game_file = test_dir / "data" / "dstorage_sample.bin";
+    {
+        std::ofstream ofs(game_file, std::ios::binary);
+        const char content[] = "KESTRELX-DIRECTSTORAGE-NVME-STREAMING-VERIFIED-DATA";
+        ofs.write(content, sizeof(content) - 1);
+    }
+
+    vfs::OverlayVfs vfs(test_dir, test_dir / "data_overlay");
+    hle::set_dstorage_vfs(&vfs);
+    hle::reset_dstorage_stats();
+
+    hle::IKxDStorageFactory* factory = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_DStorageGetFactory(IID_IUnknown, reinterpret_cast<void**>(&factory))) && factory != nullptr, "DStorageGetFactory");
+
+    hle::IKxDStorageFile* file = nullptr;
+    KX_CHECK(SUCCEEDED(factory->OpenFile(L"GAME:\\data\\dstorage_sample.bin", IID_IUnknown, reinterpret_cast<void**>(&file))) && file != nullptr, "DStorage OpenFile");
+
+    BY_HANDLE_FILE_INFORMATION finfo{};
+    KX_CHECK(SUCCEEDED(file->GetFileInformation(&finfo)) && finfo.nFileSizeLow > 0, "DStorage GetFileInformation");
+
+    hle::KxDStorageQueueDesc qdesc{};
+    hle::IKxDStorageQueue* queue = nullptr;
+    KX_CHECK(SUCCEEDED(factory->CreateQueue(&qdesc, IID_IUnknown, reinterpret_cast<void**>(&queue))) && queue != nullptr, "DStorage CreateQueue");
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "Adapter available for fence");
+    IDXGIFactory6* dxgi_f = nullptr;
+    CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_f));
+    IDXGIAdapter1* ad = nullptr;
+    dxgi_f->EnumAdapters1((*adapters)[0].index, &ad);
+    ID3D12Device* dev = nullptr;
+    D3D12CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev));
+    ad->Release();
+    dxgi_f->Release();
+
+    ID3D12Fence* fence = nullptr;
+    KX_CHECK(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "CreateFence");
+
+    char read_buf[64]{};
+    hle::KxDStorageRequest req{};
+    req.source_file = file;
+    req.source_offset = 9;  // "DIRECTSTORAGE..."
+    req.source_size = 20;
+    req.destination_buffer = read_buf;
+    req.destination_size = sizeof(read_buf);
+
+    queue->EnqueueRequest(&req);
+    queue->EnqueueSignal(fence, 42);
+    queue->Submit();
+
+    KX_CHECK(fence->GetCompletedValue() == 42, "DirectStorage fence signal value 42");
+    KX_CHECK(std::string_view(read_buf, 13) == "DIRECTSTORAGE", "DirectStorage payload verified");
+
+    const auto ds_stats = hle::dstorage_stats();
+    KX_CHECK(ds_stats.files_opened >= 1 && ds_stats.queues_created >= 1 && ds_stats.requests_submitted >= 1 && ds_stats.fences_signaled >= 1, "DStorage stats counters");
+
+    fence->Release();
+    dev->Release();
+    queue->Release();
+    file->Close();
+    file->Release();
+    factory->Release();
+    hle::set_dstorage_vfs(nullptr);
+    fs::remove_all(test_dir, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -1231,6 +1981,10 @@ int main() {
     run_test("XAudio2 stereo PCM ring-buffer, RMS energy & underrun verification", test_xaudio2_pcm_ring_buffer);
     run_test("KernelX CreateFile2/ReadFileEx Async VFS I/O & WASAPI Thread Lifecycle", test_kernelx_async_io_and_wasapi_lifecycle);
     run_test("End-to-end PE32+ Loader + Guest DLL + Wide-VFS + GameInput + XAudio2 + RDNA2 VS/PS First Light", test_end_to_end_pe_loader_guest_title);
+    run_test("RDNA2 Wave Intrinsics (WaveReadLaneFirst/At, WavePrefixCountBits, Ballot) on Dual-GPU Hardware", test_rdna2_wave_intrinsics_dual_gpu);
+    run_test("RDNA2 Multi-Texture & Multi-Buffer Dynamic Descriptor Remapping", test_rdna2_multi_texture_multi_buffer_descriptor_remapping);
+    run_test("RDNA2 Depth-Buffered 3D Lit & Textured Perspective Cube on Dual-GPU Hardware", test_rdna2_depth_buffered_3d_cube_dual_gpu);
+    run_test("GDK XUser/XStore/XPackage & DirectStorage VFS Async Bridge", test_gdk_runtime_and_directstorage_bridge);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

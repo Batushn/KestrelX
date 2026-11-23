@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(KestrelX VERSION 0.4.0 LANGUAGES CXX)
+project(KestrelX VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +31,7 @@ add_library(kestrel_core STATIC
     src/hle/registry.cpp
     src/hle/kernelx.cpp
     src/hle/xgameruntime.cpp
+    src/hle/dstorage.cpp
     src/hle/d3d12x.cpp
     src/hle/window_host.cpp
     src/hle/gameinput.cpp
@@ -70,6 +71,7 @@ endfunction()
 add_stub_import_lib(kernelx tests/test_title/defs/kernelx.def)
 add_stub_import_lib(xgameruntime tests/test_title/defs/xgameruntime.def)
 add_stub_import_lib(d3d12_xs tests/test_title/defs/d3d12_xs.def)
+add_stub_import_lib(dstorage_xs tests/test_title/defs/dstorage_xs.def)
 add_stub_import_lib(gameinput tests/test_title/defs/gameinput.def)
 add_stub_import_lib(xaudio2_9 tests/test_title/defs/xaudio2_9.def)
 
@@ -87,12 +89,13 @@ add_executable(kestrel_test_title tests/test_title/main.cpp)
 target_include_directories(kestrel_test_title PRIVATE tests/test_title)
 target_compile_options(kestrel_test_title PRIVATE /GS-)
 target_link_options(kestrel_test_title PRIVATE /ENTRY:KestrelGuestEntry /DYNAMICBASE)
-add_dependencies(kestrel_test_title stub_kernelx stub_xgameruntime stub_d3d12_xs stub_gameinput stub_xaudio2_9 kestrel_test_dll)
+add_dependencies(kestrel_test_title stub_kernelx stub_xgameruntime stub_d3d12_xs stub_dstorage_xs stub_gameinput stub_xaudio2_9 kestrel_test_dll)
 target_link_libraries(kestrel_test_title PRIVATE
     kestrel_test_dll
     "${STUB_LIB_DIR}/kernelx.lib"
     "${STUB_LIB_DIR}/xgameruntime.lib"
     "${STUB_LIB_DIR}/d3d12_xs.lib"
+    "${STUB_LIB_DIR}/dstorage_xs.lib"
     "${STUB_LIB_DIR}/gameinput.lib"
     "${STUB_LIB_DIR}/xaudio2_9.lib"
     vcruntime

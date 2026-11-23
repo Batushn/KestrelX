@@ -88,6 +88,7 @@ const char* vop1_name(uint32_t op) {
     switch (op) {
         case 0: return "v_nop";
         case 1: return "v_mov_b32";
+        case 2: return "v_readfirstlane_b32";
         case 5: return "v_cvt_f32_i32";
         case 6: return "v_cvt_f32_u32";
         case 7: return "v_cvt_u32_f32";
@@ -164,7 +165,10 @@ const char* vop3_name(uint32_t op) {
         case 0x14A: return "v_bfi_b32";
         case 0x151: return "v_med3_f32";
         case 0x169: return "v_mul_lo_u32";
+        case 0x16B: return "v_mbcnt_lo_u32_b32";
         case 0x143: return "v_mad_u32_u24";
+        case 0x360: return "v_readlane_b32";
+        case 0x361: return "v_writelane_b32";
         default: break;
     }
     if (op >= 0x100 && op < 0x140) return vop2_name(op - 0x100);

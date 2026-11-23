@@ -33,13 +33,44 @@ struct RecompResult {
     uint32_t vgpr_count = 0;
     uint32_t sgpr_count = 0;
     WaveMode wave_mode = WaveMode::Wave32;
+    bool uses_cbuf = false;
+    bool uses_wave_ops = false;
+    std::vector<DescriptorSlot> tex_bindings;
+    std::vector<DescriptorSlot> samp_bindings;
+    std::vector<DescriptorSlot> buf_srv_bindings;
 };
 
-// Emit SM 6.6 HLSL compute shader from lifted KestrelX CFG IR.
+struct RootBindingEntry {
+    enum class Kind : uint8_t {
+        CbvB0,
+        UavU0,
+        SrvTexture,
+        SrvBuffer,
+        Sampler,
+    };
+    Kind kind = Kind::CbvB0;
+    uint32_t sgpr_base = 0;
+    uint32_t hlsl_reg = 0;
+    uint32_t root_param_index = 0;
+};
+
+struct RootSignatureRemapPlan {
+    std::vector<RootBindingEntry> entries;
+    uint32_t total_srv_slots = 0;
+    uint32_t total_sampler_slots = 0;
+    bool needs_cbv_b0 = false;
+    bool needs_uav_u0 = false;
+};
+
+// Emit SM 6.6 HLSL shader from lifted KestrelX CFG IR.
 // Memory convention for compute kernels:
 //   - Input thread ID in v0 (SV_DispatchThreadID.x)
 //   - Linear global memory buffer bound at u0 (RWByteAddressBuffer g_mem)
 //   - Optional push/root constants at b0 (cbuffer KxRoot : register(b0))
 RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt = {});
+
+// Build a deterministic D3D12 root-signature / descriptor-table remap plan
+// from the SGPR resource tables discovered during RDNA2 lifting.
+RootSignatureRemapPlan build_root_remap_plan(const IrFunction& fn, ShaderStage stage);
 
 }  // namespace kestrel::gpu

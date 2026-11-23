@@ -6,6 +6,7 @@
 #include "kestrel/gpu/rdna2_isa.hpp"
 #include "kestrel/gpu/rdna2_recomp.hpp"
 #include "kestrel/hle/d3d12x.hpp"
+#include "kestrel/hle/dstorage.hpp"
 #include "kestrel/hle/gameinput.hpp"
 #include "kestrel/hle/kernelx.hpp"
 #include "kestrel/hle/registry.hpp"
@@ -234,6 +235,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
     vfs::OverlayVfs overlay(game_root, data_dir);
     hle::Registry registry;
     hle::set_kernelx_vfs(&overlay);
+    hle::set_dstorage_vfs(&overlay);
     hle::set_xgameruntime_title_id(title_id);
     hle::set_d3d12x_preferred_adapter(adapter_index);
     hle::set_d3d12x_windowed(windowed, 512, 512);
@@ -242,6 +244,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
     hle::set_xaudio2_wasapi_enabled(audio);
     hle::register_kernelx(registry);
     hle::register_xgameruntime(registry);
+    hle::register_dstorage(registry);
     hle::register_d3d12x(registry);
     hle::register_gameinput(registry);
     hle::register_xaudio2(registry);
@@ -275,13 +278,16 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
     const auto kx = hle::kernelx_stats();
     const auto gi = hle::gameinput_stats();
     const auto xa = hle::xaudio2_stats();
+    const auto ds = hle::dstorage_stats();
     std::cout << std::format(
-        "Guest exited with code {} | D3D12.X(dev={}, q={}, cmd={}, res={}, draws={}, barriers={}, cs_pso={}, gfx_pso={}, cache_hit={}, disk_hit={}, present={}) | KernelX(allocs={}, peak={} B, async_rd={}) | GameInput(reads={}) | XAudio2(frames={})\n",
+        "Guest exited with code {} | D3D12.X(dev={}, q={}, cmd={}, res={}, draws={}, barriers={}, cs_pso={}, gfx_pso={}, cache_hit={}, disk_hit={}, present={}) | KernelX(allocs={}, peak={} B, async_rd={}) | DStorage(files={}, reqs={}, bytes={}) | GameInput(reads={}) | XAudio2(frames={})\n",
         *rc, d3d.devices_created, d3d.queues_created, d3d.cmd_lists_created,
         d3d.resources_created, d3d.draw_calls, d3d.barrier_calls,
         d3d.pso_recompiled, d3d.gfx_pso_recompiled,
         d3d.pso_cache_hits + d3d.gfx_pso_cache_hits, d3d.disk_cache_hits, d3d.present_calls,
-        kx.alloc_count, kx.peak_bytes, kx.async_reads, gi.readings_polled, xa.frames_submitted);
+        kx.alloc_count, kx.peak_bytes, kx.async_reads,
+        ds.files_opened, ds.requests_submitted, ds.bytes_read,
+        gi.readings_polled, xa.frames_submitted);
     return *rc;
 }
 

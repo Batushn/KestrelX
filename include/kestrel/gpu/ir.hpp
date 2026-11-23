@@ -52,6 +52,12 @@ enum class IrOp : uint8_t {
     VFractF32,
     VCmp,
     VCndMask,
+    // Wave / subgroup intrinsics (RDNA2 Wave32/Wave64 -> SM 6.6 Wave*)
+    VReadFirstLaneB32,
+    VReadLaneB32,
+    VWriteLaneB32,
+    VMbcntLoU32B32,
+    SAndSaveExec,
     // Memory, Buffer, Texture, LDS & Graphics Export
     SLoadDword,
     GlobalLoadDword,
@@ -97,6 +103,11 @@ struct IrOperand {
     bool neg = false;
 };
 
+struct DescriptorSlot {
+    uint32_t sgpr_base = 0;  // RDNA2 T#/V#/S# base SGPR index
+    uint32_t hlsl_reg = 0;   // Remapped HLSL register index (tN or sN)
+};
+
 struct IrInst {
     uint32_t pc = 0;
     IrOp op = IrOp::Nop;
@@ -107,6 +118,8 @@ struct IrInst {
     IrOperand src2;
     IrOperand src3;
     uint32_t offset = 0;
+    uint32_t rsrc_slot = 0;  // Index into tex_bindings or buf_srv_bindings
+    uint32_t samp_slot = 0;  // Index into samp_bindings
     uint8_t exp_target = 0;
     uint8_t exp_en = 0;
     uint8_t dmask = 0xFu;
@@ -133,8 +146,13 @@ struct IrFunction {
     uint32_t unknown_count = 0;
     bool uses_lds = false;
     bool uses_mem = false;
+    bool uses_cbuf = false;
     bool uses_buf_srv = false;
     bool uses_tex = false;
+    bool uses_wave_ops = false;
+    std::vector<DescriptorSlot> tex_bindings;
+    std::vector<DescriptorSlot> samp_bindings;
+    std::vector<DescriptorSlot> buf_srv_bindings;
 };
 
 IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded);

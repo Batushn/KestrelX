@@ -183,11 +183,44 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
         case IrOp::VCndMask:
             out << ind << std::format("v[{}] = vcc ? {} : {};\n", i.dst.reg, emit_u32(i.src1), emit_u32(i.src0));
             break;
+        case IrOp::VReadFirstLaneB32:
+            out << ind << std::format("s[{}] = WaveReadLaneFirst({});\n", i.dst.reg, emit_u32(i.src0));
+            break;
+        case IrOp::VReadLaneB32:
+            out << ind << std::format("s[{}] = WaveReadLaneAt({}, {});\n", i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
+        case IrOp::VWriteLaneB32:
+            out << ind << std::format("if (WaveGetLaneIndex() == ({})) {{ v[{}] = {}; }}\n",
+                                      emit_u32(i.src1), i.dst.reg, emit_u32(i.src0));
+            break;
+        case IrOp::VMbcntLoU32B32:
+            out << ind << std::format(
+                "v[{}] = countbits(WaveActiveBallot(true).x & ({}) & ((WaveGetLaneIndex() < 32u) ? ((1u << WaveGetLaneIndex()) - 1u) : 0xFFFFFFFFu)) + ({});\n",
+                i.dst.reg, emit_u32(i.src0), emit_u32(i.src1));
+            break;
+        case IrOp::SAndSaveExec:
+            if (i.subop == "s_and_saveexec_b64") {
+                out << ind << std::format(
+                    "{{ uint4 kx_bal = WaveActiveBallot(true); s[{}] = kx_bal.x; s[{}] = kx_bal.y; scc = ((kx_bal.x & ({})) != 0u); }}\n",
+                    i.dst.reg, i.dst.reg + 1, emit_u32(i.src0));
+            } else {
+                out << ind << std::format(
+                    "{{ uint kx_bal = WaveActiveBallot(true).x; s[{}] = kx_bal; scc = ((kx_bal & ({})) != 0u); }}\n",
+                    i.dst.reg, emit_u32(i.src0));
+            }
+            break;
         case IrOp::SLoadDword: {
             const uint32_t count = (i.subop == "s_load_dwordx4") ? 4u : ((i.subop == "s_load_dwordx2") ? 2u : 1u);
-            for (uint32_t k = 0; k < count; ++k) {
-                out << ind << std::format("s[{}] = g_mem.Load({} + {}u);\n",
-                                          i.dst.reg + k, emit_u32(i.src0), i.offset + k * 4u);
+            if (stage == ShaderStage::Compute) {
+                for (uint32_t k = 0; k < count; ++k) {
+                    out << ind << std::format("s[{}] = g_mem.Load({} + {}u);\n",
+                                              i.dst.reg + k, emit_u32(i.src0), i.offset + k * 4u);
+                }
+            } else {
+                for (uint32_t k = 0; k < count; ++k) {
+                    out << ind << std::format("s[{}] = kx_cb_load({} + {}u);\n",
+                                              i.dst.reg + k, emit_u32(i.src0), i.offset + k * 4u);
+                }
             }
             break;
         }
@@ -200,7 +233,7 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
         case IrOp::BufferLoadDword:
         case IrOp::BufferLoadDwordx2:
         case IrOp::BufferLoadDwordx4: {
-            const char* buf = (stage == ShaderStage::Compute) ? "g_mem" : "g_buf";
+            const std::string buf = (stage == ShaderStage::Compute) ? "g_mem" : std::format("g_buf{}", i.rsrc_slot);
             const std::string addr = std::format("({} + {} + {}u)", emit_u32(i.src0), emit_u32(i.src3), i.offset);
             if (i.op == IrOp::BufferLoadDword) {
                 out << ind << std::format("v[{}] = {}.Load({});\n", i.dst.reg, buf, addr);
@@ -232,11 +265,11 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
             const char* comps[4] = {"x", "y", "z", "w"};
             out << ind << "{ ";
             if (stage == ShaderStage::Pixel) {
-                out << std::format("float4 kx_tx = g_tex0.Sample(g_samp0, float2(asfloat(v[{}]), asfloat(v[{}]))); ",
-                                   i.src0.reg, i.src0.reg + 1);
+                out << std::format("float4 kx_tx = g_tex{}.Sample(g_samp{}, float2(asfloat(v[{}]), asfloat(v[{}]))); ",
+                                   i.rsrc_slot, i.samp_slot, i.src0.reg, i.src0.reg + 1);
             } else {
-                out << std::format("float4 kx_tx = g_tex0.SampleLevel(g_samp0, float2(asfloat(v[{}]), asfloat(v[{}])), 0.0); ",
-                                   i.src0.reg, i.src0.reg + 1);
+                out << std::format("float4 kx_tx = g_tex{}.SampleLevel(g_samp{}, float2(asfloat(v[{}]), asfloat(v[{}])), 0.0); ",
+                                   i.rsrc_slot, i.samp_slot, i.src0.reg, i.src0.reg + 1);
             }
             uint32_t out_idx = i.dst.reg;
             for (int c = 0; c < 4; ++c) {
@@ -249,8 +282,8 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
         }
         case IrOp::ImageLoad: {
             const char* comps[4] = {"x", "y", "z", "w"};
-            out << ind << std::format("{{ float4 kx_tx = g_tex0.Load(int3(int(v[{}]), int(v[{}]), 0)); ",
-                                      i.src0.reg, i.src0.reg + 1);
+            out << ind << std::format("{{ float4 kx_tx = g_tex{}.Load(int3(int(v[{}]), int(v[{}]), 0)); ",
+                                      i.rsrc_slot, i.src0.reg, i.src0.reg + 1);
             uint32_t out_idx = i.dst.reg;
             for (int c = 0; c < 4; ++c) {
                 if (i.dmask & (1u << c)) {
@@ -261,8 +294,8 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
             break;
         }
         case IrOp::ImageGetResInfo: {
-            out << ind << std::format("{{ uint kx_tw = 0u, kx_th = 0u, kx_tm = 0u; g_tex0.GetDimensions(v[{}], kx_tw, kx_th, kx_tm); ",
-                                      i.src0.reg);
+            out << ind << std::format("{{ uint kx_tw = 0u, kx_th = 0u, kx_tm = 0u; g_tex{}.GetDimensions(v[{}], kx_tw, kx_th, kx_tm); ",
+                                      i.rsrc_slot, i.src0.reg);
             const char* fields[4] = {"kx_tw", "kx_th", "1u", "kx_tm"};
             uint32_t out_idx = i.dst.reg;
             for (int c = 0; c < 4; ++c) {
@@ -329,7 +362,66 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
     }
 }
 
+void emit_cbuf_helper(std::ostringstream& out) {
+    out << "cbuffer KxConst : register(b0) { uint4 kx_cb[16]; };\n";
+    out << "uint kx_cb_load(uint byte_off) {\n";
+    out << "    uint idx = byte_off >> 2u;\n";
+    out << "    uint4 row = kx_cb[(idx >> 2u) & 15u];\n";
+    out << "    uint c = idx & 3u;\n";
+    out << "    return (c == 0u) ? row.x : ((c == 1u) ? row.y : ((c == 2u) ? row.z : row.w));\n";
+    out << "}\n";
+}
+
+void emit_dynamic_descriptors(std::ostringstream& out, const IrFunction& fn, ShaderStage stage) {
+    if (stage != ShaderStage::Compute) {
+        for (size_t k = 0; k < fn.buf_srv_bindings.size(); ++k) {
+            out << std::format("ByteAddressBuffer g_buf{} : register(t{}); // SGPR s[{}..{}]\n",
+                               k, fn.buf_srv_bindings[k].hlsl_reg,
+                               fn.buf_srv_bindings[k].sgpr_base, fn.buf_srv_bindings[k].sgpr_base + 3);
+        }
+    }
+    for (size_t k = 0; k < fn.tex_bindings.size(); ++k) {
+        out << std::format("Texture2D<float4> g_tex{} : register(t{}); // SGPR s[{}..{}]\n",
+                           k, fn.tex_bindings[k].hlsl_reg,
+                           fn.tex_bindings[k].sgpr_base, fn.tex_bindings[k].sgpr_base + 7);
+    }
+    for (size_t k = 0; k < fn.samp_bindings.size(); ++k) {
+        out << std::format("SamplerState g_samp{} : register(s{}); // SGPR s[{}..{}]\n",
+                           k, fn.samp_bindings[k].hlsl_reg,
+                           fn.samp_bindings[k].sgpr_base, fn.samp_bindings[k].sgpr_base + 3);
+    }
+}
+
 }  // namespace
+
+RootSignatureRemapPlan build_root_remap_plan(const IrFunction& fn, ShaderStage stage) {
+    RootSignatureRemapPlan plan{};
+    uint32_t root_idx = 0;
+
+    if (stage == ShaderStage::Compute || fn.uses_cbuf || fn.uses_mem) {
+        plan.needs_cbv_b0 = true;
+        plan.entries.push_back({RootBindingEntry::Kind::CbvB0, 0, 0, root_idx++});
+    }
+    if (stage == ShaderStage::Compute || fn.uses_mem) {
+        plan.needs_uav_u0 = true;
+        plan.entries.push_back({RootBindingEntry::Kind::UavU0, 0, 0, root_idx++});
+    }
+    if (stage != ShaderStage::Compute) {
+        for (const auto& b : fn.buf_srv_bindings) {
+            plan.entries.push_back({RootBindingEntry::Kind::SrvBuffer, b.sgpr_base, b.hlsl_reg, root_idx++});
+            ++plan.total_srv_slots;
+        }
+    }
+    for (const auto& t : fn.tex_bindings) {
+        plan.entries.push_back({RootBindingEntry::Kind::SrvTexture, t.sgpr_base, t.hlsl_reg, root_idx++});
+        ++plan.total_srv_slots;
+    }
+    for (const auto& s : fn.samp_bindings) {
+        plan.entries.push_back({RootBindingEntry::Kind::Sampler, s.sgpr_base, s.hlsl_reg, root_idx++});
+        ++plan.total_sampler_slots;
+    }
+    return plan;
+}
 
 RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
     RecompResult res{};
@@ -337,6 +429,11 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
     res.vgpr_count = std::max<uint32_t>(fn.max_vgpr, 4u);
     res.sgpr_count = std::max<uint32_t>(fn.max_sgpr, 4u);
     res.blocks_emitted = static_cast<uint32_t>(fn.blocks.size());
+    res.uses_cbuf = fn.uses_cbuf;
+    res.uses_wave_ops = fn.uses_wave_ops;
+    res.tex_bindings = fn.tex_bindings;
+    res.samp_bindings = fn.samp_bindings;
+    res.buf_srv_bindings = fn.buf_srv_bindings;
 
     const char* ret_stmt = (opt.stage == ShaderStage::Vertex) ? "return kx_out;"
                          : (opt.stage == ShaderStage::Pixel)  ? "return kx_mrt0;"
@@ -348,10 +445,7 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
         out << std::format("// Stage: Compute | Target wave mode: Wave{}\n", static_cast<uint32_t>(opt.wave_mode));
         out << "RWByteAddressBuffer g_mem : register(u0);\n";
         out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
-        if (fn.uses_tex) {
-            out << "Texture2D<float4> g_tex0 : register(t0);\n";
-            out << "SamplerState g_samp0 : register(s0);\n";
-        }
+        emit_dynamic_descriptors(out, fn, opt.stage);
         if (fn.uses_lds) {
             out << "groupshared uint g_lds[8192];\n";
         }
@@ -363,15 +457,14 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
         out << "// Stage: Vertex (vs_6_6)\n";
         if (fn.uses_mem) {
             out << "RWByteAddressBuffer g_mem : register(u0);\n";
-            out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
+            if (!fn.uses_cbuf) {
+                out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
+            }
         }
-        if (fn.uses_buf_srv) {
-            out << "ByteAddressBuffer g_buf : register(t1);\n";
+        if (fn.uses_cbuf) {
+            emit_cbuf_helper(out);
         }
-        if (fn.uses_tex) {
-            out << "Texture2D<float4> g_tex0 : register(t0);\n";
-            out << "SamplerState g_samp0 : register(s0);\n";
-        }
+        emit_dynamic_descriptors(out, fn, opt.stage);
         out << "struct KxVsOut { float4 pos : SV_Position; float4 param0 : TEXCOORD0; };\n\n";
         out << std::format("KxVsOut {}(uint sv_vid : SV_VertexID) {{\n", opt.entry_point);
         out << "    KxVsOut kx_out = (KxVsOut)0;\n";
@@ -379,15 +472,14 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
         out << "// Stage: Pixel (ps_6_6)\n";
         if (fn.uses_mem) {
             out << "RWByteAddressBuffer g_mem : register(u0);\n";
-            out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
+            if (!fn.uses_cbuf) {
+                out << "cbuffer KxRoot : register(b0) { uint4 kx_root0; uint4 kx_root1; };\n";
+            }
         }
-        if (fn.uses_buf_srv) {
-            out << "ByteAddressBuffer g_buf : register(t1);\n";
+        if (fn.uses_cbuf) {
+            emit_cbuf_helper(out);
         }
-        if (fn.uses_tex) {
-            out << "Texture2D<float4> g_tex0 : register(t0);\n";
-            out << "SamplerState g_samp0 : register(s0);\n";
-        }
+        emit_dynamic_descriptors(out, fn, opt.stage);
         out << "struct KxPsIn { float4 pos : SV_Position; float4 param0 : TEXCOORD0; };\n\n";
         out << std::format("float4 {}(KxPsIn kx_in) : SV_Target0 {{\n", opt.entry_point);
         out << "    float4 kx_mrt0 = float4(0.0, 0.0, 0.0, 1.0);\n";
@@ -402,7 +494,7 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
         out << "    s[0] = kx_root0.x; s[1] = kx_root0.y; s[2] = kx_root0.z; s[3] = kx_root0.w;\n\n";
     } else if (opt.stage == ShaderStage::Vertex) {
         out << "    v[0] = sv_vid;\n";
-        if (fn.uses_mem) {
+        if (fn.uses_mem && !fn.uses_cbuf) {
             out << "    s[0] = kx_root0.x; s[1] = kx_root0.y; s[2] = kx_root0.z; s[3] = kx_root0.w;\n";
         }
         out << "\n";

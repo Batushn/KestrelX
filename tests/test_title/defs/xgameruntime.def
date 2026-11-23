@@ -6,3 +6,12 @@ EXPORTS
     XTaskQueueSubmitCallback
     XTaskQueueDispatch
     XTaskQueueCloseHandle
+    XAsyncGetStatus
+    XUserAddAsync
+    XUserAddResult
+    XUserGetId
+    XUserGetGamertag
+    XUserCloseHandle
+    XPackageGetCurrentProcessPackageIdentifier
+    XStoreCreateContext
+    XStoreCloseContextHandle

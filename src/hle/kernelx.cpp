@@ -35,6 +35,13 @@ bool is_write_open(DWORD access, DWORD disp) {
            disp == TRUNCATE_EXISTING;
 }
 
+bool is_win32_device_path(std::string_view path) {
+    if (path.starts_with("\\\\.\\")) return true;
+    const std::string low = to_lower_ascii(path);
+    return low == "con" || low == "conin$" || low == "conout$" ||
+           low == "nul" || low == "prn" || low == "aux";
+}
+
 void* __stdcall kx_XMemAlloc(size_t size, uint64_t attributes) {
     (void)attributes;
     if (size == 0) size = 1;
@@ -89,15 +96,13 @@ uint32_t __stdcall kx_GetConsoleType() { return 4; }
 HANDLE __stdcall kx_CreateFileA(
     LPCSTR filename, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sec,
     DWORD disp, DWORD flags, HANDLE tmpl) {
-    if (g_vfs && filename) {
+    if (g_vfs && filename && !is_win32_device_path(filename)) {
         auto resolved = g_vfs->resolve(filename, is_write_open(access, disp));
         if (resolved) {
             return CreateFileW(resolved->c_str(), access, share, sec, disp, flags, tmpl);
         }
-        if (std::string_view(filename).find(':') != std::string_view::npos) {
-            SetLastError(ERROR_FILE_NOT_FOUND);
-            return INVALID_HANDLE_VALUE;
-        }
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
     }
     return CreateFileA(filename, access, share, sec, disp, flags, tmpl);
 }
@@ -107,11 +112,11 @@ HANDLE __stdcall kx_CreateFileW(
     DWORD disp, DWORD flags, HANDLE tmpl) {
     if (g_vfs && filename) {
         const std::string utf8 = wide_to_utf8(filename);
-        auto resolved = g_vfs->resolve(utf8, is_write_open(access, disp));
-        if (resolved) {
-            return CreateFileW(resolved->c_str(), access, share, sec, disp, flags, tmpl);
-        }
-        if (utf8.find(':') != std::string::npos) {
+        if (!is_win32_device_path(utf8)) {
+            auto resolved = g_vfs->resolve(utf8, is_write_open(access, disp));
+            if (resolved) {
+                return CreateFileW(resolved->c_str(), access, share, sec, disp, flags, tmpl);
+            }
             SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_HANDLE_VALUE;
         }
@@ -120,13 +125,11 @@ HANDLE __stdcall kx_CreateFileW(
 }
 
 BOOL __stdcall kx_DeleteFileA(LPCSTR filename) {
-    if (g_vfs && filename) {
+    if (g_vfs && filename && !is_win32_device_path(filename)) {
         auto r = g_vfs->remove_file(filename);
         if (r) return TRUE;
-        if (std::string_view(filename).find(':') != std::string_view::npos) {
-            SetLastError(ERROR_FILE_NOT_FOUND);
-            return FALSE;
-        }
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
     }
     return DeleteFileA(filename);
 }
@@ -134,9 +137,9 @@ BOOL __stdcall kx_DeleteFileA(LPCSTR filename) {
 BOOL __stdcall kx_DeleteFileW(LPCWSTR filename) {
     if (g_vfs && filename) {
         const std::string utf8 = wide_to_utf8(filename);
-        auto r = g_vfs->remove_file(utf8);
-        if (r) return TRUE;
-        if (utf8.find(':') != std::string::npos) {
+        if (!is_win32_device_path(utf8)) {
+            auto r = g_vfs->remove_file(utf8);
+            if (r) return TRUE;
             SetLastError(ERROR_FILE_NOT_FOUND);
             return FALSE;
         }
@@ -147,11 +150,11 @@ BOOL __stdcall kx_DeleteFileW(LPCWSTR filename) {
 BOOL __stdcall kx_GetFileAttributesExW(LPCWSTR filename, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
     if (g_vfs && filename) {
         const std::string utf8 = wide_to_utf8(filename);
-        auto resolved = g_vfs->resolve(utf8, false);
-        if (resolved) {
-            return GetFileAttributesExW(resolved->c_str(), level, info);
-        }
-        if (utf8.find(':') != std::string::npos) {
+        if (!is_win32_device_path(utf8)) {
+            auto resolved = g_vfs->resolve(utf8, false);
+            if (resolved) {
+                return GetFileAttributesExW(resolved->c_str(), level, info);
+            }
             SetLastError(ERROR_FILE_NOT_FOUND);
             return FALSE;
         }
@@ -167,11 +170,11 @@ HANDLE __stdcall kx_CreateFile2(
     }
     if (g_vfs && filename) {
         const std::string utf8 = wide_to_utf8(filename);
-        auto resolved = g_vfs->resolve(utf8, is_write_open(access, disp));
-        if (resolved) {
-            return CreateFile2(resolved->c_str(), access, share, disp, ext);
-        }
-        if (utf8.find(':') != std::string::npos) {
+        if (!is_win32_device_path(utf8)) {
+            auto resolved = g_vfs->resolve(utf8, is_write_open(access, disp));
+            if (resolved) {
+                return CreateFile2(resolved->c_str(), access, share, disp, ext);
+            }
             SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_HANDLE_VALUE;
         }

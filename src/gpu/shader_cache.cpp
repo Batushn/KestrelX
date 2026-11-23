@@ -1,6 +1,7 @@
 #include "kestrel/gpu/shader_cache.hpp"
 
 #include <Windows.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -35,6 +36,9 @@ uint64_t fnv1a_64_bytes(const uint8_t* data, size_t len, uint64_t seed = 1469598
 DiskShaderCache::DiskShaderCache(std::filesystem::path root_dir)
     : root_dir_(root_dir.empty() ? default_cache_dir() : std::move(root_dir)) {}
 
+DiskShaderCache::DiskShaderCache(std::filesystem::path root_dir, ShaderCacheConfig config)
+    : root_dir_(root_dir.empty() ? default_cache_dir() : std::move(root_dir)), config_(config) {}
+
 std::filesystem::path DiskShaderCache::default_cache_dir() {
     if (const char* override_dir = std::getenv("KESTREL_SHADER_CACHE_DIR"); override_dir && override_dir[0] != '\0') {
         return std::filesystem::path(override_dir);
@@ -48,20 +52,41 @@ std::filesystem::path DiskShaderCache::default_cache_dir() {
 }
 
 uint64_t DiskShaderCache::make_key(ShaderStage stage, WaveMode wave, uint32_t group_x,
-                                   const uint8_t* rdna2_bytes, size_t len) {
+                                   const uint8_t* rdna2_bytes, size_t len,
+                                   uint32_t group_y, uint32_t group_z,
+                                   uint32_t mrt_mask) {
     uint64_t seed = 14695981039346656037ull;
-    const uint32_t meta[4] = {
+    const uint32_t meta[7] = {
         kShaderCacheCompilerVersion,
         static_cast<uint32_t>(stage),
         static_cast<uint32_t>(wave),
         group_x,
+        group_y,
+        group_z,
+        mrt_mask,
     };
     seed = fnv1a_64_bytes(reinterpret_cast<const uint8_t*>(meta), sizeof(meta), seed);
     return fnv1a_64_bytes(rdna2_bytes, len, seed);
 }
 
 void DiskShaderCache::set_root_dir(std::filesystem::path root_dir) {
+    std::lock_guard<std::mutex> lock(mtx_);
     root_dir_ = root_dir.empty() ? default_cache_dir() : std::move(root_dir);
+}
+
+std::filesystem::path DiskShaderCache::root_dir() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return root_dir_;
+}
+
+void DiskShaderCache::set_config(const ShaderCacheConfig& config) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    config_ = config;
+}
+
+ShaderCacheConfig DiskShaderCache::config() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return config_;
 }
 
 std::filesystem::path DiskShaderCache::entry_path(uint64_t key) const {
@@ -69,9 +94,10 @@ std::filesystem::path DiskShaderCache::entry_path(uint64_t key) const {
 }
 
 bool DiskShaderCache::load(uint64_t key, std::vector<uint8_t>& out_dxil) {
+    std::lock_guard<std::mutex> lock(mtx_);
     const auto path = entry_path(key);
     std::error_code ec;
-    if (!std::filesystem::exists(path, ec)) {
+    if (!std::filesystem::exists(path, ec) || ec) {
         ++stats_.disk_misses;
         return false;
     }
@@ -121,6 +147,13 @@ bool DiskShaderCache::load(uint64_t key, std::vector<uint8_t>& out_dxil) {
         return false;
     }
 
+    ifs.close();
+
+    if (config_.enable_lru) {
+        std::error_code touch_ec;
+        std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), touch_ec);
+    }
+
     out_dxil = std::move(payload);
     ++stats_.disk_hits;
     return true;
@@ -128,6 +161,8 @@ bool DiskShaderCache::load(uint64_t key, std::vector<uint8_t>& out_dxil) {
 
 bool DiskShaderCache::store(uint64_t key, const std::vector<uint8_t>& dxil) {
     if (dxil.size() < 32 || dxil.size() > (64u << 20)) return false;
+
+    std::lock_guard<std::mutex> lock(mtx_);
     std::error_code ec;
     std::filesystem::create_directories(root_dir_, ec);
     if (ec) return false;
@@ -162,7 +197,98 @@ bool DiskShaderCache::store(uint64_t key, const std::vector<uint8_t>& dxil) {
     }
 
     ++stats_.disk_writes;
+    (void)prune_locked();
     return true;
+}
+
+size_t DiskShaderCache::prune() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return prune_locked();
+}
+
+size_t DiskShaderCache::clear() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::error_code ec;
+    if (!std::filesystem::exists(root_dir_, ec) || ec) return 0;
+
+    size_t removed = 0;
+    for (std::filesystem::directory_iterator it(root_dir_, ec), end; it != end && !ec; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec) || entry_ec) continue;
+        const auto ext = it->path().extension();
+        if (ext == ".kxdxil" || ext == ".tmp") {
+            if (std::filesystem::remove(it->path(), entry_ec) && !entry_ec) {
+                if (ext == ".kxdxil") ++removed;
+            }
+        }
+    }
+    return removed;
+}
+
+ShaderCacheStats DiskShaderCache::stats() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return stats_;
+}
+
+void DiskShaderCache::reset_stats() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    stats_ = {};
+}
+
+size_t DiskShaderCache::prune_locked() {
+    if (config_.max_entries == 0 && config_.max_bytes == 0) return 0;
+
+    std::error_code ec;
+    if (!std::filesystem::exists(root_dir_, ec) || ec) return 0;
+
+    struct Entry {
+        std::filesystem::path path;
+        uint64_t size = 0;
+        std::filesystem::file_time_type mtime{};
+    };
+
+    std::vector<Entry> entries;
+    uint64_t total_bytes = 0;
+
+    for (std::filesystem::directory_iterator it(root_dir_, ec), end; it != end && !ec; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec) || entry_ec) continue;
+        if (it->path().extension() != ".kxdxil") continue;
+
+        const uint64_t sz = it->file_size(entry_ec);
+        if (entry_ec) continue;
+        const auto mt = it->last_write_time(entry_ec);
+        if (entry_ec) continue;
+
+        entries.push_back({it->path(), sz, mt});
+        total_bytes += sz;
+    }
+
+    size_t total_entries = entries.size();
+    const bool over_entries = (config_.max_entries > 0) && (total_entries > config_.max_entries);
+    const bool over_bytes = (config_.max_bytes > 0) && (total_bytes > config_.max_bytes);
+    if (!over_entries && !over_bytes) return 0;
+
+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.mtime != b.mtime) return a.mtime < b.mtime;
+        return a.path < b.path;
+    });
+
+    size_t evicted = 0;
+    for (const auto& e : entries) {
+        const bool still_over_entries = (config_.max_entries > 0) && (total_entries > config_.max_entries);
+        const bool still_over_bytes = (config_.max_bytes > 0) && (total_bytes > config_.max_bytes);
+        if (!still_over_entries && !still_over_bytes) break;
+
+        std::error_code rm_ec;
+        if (std::filesystem::remove(e.path, rm_ec) && !rm_ec) {
+            --total_entries;
+            total_bytes -= e.size;
+            ++stats_.evictions;
+            ++evicted;
+        }
+    }
+    return evicted;
 }
 
 }  // namespace kestrel::gpu

@@ -2665,6 +2665,8 @@ void test_veh_zen2_sse4a_extrq_insertq() {
     const auto st = cpu::ScopedVehShim::stats();
     KX_CHECK(st.extrq_emulated == 1, "Extrq counter incremented");
     KX_CHECK(st.insertq_emulated == 1, "Insertq counter incremented");
+}
+
 void test_vrs_tier2_encode_decode_combiners_and_image() {
     using gpu::VrsCombiner;
     using gpu::VrsShadingRate;

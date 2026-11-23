@@ -24,12 +24,14 @@
 #include "kestrel/formats/sgd5.hpp"
 
 #include <dxgi1_6.h>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -3071,6 +3073,272 @@ float4 main(float4 pos : SV_Position) : SV_Target0 {
     KX_CHECK(tier2_verified >= 1, "At least one hardware GPU verified for VRS Tier 2");
 }
 
+void test_gameinput_multi_controller_slots_and_rumble() {
+    hle::reset_gameinput_stats();
+    hle::Registry reg;
+    hle::register_gameinput(reg);
+
+    auto* create_fn = reinterpret_cast<HRESULT(__stdcall*)(hle::IKxGameInput**)>(
+        reg.resolve_name("gameinput.dll", "GameInputCreate"));
+    KX_CHECK(create_fn != nullptr, "GameInputCreate export");
+
+    hle::IKxGameInput* gi = nullptr;
+    KX_CHECK(SUCCEEDED(create_fn(&gi)) && gi != nullptr, "GameInputCreate S_OK");
+
+    // Bounds & pointer validation on GetDeviceForSlot
+    hle::IKxGameInputDevice* bad_dev = nullptr;
+    KX_CHECK(gi->GetDeviceForSlot(hle::kMaxControllerSlots, &bad_dev) == E_INVALIDARG && bad_dev == nullptr,
+             "Out-of-range slot rejected with E_INVALIDARG");
+    KX_CHECK(gi->GetDeviceForSlot(0, nullptr) == E_POINTER, "Null out_device rejected with E_POINTER");
+
+    // Enumerate all 4 slots and verify distinct identity & GetDefaultDevice == slot 0
+    std::array<hle::IKxGameInputDevice*, hle::kMaxControllerSlots> devs{};
+    for (uint32_t s = 0; s < hle::kMaxControllerSlots; ++s) {
+        KX_CHECK(SUCCEEDED(gi->GetDeviceForSlot(s, &devs[s])) && devs[s] != nullptr, "GetDeviceForSlot S_OK");
+        KX_CHECK(devs[s]->GetSlotIndex() == s, "Slot index matches");
+        KX_CHECK(devs[s]->GetDeviceId() != 0, "Non-zero device ID");
+        for (uint32_t prev = 0; prev < s; ++prev) {
+            KX_CHECK(devs[s]->GetDeviceId() != devs[prev]->GetDeviceId(), "Unique device ID per slot");
+        }
+    }
+
+    hle::IKxGameInputDevice* def_dev = nullptr;
+    KX_CHECK(SUCCEEDED(gi->GetDefaultDevice(&def_dev)) && def_dev != nullptr, "GetDefaultDevice S_OK");
+    KX_CHECK(def_dev->GetSlotIndex() == 0 && def_dev->GetDeviceId() == devs[0]->GetDeviceId(),
+             "Default device maps to slot 0");
+    def_dev->Release();
+
+    // Mark all 4 slots mocked disconnected and verify targeted reads fail with ERROR_DEVICE_NOT_CONNECTED
+    for (uint32_t s = 0; s < hle::kMaxControllerSlots; ++s) {
+        hle::set_gameinput_mock_slot_state(s, {}, false);
+        KX_CHECK(!devs[s]->IsConnected(), "Slot initially disconnected");
+        hle::IKxGameInputReading* disc_r = nullptr;
+        const HRESULT hr = gi->GetCurrentReading(hle::KxGameInputKindGamepad, devs[s], &disc_r);
+        KX_CHECK(hr == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) && disc_r == nullptr,
+                 "Disconnected slot returns ERROR_DEVICE_NOT_CONNECTED");
+    }
+    KX_CHECK(hle::gameinput_stats().active_controllers == 0, "Zero active controllers when all disconnected");
+
+    // Connect 4 concurrent controllers with independent states
+    const std::array<hle::KxGameInputGamepadState, hle::kMaxControllerSlots> expected = {{
+        {hle::KxGamepadA, 0.25f, 0.00f,  0.50f,  0.00f,  0.00f,  0.00f},
+        {hle::KxGamepadB, 0.00f, 0.50f,  0.00f, -0.75f,  0.00f,  0.00f},
+        {hle::KxGamepadX, 0.75f, 0.10f,  0.00f,  0.00f,  0.90f,  0.00f},
+        {hle::KxGamepadY, 0.15f, 1.00f, -1.00f,  0.25f,  0.00f, -0.85f},
+    }};
+    for (uint32_t s = 0; s < hle::kMaxControllerSlots; ++s) {
+        hle::set_gameinput_mock_slot_state(s, expected[s], true);
+        KX_CHECK(devs[s]->IsConnected(), "Slot connected after mock state set");
+    }
+    KX_CHECK(hle::gameinput_stats().active_controllers == 4, "4 active controllers tracked");
+
+    // Verify independent targeted readings across all 4 slots
+    for (uint32_t s = 0; s < hle::kMaxControllerSlots; ++s) {
+        hle::IKxGameInputReading* r = nullptr;
+        KX_CHECK(SUCCEEDED(gi->GetCurrentReading(hle::KxGameInputKindGamepad, devs[s], &r)) && r != nullptr,
+                 "Targeted slot reading succeeds");
+        hle::KxGameInputGamepadState got{};
+        KX_CHECK(r->GetGamepadState(&got), "GetGamepadState true");
+        KX_CHECK(got.buttons == expected[s].buttons, "Buttons isolated per slot");
+        KX_CHECK(std::abs(got.left_trigger - expected[s].left_trigger) < 1e-5f, "Left trigger isolated per slot");
+        KX_CHECK(std::abs(got.right_trigger - expected[s].right_trigger) < 1e-5f, "Right trigger isolated per slot");
+        KX_CHECK(std::abs(got.left_thumbstick_x - expected[s].left_thumbstick_x) < 1e-5f, "LX isolated per slot");
+        KX_CHECK(std::abs(got.left_thumbstick_y - expected[s].left_thumbstick_y) < 1e-5f, "LY isolated per slot");
+        KX_CHECK(std::abs(got.right_thumbstick_x - expected[s].right_thumbstick_x) < 1e-5f, "RX isolated per slot");
+        KX_CHECK(std::abs(got.right_thumbstick_y - expected[s].right_thumbstick_y) < 1e-5f, "RY isolated per slot");
+        r->Release();
+    }
+
+    // Disconnect slot 2 only; verify slot 2 fails while slots 0, 1, 3 continue reading
+    hle::simulate_gameinput_hotplug(2, false);
+    KX_CHECK(!devs[2]->IsConnected(), "Slot 2 disconnected");
+    KX_CHECK(hle::gameinput_stats().active_controllers == 3, "3 active controllers after slot 2 disconnect");
+    {
+        hle::IKxGameInputReading* r2 = nullptr;
+        KX_CHECK(gi->GetCurrentReading(hle::KxGameInputKindGamepad, devs[2], &r2) ==
+                     HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) && r2 == nullptr,
+                 "Disconnected slot 2 reading fails");
+        hle::IKxGameInputReading* r3 = nullptr;
+        KX_CHECK(SUCCEEDED(gi->GetCurrentReading(hle::KxGameInputKindGamepad, devs[3], &r3)) && r3 != nullptr,
+                 "Slot 3 reading still succeeds");
+        hle::KxGameInputGamepadState got3{};
+        KX_CHECK(r3->GetGamepadState(&got3) && got3.buttons == hle::KxGamepadY, "Slot 3 state intact");
+        r3->Release();
+    }
+
+    // Per-slot rumble isolation: slot 1 must NOT overwrite slot 0 (or slots 2/3)
+    const hle::KxGameInputRumbleParams r0{0.20f, 0.30f, 0.10f, 0.40f};
+    const hle::KxGameInputRumbleParams r1{0.90f, 0.80f, 0.70f, 0.60f};
+    devs[0]->SetRumbleState(&r0);
+    devs[1]->SetRumbleState(&r1);
+
+    hle::KxGameInputRumbleParams got_r0{}, got_r1{}, got_r2{};
+    devs[0]->GetRumbleState(&got_r0);
+    devs[1]->GetRumbleState(&got_r1);
+    devs[2]->GetRumbleState(&got_r2);
+    KX_CHECK(std::abs(got_r0.low_frequency - 0.20f) < 1e-5f && std::abs(got_r0.high_frequency - 0.30f) < 1e-5f,
+             "Slot 0 rumble preserved after slot 1 update");
+    KX_CHECK(std::abs(got_r1.low_frequency - 0.90f) < 1e-5f && std::abs(got_r1.right_trigger - 0.60f) < 1e-5f,
+             "Slot 1 rumble stored independently");
+    KX_CHECK(got_r2.low_frequency == 0.0f && got_r2.high_frequency == 0.0f, "Slot 2 rumble remains zero");
+
+    // NaN / +/-Inf / out-of-range rumble clamping safety
+    const hle::KxGameInputRumbleParams wild{
+        std::numeric_limits<float>::quiet_NaN(),
+        2.5f,
+        -0.75f,
+        std::numeric_limits<float>::infinity()};
+    devs[3]->SetRumbleState(&wild);
+    hle::KxGameInputRumbleParams got_r3{};
+    devs[3]->GetRumbleState(&got_r3);
+    KX_CHECK(got_r3.low_frequency == 0.0f, "NaN rumble clamped to 0.0");
+    KX_CHECK(std::abs(got_r3.high_frequency - 1.0f) < 1e-5f, ">1.0 rumble clamped to 1.0");
+    KX_CHECK(got_r3.left_trigger == 0.0f, "Negative rumble clamped to 0.0");
+    KX_CHECK(got_r3.right_trigger == 0.0f, "+Inf rumble clamped to 0.0");
+
+    // Clear all motors to zero and clean up
+    const hle::KxGameInputRumbleParams zero{};
+    for (auto* d : devs) {
+        d->SetRumbleState(&zero);
+        d->Release();
+    }
+    KX_CHECK(hle::gameinput_stats().rumble_commands_sent == 7, "Exact rumble command count tracked");
+    hle::clear_gameinput_mock_slots();
+    gi->Release();
+}
+
+void test_gameinput_hotplug_callbacks_and_telemetry() {
+    hle::reset_gameinput_stats();
+    hle::Registry reg;
+    hle::register_gameinput(reg);
+
+    auto* create_fn = reinterpret_cast<HRESULT(__stdcall*)(hle::IKxGameInput**)>(
+        reg.resolve_name("gameinput.dll", "GameInputCreate"));
+    KX_CHECK(create_fn != nullptr, "GameInputCreate export");
+
+    hle::IKxGameInput* gi = nullptr;
+    KX_CHECK(SUCCEEDED(create_fn(&gi)) && gi != nullptr, "GameInputCreate S_OK");
+
+    // Validation checks
+    hle::KxGameInputCallbackToken bad_tok = 0;
+    KX_CHECK(gi->RegisterDeviceCallback(nullptr, nullptr, &bad_tok) == E_INVALIDARG,
+             "Null callback rejected with E_INVALIDARG");
+    KX_CHECK(!gi->UnregisterCallback(0), "UnregisterCallback(0) returns false");
+    KX_CHECK(!gi->UnregisterCallback(999999), "UnregisterCallback(unknown) returns false");
+
+    struct EventRecord {
+        hle::KxGameInputCallbackToken token = 0;
+        uint32_t slot = 0;
+        uint64_t device_id = 0;
+        uint64_t timestamp = 0;
+        hle::KxGameInputDeviceStatus cur = hle::KxGameInputDeviceStatus::Disconnected;
+        hle::KxGameInputDeviceStatus prev = hle::KxGameInputDeviceStatus::Disconnected;
+        bool dev_is_connected = false;
+    };
+    struct CbContext {
+        std::vector<EventRecord> events;
+        hle::IKxGameInput* gi = nullptr;
+        bool self_unregister = false;
+    };
+
+    auto on_device = [](hle::KxGameInputCallbackToken token,
+                        void* ctx_ptr,
+                        hle::IKxGameInputDevice* device,
+                        uint64_t timestamp,
+                        hle::KxGameInputDeviceStatus cur,
+                        hle::KxGameInputDeviceStatus prev) -> void {
+        auto* ctx = static_cast<CbContext*>(ctx_ptr);
+        ctx->events.push_back(EventRecord{
+            token,
+            device ? device->GetSlotIndex() : 0xFFFFFFFFu,
+            device ? device->GetDeviceId() : 0ull,
+            timestamp,
+            cur,
+            prev,
+            device ? device->IsConnected() : false,
+        });
+        if (ctx->self_unregister && ctx->gi) {
+            ctx->gi->UnregisterCallback(token);
+        }
+    };
+
+    CbContext ctx1{};
+    CbContext ctx2{};
+    hle::KxGameInputCallbackToken tok1 = 0;
+    hle::KxGameInputCallbackToken tok2 = 0;
+    KX_CHECK(SUCCEEDED(gi->RegisterDeviceCallback(&ctx1, on_device, &tok1)) && tok1 != 0, "Register cb 1");
+    KX_CHECK(SUCCEEDED(gi->RegisterDeviceCallback(&ctx2, on_device, &tok2)) && tok2 != 0 && tok2 != tok1,
+             "Register cb 2 with distinct token");
+
+    // 1. Connect slot 1 -> both callbacks fire
+    hle::simulate_gameinput_hotplug(1, true);
+    KX_CHECK(ctx1.events.size() == 1 && ctx2.events.size() == 1, "Both callbacks fired on slot 1 connect");
+    KX_CHECK(ctx1.events[0].token == tok1 && ctx1.events[0].slot == 1 && ctx1.events[0].device_id != 0 &&
+                 ctx1.events[0].timestamp > 0 &&
+                 ctx1.events[0].cur == hle::KxGameInputDeviceStatus::Connected &&
+                 ctx1.events[0].prev == hle::KxGameInputDeviceStatus::Disconnected &&
+                 ctx1.events[0].dev_is_connected,
+             "Slot 1 connect event fields accurate");
+    {
+        const auto st = hle::gameinput_stats();
+        KX_CHECK(st.active_controllers == 1 && st.hotplug_events == 1, "Stats after slot 1 connect");
+    }
+
+    // 2. Redundant connect on slot 1 -> deterministic no-op (no duplicate callback or event)
+    hle::simulate_gameinput_hotplug(1, true);
+    KX_CHECK(ctx1.events.size() == 1 && ctx2.events.size() == 1, "Redundant connect does not re-fire");
+    KX_CHECK(hle::gameinput_stats().hotplug_events == 1, "Redundant connect does not increment hotplug_events");
+
+    // 3. Connect slot 3, then disconnect slot 1
+    hle::simulate_gameinput_hotplug(3, true);
+    hle::simulate_gameinput_hotplug(1, false);
+    KX_CHECK(ctx1.events.size() == 3 && ctx2.events.size() == 3, "Both callbacks received all 3 transitions");
+    KX_CHECK(ctx1.events[1].slot == 3 && ctx1.events[1].cur == hle::KxGameInputDeviceStatus::Connected,
+             "Slot 3 connect recorded");
+    KX_CHECK(ctx1.events[2].slot == 1 &&
+                 ctx1.events[2].cur == hle::KxGameInputDeviceStatus::Disconnected &&
+                 ctx1.events[2].prev == hle::KxGameInputDeviceStatus::Connected &&
+                 !ctx1.events[2].dev_is_connected,
+             "Slot 1 disconnect recorded");
+    {
+        const auto st = hle::gameinput_stats();
+        KX_CHECK(st.active_controllers == 1 && st.hotplug_events == 3, "Stats after connect+disconnect");
+    }
+
+    // 4. Unregister tok1 -> stops receiving callbacks while tok2 continues
+    KX_CHECK(gi->UnregisterCallback(tok1), "Unregister tok1 returns true");
+    KX_CHECK(!gi->UnregisterCallback(tok1), "Double unregister returns false");
+
+    hle::simulate_gameinput_hotplug(0, true);
+    KX_CHECK(ctx1.events.size() == 3, "Unregistered callback receives zero further events");
+    KX_CHECK(ctx2.events.size() == 4 && ctx2.events[3].slot == 0, "Remaining callback still fires");
+    {
+        const auto st = hle::gameinput_stats();
+        KX_CHECK(st.active_controllers == 2 && st.hotplug_events == 4, "Stats after slot 0 connect");
+    }
+
+    // 5. Re-entrancy safety: callback unregisters itself from inside dispatch without deadlocking
+    CbContext ctx_self{{}, gi, true};
+    hle::KxGameInputCallbackToken tok_self = 0;
+    KX_CHECK(SUCCEEDED(gi->RegisterDeviceCallback(&ctx_self, on_device, &tok_self)) && tok_self != 0,
+             "Register self-unregistering callback");
+    hle::simulate_gameinput_hotplug(2, true);
+    KX_CHECK(ctx_self.events.size() == 1, "Self-unregistering callback fired once");
+    hle::simulate_gameinput_hotplug(2, false);
+    KX_CHECK(ctx_self.events.size() == 1, "Self-unregistered callback did not fire again");
+
+    // 6. Releasing IKxGameInput automatically cleans up remaining callbacks (no dangling call)
+    const size_t ctx2_count_before_release = ctx2.events.size();
+    gi->Release();
+    hle::simulate_gameinput_hotplug(0, false);
+    KX_CHECK(ctx2.events.size() == ctx2_count_before_release,
+             "Released IKxGameInput auto-unregisters remaining callbacks");
+    KX_CHECK(hle::gameinput_stats().active_controllers == 1 && hle::gameinput_stats().hotplug_events == 7,
+             "Final hotplug telemetry accurate");
+
+    hle::clear_gameinput_mock_slots();
+}
+
 }  // namespace
 
 int main() {
@@ -3108,6 +3376,8 @@ int main() {
     run_test("AMD Zen 2 VEH Shim SSE4a Instruction Emulation (EXTRQ / INSERTQ on Intel & AMD)", test_veh_zen2_sse4a_extrq_insertq);
     run_test("RDNA2 VRS Tier 2 Rate/Tile Encode-Decode, Combiners & Shading Rate Image Builder", test_vrs_tier2_encode_decode_combiners_and_image);
     run_test("D3D12.X ID3D12GraphicsCommandList5 VRS Tier 2 Hardware Render & Telemetry", test_vrs_tier2_hardware_render_and_proxy_telemetry);
+    run_test("GameInput Multi-Controller Slot Management (0..3) & Rumble Isolation", test_gameinput_multi_controller_slots_and_rumble);
+    run_test("GameInput Device Hotplug Callbacks, Re-Entrancy & Telemetry", test_gameinput_hotplug_callbacks_and_telemetry);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

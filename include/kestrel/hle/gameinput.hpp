@@ -10,6 +10,8 @@
 
 namespace kestrel::hle {
 
+constexpr uint32_t kMaxControllerSlots = 4;
+
 enum KxGameInputKind : uint32_t {
     KxGameInputKindUnknown = 0x00000000,
     KxGameInputKindGamepad = 0x00010000,
@@ -31,6 +33,11 @@ enum KxGameInputGamepadButtons : uint32_t {
     KxGamepadRightShoulder  = 0x00000800,
     KxGamepadLeftThumbstick = 0x00001000,
     KxGamepadRightThumbstick= 0x00002000,
+};
+
+enum class KxGameInputDeviceStatus : uint32_t {
+    Disconnected = 0,
+    Connected = 1,
 };
 
 struct KxGameInputGamepadState {
@@ -59,19 +66,45 @@ struct KxGameInputRumbleParams {
 struct IKxGameInputDevice : public IUnknown {
     virtual void STDMETHODCALLTYPE SetRumbleState(const KxGameInputRumbleParams* params) = 0;
     virtual void STDMETHODCALLTYPE GetRumbleState(KxGameInputRumbleParams* out_params) = 0;
+    // Appended v0.7 multi-controller identity methods (preserves existing COM vtable layout)
+    virtual uint32_t STDMETHODCALLTYPE GetSlotIndex() = 0;
+    virtual bool STDMETHODCALLTYPE IsConnected() = 0;
+    virtual uint64_t STDMETHODCALLTYPE GetDeviceId() = 0;
 };
+
+using KxGameInputCallbackToken = uint64_t;
+
+using KxGameInputDeviceCallback = void(STDMETHODCALLTYPE*)(
+    KxGameInputCallbackToken callback_token,
+    void* context,
+    IKxGameInputDevice* device,
+    uint64_t timestamp,
+    KxGameInputDeviceStatus current_status,
+    KxGameInputDeviceStatus previous_status);
 
 struct IKxGameInput : public IUnknown {
     virtual uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetCurrentReading(
         uint32_t input_kind, void* device, IKxGameInputReading** reading) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetDefaultDevice(IKxGameInputDevice** out_device) = 0;
+    // Appended v0.7 multi-controller & hotplug methods (preserves existing COM vtable layout)
+    virtual HRESULT STDMETHODCALLTYPE GetDeviceForSlot(uint32_t slot, IKxGameInputDevice** out_device) = 0;
+    // Deterministic state-transition semantics: callbacks fire on Disconnected <-> Connected
+    // transitions occurring after registration. Use GetDeviceForSlot() + IsConnected() to
+    // inspect initial device connection state.
+    virtual HRESULT STDMETHODCALLTYPE RegisterDeviceCallback(
+        void* context,
+        KxGameInputDeviceCallback callback,
+        KxGameInputCallbackToken* out_token) = 0;
+    virtual bool STDMETHODCALLTYPE UnregisterCallback(KxGameInputCallbackToken token) = 0;
 };
 
 struct GameInputStats {
     uint64_t instances_created = 0;
     uint64_t readings_polled = 0;
     uint64_t rumble_commands_sent = 0;
+    uint64_t active_controllers = 0;
+    uint64_t hotplug_events = 0;
 };
 
 // Pure helper for deterministic XInput word/axis -> GameInput state conversion.
@@ -86,6 +119,9 @@ KxGameInputGamepadState translate_xinput_raw(
 
 void set_gameinput_mock_state(const KxGameInputGamepadState& state, bool connected = true);
 void clear_gameinput_mock_state();
+void set_gameinput_mock_slot_state(uint32_t slot, const KxGameInputGamepadState& state, bool connected = true);
+void simulate_gameinput_hotplug(uint32_t slot, bool connected);
+void clear_gameinput_mock_slots();
 void register_gameinput(Registry& reg);
 GameInputStats gameinput_stats();
 void reset_gameinput_stats();

@@ -1,4 +1,5 @@
 #include "kestrel/hle/kernelx.hpp"
+#include "kestrel/common/types.hpp"
 
 #include <Windows.h>
 #include <cstdlib>
@@ -27,6 +28,12 @@ std::unordered_map<void*, size_t> g_allocs;
 KernelXStats g_stats{};
 vfs::OverlayVfs* g_vfs = nullptr;
 constexpr uint64_t kSeriesXTitleBudget = 13824ull * 1024ull * 1024ull;
+
+bool is_write_open(DWORD access, DWORD disp) {
+    return (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0 ||
+           disp == CREATE_NEW || disp == CREATE_ALWAYS || disp == OPEN_ALWAYS ||
+           disp == TRUNCATE_EXISTING;
+}
 
 void* __stdcall kx_XMemAlloc(size_t size, uint64_t attributes) {
     (void)attributes;
@@ -83,10 +90,7 @@ HANDLE __stdcall kx_CreateFileA(
     LPCSTR filename, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sec,
     DWORD disp, DWORD flags, HANDLE tmpl) {
     if (g_vfs && filename) {
-        const bool for_write = (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0 ||
-                               disp == CREATE_NEW || disp == CREATE_ALWAYS || disp == OPEN_ALWAYS ||
-                               disp == TRUNCATE_EXISTING;
-        auto resolved = g_vfs->resolve(filename, for_write);
+        auto resolved = g_vfs->resolve(filename, is_write_open(access, disp));
         if (resolved) {
             return CreateFileW(resolved->c_str(), access, share, sec, disp, flags, tmpl);
         }
@@ -96,6 +100,63 @@ HANDLE __stdcall kx_CreateFileA(
         }
     }
     return CreateFileA(filename, access, share, sec, disp, flags, tmpl);
+}
+
+HANDLE __stdcall kx_CreateFileW(
+    LPCWSTR filename, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sec,
+    DWORD disp, DWORD flags, HANDLE tmpl) {
+    if (g_vfs && filename) {
+        const std::string utf8 = wide_to_utf8(filename);
+        auto resolved = g_vfs->resolve(utf8, is_write_open(access, disp));
+        if (resolved) {
+            return CreateFileW(resolved->c_str(), access, share, sec, disp, flags, tmpl);
+        }
+        if (utf8.find(':') != std::string::npos) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    return CreateFileW(filename, access, share, sec, disp, flags, tmpl);
+}
+
+BOOL __stdcall kx_DeleteFileA(LPCSTR filename) {
+    if (g_vfs && filename) {
+        auto r = g_vfs->remove_file(filename);
+        if (r) return TRUE;
+        if (std::string_view(filename).find(':') != std::string_view::npos) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+    }
+    return DeleteFileA(filename);
+}
+
+BOOL __stdcall kx_DeleteFileW(LPCWSTR filename) {
+    if (g_vfs && filename) {
+        const std::string utf8 = wide_to_utf8(filename);
+        auto r = g_vfs->remove_file(utf8);
+        if (r) return TRUE;
+        if (utf8.find(':') != std::string::npos) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+    }
+    return DeleteFileW(filename);
+}
+
+BOOL __stdcall kx_GetFileAttributesExW(LPCWSTR filename, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
+    if (g_vfs && filename) {
+        const std::string utf8 = wide_to_utf8(filename);
+        auto resolved = g_vfs->resolve(utf8, false);
+        if (resolved) {
+            return GetFileAttributesExW(resolved->c_str(), level, info);
+        }
+        if (utf8.find(':') != std::string::npos) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+    }
+    return GetFileAttributesExW(filename, level, info);
 }
 
 }  // namespace
@@ -111,6 +172,10 @@ void register_kernelx(Registry& reg) {
     reg.register_export("kernelx.dll", "TitleMemoryStatus", reinterpret_cast<void*>(&kx_TitleMemoryStatus));
     reg.register_export("kernelx.dll", "GetConsoleType", reinterpret_cast<void*>(&kx_GetConsoleType));
     reg.register_export("kernelx.dll", "CreateFileA", reinterpret_cast<void*>(&kx_CreateFileA));
+    reg.register_export("kernelx.dll", "CreateFileW", reinterpret_cast<void*>(&kx_CreateFileW));
+    reg.register_export("kernelx.dll", "DeleteFileA", reinterpret_cast<void*>(&kx_DeleteFileA));
+    reg.register_export("kernelx.dll", "DeleteFileW", reinterpret_cast<void*>(&kx_DeleteFileW));
+    reg.register_export("kernelx.dll", "GetFileAttributesExW", reinterpret_cast<void*>(&kx_GetFileAttributesExW));
     reg.register_export("xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&kx_XMemAlloc));
     reg.register_export("xmem.dll", "XMemFree", reinterpret_cast<void*>(&kx_XMemFree));
     reg.register_export("xmem.dll", "XMemSize", reinterpret_cast<void*>(&kx_XMemSize));

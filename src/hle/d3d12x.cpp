@@ -1,15 +1,88 @@
 #include "kestrel/hle/d3d12x.hpp"
+#include "kestrel/gpu/dxc_compiler.hpp"
+#include "kestrel/gpu/ir.hpp"
+#include "kestrel/gpu/rdna2_isa.hpp"
+#include "kestrel/gpu/rdna2_recomp.hpp"
 
 #include <dxgi1_6.h>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace kestrel::hle {
 
 namespace {
 
 std::atomic<int> g_preferred_adapter{-1};
-std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0}, g_zero_mem{0}, g_presents{0};
+std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0},
+    g_zero_mem{0}, g_presents{0}, g_pso_recomp{0}, g_pso_cache_hits{0};
+
+std::mutex g_shader_cache_mtx;
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_dxil_cache;
+gpu::DxcCompiler g_dxc;
+bool g_dxc_ready = false;
+
+uint64_t fnv1a_64(const uint8_t* data, size_t len, uint64_t seed = 14695981039346656037ull) {
+    uint64_t h = seed;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= data[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+// Clean-room native RDNA2 container header ("KXRN" + uint32 group_size_x + GFX10.3 dwords)
+bool try_recompile_kestrel_rdna2(
+    const void* bytecode, SIZE_T length, bool prefer_wave64, std::vector<uint8_t>& out_dxil) {
+    if (!bytecode || length < 12) return false;
+    const auto* bytes = static_cast<const uint8_t*>(bytecode);
+    if (std::memcmp(bytes, "KXRN", 4) != 0) return false;
+
+    uint32_t group_x = 64;
+    std::memcpy(&group_x, bytes + 4, 4);
+    if (group_x == 0 || group_x > 1024) group_x = 64;
+
+    const size_t code_bytes = length - 8;
+    if (code_bytes == 0 || (code_bytes % 4) != 0) return false;
+
+    const gpu::WaveMode wave = prefer_wave64 ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
+    const uint64_t cache_key = fnv1a_64(bytes, length, static_cast<uint64_t>(wave));
+
+    {
+        std::lock_guard lock(g_shader_cache_mtx);
+        auto it = g_dxil_cache.find(cache_key);
+        if (it != g_dxil_cache.end()) {
+            out_dxil = it->second;
+            g_pso_cache_hits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (!g_dxc_ready) {
+            if (!g_dxc.initialize()) return false;
+            g_dxc_ready = true;
+        }
+    }
+
+    std::vector<uint32_t> words(code_bytes / 4);
+    std::memcpy(words.data(), bytes + 8, code_bytes);
+
+    auto decoded = gpu::decode_rdna2(words.data(), words.size());
+    auto ir = gpu::lift_rdna2_to_ir(decoded);
+    if (ir.unknown_count > 0) return false;
+
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = wave, .group_size_x = group_x});
+    auto compiled = g_dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    if (!compiled) return false;
+
+    {
+        std::lock_guard lock(g_shader_cache_mtx);
+        g_dxil_cache[cache_key] = compiled->dxil;
+    }
+    out_dxil = std::move(compiled->dxil);
+    g_pso_recomp.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
 
 HRESULT pick_hardware_adapter(IDXGIAdapter1** out_adapter) {
     *out_adapter = nullptr;
@@ -91,9 +164,73 @@ HRESULT __stdcall kx_D3D12SerializeRootSignature(
     return D3D12SerializeRootSignature(desc, ver, blob, err);
 }
 
+HRESULT __stdcall kx_D3D12PresentX(ID3D12CommandQueue*, uint32_t, const void*, const void*) {
+    g_presents.fetch_add(1, std::memory_order_relaxed);
+    return S_OK;
+}
+
+HRESULT __stdcall kx_D3D12WaitFrameEventX(uint64_t, uint32_t, void*) {
+    return S_OK;
+}
+
 }  // namespace
 
-KxDeviceProxy::KxDeviceProxy(ID3D12Device* inner) : inner_(inner) { if (inner_) inner_->AddRef(); }
+// ---- KxCommandQueueProxy ----
+
+KxCommandQueueProxy::KxCommandQueueProxy(ID3D12CommandQueue* inner) : inner_(inner) {
+    if (inner_) inner_->AddRef();
+}
+KxCommandQueueProxy::~KxCommandQueueProxy() {
+    if (inner_) { inner_->Release(); inner_ = nullptr; }
+}
+
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::QueryInterface(REFIID riid, void** ppv) {
+    if (!ppv) return E_POINTER;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
+        riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12Pageable) ||
+        riid == __uuidof(ID3D12CommandQueue)) {
+        *ppv = static_cast<ID3D12CommandQueue*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return inner_->QueryInterface(riid, ppv);
+}
+
+ULONG STDMETHODCALLTYPE KxCommandQueueProxy::AddRef() { return ref_.fetch_add(1, std::memory_order_relaxed) + 1; }
+ULONG STDMETHODCALLTYPE KxCommandQueueProxy::Release() {
+    const ULONG next = ref_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (next == 0) delete this;
+    return next;
+}
+
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetPrivateData(REFGUID g, UINT* s, void* d) { return inner_->GetPrivateData(g, s, d); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::SetPrivateData(REFGUID g, UINT s, const void* d) { return inner_->SetPrivateData(g, s, d); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::SetPrivateDataInterface(REFGUID g, const IUnknown* d) { return inner_->SetPrivateDataInterface(g, d); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::SetName(LPCWSTR n) { return inner_->SetName(n); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetDevice(REFIID r, void** o) { return inner_->GetDevice(r, o); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::UpdateTileMappings(ID3D12Resource* res, UINT n, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Heap* h, UINT nr, const D3D12_TILE_RANGE_FLAGS* f, const UINT* ho, const UINT* tc, D3D12_TILE_MAPPING_FLAGS fl) { inner_->UpdateTileMappings(res, n, c, sz, h, nr, f, ho, tc, fl); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::CopyTileMappings(ID3D12Resource* dr, const D3D12_TILED_RESOURCE_COORDINATE* dc, ID3D12Resource* sr, const D3D12_TILED_RESOURCE_COORDINATE* sc, const D3D12_TILE_REGION_SIZE* sz, D3D12_TILE_MAPPING_FLAGS fl) { inner_->CopyTileMappings(dr, dc, sr, sc, sz, fl); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::ExecuteCommandLists(UINT n, ID3D12CommandList* const* ls) { inner_->ExecuteCommandLists(n, ls); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::SetMarker(UINT m, const void* d, UINT s) { inner_->SetMarker(m, d, s); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::BeginEvent(UINT m, const void* d, UINT s) { inner_->BeginEvent(m, d, s); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::EndEvent() { inner_->EndEvent(); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::Signal(ID3D12Fence* f, UINT64 v) { return inner_->Signal(f, v); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::Wait(ID3D12Fence* f, UINT64 v) { return inner_->Wait(f, v); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetTimestampFrequency(UINT64* f) { return inner_->GetTimestampFrequency(f); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetClockCalibration(UINT64* g, UINT64* c) { return inner_->GetClockCalibration(g, c); }
+D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE KxCommandQueueProxy::GetDesc() { return inner_->GetDesc(); }
+
+// ---- KxDeviceProxy ----
+
+KxDeviceProxy::KxDeviceProxy(ID3D12Device* inner) : inner_(inner) {
+    if (inner_) {
+        inner_->AddRef();
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt1{};
+        if (SUCCEEDED(inner_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opt1, sizeof(opt1)))) {
+            supports_wave64_ = (opt1.WaveLaneCountMin <= 64 && opt1.WaveLaneCountMax >= 64);
+        }
+    }
+}
 KxDeviceProxy::~KxDeviceProxy() { if (inner_) { inner_->Release(); inner_ = nullptr; } }
 
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::QueryInterface(REFIID riid, void** ppv) {
@@ -118,14 +255,35 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::SetPrivateData(REFGUID g, UINT s, const
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::SetPrivateDataInterface(REFGUID g, const IUnknown* d) { return inner_->SetPrivateDataInterface(g, d); }
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::SetName(LPCWSTR n) { return inner_->SetName(n); }
 UINT STDMETHODCALLTYPE KxDeviceProxy::GetNodeCount() { return inner_->GetNodeCount(); }
+
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* d, REFIID r, void** o) {
-    HRESULT hr = inner_->CreateCommandQueue(d, r, o);
-    if (SUCCEEDED(hr)) g_queues.fetch_add(1, std::memory_order_relaxed);
+    ID3D12CommandQueue* raw = nullptr;
+    HRESULT hr = inner_->CreateCommandQueue(d, IID_PPV_ARGS(&raw));
+    if (FAILED(hr)) return hr;
+    g_queues.fetch_add(1, std::memory_order_relaxed);
+    auto* proxy = new KxCommandQueueProxy(raw);
+    raw->Release();
+    hr = proxy->QueryInterface(r, o);
+    proxy->Release();
     return hr;
 }
+
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE t, REFIID r, void** o) { return inner_->CreateCommandAllocator(t, r, o); }
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID r, void** o) { return inner_->CreateGraphicsPipelineState(d, r, o); }
-HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID r, void** o) { return inner_->CreateComputePipelineState(d, r, o); }
+
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID r, void** o) {
+    if (d && d->CS.pShaderBytecode && d->CS.BytecodeLength >= 12) {
+        std::vector<uint8_t> dxil;
+        if (try_recompile_kestrel_rdna2(d->CS.pShaderBytecode, d->CS.BytecodeLength, supports_wave64_, dxil)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC patched = *d;
+            patched.CS.pShaderBytecode = dxil.data();
+            patched.CS.BytecodeLength = dxil.size();
+            return inner_->CreateComputePipelineState(&patched, r, o);
+        }
+    }
+    return inner_->CreateComputePipelineState(d, r, o);
+}
+
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandList(UINT m, D3D12_COMMAND_LIST_TYPE t, ID3D12CommandAllocator* a, ID3D12PipelineState* i, REFIID r, void** o) {
     HRESULT hr = inner_->CreateCommandList(m, t, a, i, r, o);
     if (SUCCEEDED(hr)) g_cmd_lists.fetch_add(1, std::memory_order_relaxed);
@@ -181,12 +339,19 @@ void register_d3d12x(Registry& reg) {
         reg.register_export(mod, "D3D12XboxCreateDevice", reinterpret_cast<void*>(&kx_D3D12XboxCreateDevice));
         reg.register_export(mod, "D3D12ZeroMemoryX", reinterpret_cast<void*>(&kx_D3D12ZeroMemoryX));
         reg.register_export(mod, "D3D12SerializeRootSignature", reinterpret_cast<void*>(&kx_D3D12SerializeRootSignature));
+        reg.register_export(mod, "D3D12PresentX", reinterpret_cast<void*>(&kx_D3D12PresentX));
+        reg.register_export(mod, "D3D12WaitFrameEventX", reinterpret_cast<void*>(&kx_D3D12WaitFrameEventX));
     }
 }
 
 D3D12XStats d3d12x_stats() {
-    return {g_devices.load(), g_queues.load(), g_cmd_lists.load(), g_resources.load(), g_zero_mem.load(), g_presents.load()};
+    return {g_devices.load(), g_queues.load(), g_cmd_lists.load(), g_resources.load(),
+            g_zero_mem.load(), g_presents.load(), g_pso_recomp.load(), g_pso_cache_hits.load()};
 }
-void reset_d3d12x_stats() { g_devices = g_queues = g_cmd_lists = g_resources = g_zero_mem = g_presents = 0; }
+void reset_d3d12x_stats() {
+    g_devices = g_queues = g_cmd_lists = g_resources = g_zero_mem = g_presents = g_pso_recomp = g_pso_cache_hits = 0;
+    std::lock_guard lock(g_shader_cache_mtx);
+    g_dxil_cache.clear();
+}
 
 }  // namespace kestrel::hle

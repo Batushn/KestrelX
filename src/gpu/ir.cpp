@@ -110,8 +110,10 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
 
         switch (d.enc) {
             case Encoding::SOPP:
-                if (d.mnemonic == "s_nop" || d.mnemonic == "s_waitcnt" || d.mnemonic == "s_waitcnt_vscnt" ||
-                    d.mnemonic == "s_barrier" || d.mnemonic == "s_clause") {
+                if (d.mnemonic == "s_barrier") {
+                    ir.op = IrOp::Barrier;
+                } else if (d.mnemonic == "s_nop" || d.mnemonic == "s_waitcnt" || d.mnemonic == "s_waitcnt_vscnt" ||
+                           d.mnemonic == "s_clause") {
                     ir.op = IrOp::Nop;
                 } else if (d.mnemonic == "s_endpgm" || d.mnemonic == "s_endpgm_saved") {
                     ir.op = IrOp::EndPgm;
@@ -168,6 +170,39 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 ir.subop = d.mnemonic;
                 ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
                 ir.src1 = decode_operand(d.src1, d.has_literal, d.literal);
+                break;
+
+            case Encoding::SMEM:
+                if (d.mnemonic == "s_load_dword" || d.mnemonic == "s_load_dwordx2" || d.mnemonic == "s_load_dwordx4") {
+                    ir.op = IrOp::SLoadDword;
+                    ir.subop = d.mnemonic;
+                    ir.dst = make_sgpr(d.dst);
+                    ir.src0 = make_sgpr(d.src0);
+                    if (d.mnemonic == "s_load_dwordx2" && d.dst + 2 > fn.max_sgpr) fn.max_sgpr = d.dst + 2;
+                    if (d.mnemonic == "s_load_dwordx4" && d.dst + 4 > fn.max_sgpr) fn.max_sgpr = d.dst + 4;
+                } else {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
+                }
+                break;
+
+            case Encoding::DS:
+                if (d.mnemonic == "ds_write_b32") {
+                    ir.op = IrOp::DsWriteB32;
+                    ir.src0 = make_vgpr(d.src0);  // LDS byte address
+                    ir.src1 = make_vgpr(d.src1);  // data0
+                    fn.uses_lds = true;
+                } else if (d.mnemonic == "ds_read_b32") {
+                    ir.op = IrOp::DsReadB32;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);  // LDS byte address
+                    fn.uses_lds = true;
+                } else {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
+                }
                 break;
 
             case Encoding::VOP1:

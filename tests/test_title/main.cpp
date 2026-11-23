@@ -184,6 +184,69 @@ int test_d3d12x_render_and_readback() {
         rc = 110;
     }
 
+    // Exercise KxDeviceProxy::CreateComputePipelineState with a raw RDNA2 ("KXRN") compute shader!
+    // Program: v1 = v0 << 2; v2 = g_mem[v1]; v3 = v2 + 10; g_mem[v1] = v3; s_endpgm
+    // First call compiles RDNA2 -> IR -> HLSL -> DXC -> DXIL; second call verifies cache hit!
+    if (rc == 0) {
+        D3D12_ROOT_PARAMETER rp[2]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[0].Constants.ShaderRegister = 0;
+        rp[0].Constants.Num32BitValues = 8;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        rp[1].Descriptor.ShaderRegister = 0;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2;
+        rsd.pParameters = rp;
+
+        ID3DBlob* rs_blob = nullptr;
+        ID3DBlob* rs_err = nullptr;
+        ID3D12RootSignature* rs = nullptr;
+        if (SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err)) && rs_blob &&
+            SUCCEEDED(dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                                               __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&rs)))) {
+            // Raw KXRN header ("KXRN", group_size_x=64) + GFX10.3 dwords
+            const uint32_t kxrn_shader[] = {
+                0x4E52584Bu,                                              // "KXRN"
+                64u,                                                      // numthreads(64,1,1)
+                (26u << 25) | (1u << 17) | (0u << 9) | 130u,              // v_lshlrev_b32 v1, 2, v0
+                (0x37u << 26) | (12u << 18) | (2u << 14),                 // global_load_dword w0
+                (2u << 24) | (127u << 16) | (2u << 8) | 1u,               // global_load_dword w1 (v2, v1)
+                (37u << 25) | (3u << 17) | (2u << 9) | (128u + 10u),      // v_add_nc_u32 v3, 10, v2
+                (0x37u << 26) | (28u << 18) | (2u << 14),                 // global_store_dword w0
+                (3u << 24) | (127u << 16) | (3u << 8) | 1u,               // global_store_dword w1 (v1, v3)
+                (0x17Fu << 23) | (1u << 16),                              // s_endpgm
+            };
+
+            D3D12_COMPUTE_PIPELINE_STATE_DESC cpd{};
+            cpd.pRootSignature = rs;
+            cpd.CS.pShaderBytecode = kxrn_shader;
+            cpd.CS.BytecodeLength = sizeof(kxrn_shader);
+
+            ID3D12PipelineState* pso1 = nullptr;
+            ID3D12PipelineState* pso2 = nullptr;
+            if (FAILED(dev->CreateComputePipelineState(&cpd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso1))) || !pso1) {
+                rc = 111;
+            } else if (FAILED(dev->CreateComputePipelineState(&cpd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso2))) || !pso2) {
+                rc = 112;
+            }
+            if (pso2) pso2->Release();
+            if (pso1) pso1->Release();
+            rs->Release();
+        } else {
+            rc = 113;
+        }
+        if (rs_blob) rs_blob->Release();
+        if (rs_err) rs_err->Release();
+    }
+
+    if (rc == 0) {
+        if (FAILED(D3D12PresentX(queue, 0, nullptr, nullptr))) rc = 114;
+        if (FAILED(D3D12WaitFrameEventX(0, 0, nullptr))) rc = 115;
+    }
+
     fence->Release();
     readback->Release();
     rt->Release();
@@ -217,7 +280,7 @@ extern "C" int __cdecl KestrelGuestEntry() {
     if (!TitleMemoryStatus(&ms) || ms.total_mem < (8ull << 30) || ms.title_used < 4096) return 7;
     XMemFree(mem, 0);
 
-    // 5. Verify Overlay VFS via kernelx!CreateFileA (read GAME:\, write S:\)
+    // 5. Verify Overlay VFS via kernelx!CreateFileA + CreateFileW + GetFileAttributesExW + DeleteFileW
     HANDLE hf = CreateFileA("GAME:\\data\\readonly.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hf == INVALID_HANDLE_VALUE) return 8;
     char buf[64]{};
@@ -225,6 +288,14 @@ extern "C" int __cdecl KestrelGuestEntry() {
     ReadFile(hf, buf, sizeof(buf) - 1, &nread, nullptr);
     CloseHandle(hf);
     if (nread < 25 || buf[0] != 'K' || buf[1] != 'e' || buf[7] != 'X') return 9;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(L"GAME:\\data\\readonly.txt", GetFileExInfoStandard, &fad) || fad.nFileSizeLow < 25) return 18;
+
+    HANDLE htmp = CreateFileW(L"T:\\scratch.tmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (htmp == INVALID_HANDLE_VALUE) return 19;
+    CloseHandle(htmp);
+    if (!DeleteFileW(L"T:\\scratch.tmp")) return 20;
 
     HANDLE hsave = CreateFileA("S:\\save.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hsave == INVALID_HANDLE_VALUE) return 10;
@@ -245,6 +316,6 @@ extern "C" int __cdecl KestrelGuestEntry() {
     XTaskQueueCloseHandle(tq);
     if (g_task_fired != 0x12345678u) return 17;
 
-    // 7. Verify d3d12_xs.dll KxDeviceProxy on real D3D12 GPU (RTV clear + fence + pixel readback)
+    // 7. Verify d3d12_xs.dll KxDeviceProxy on real D3D12 GPU (RTV clear + KXRN RDNA2 PSO auto-recomp + PresentX)
     return test_d3d12x_render_and_readback();
 }

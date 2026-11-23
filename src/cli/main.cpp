@@ -260,9 +260,10 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir) {
     const auto d3d = hle::d3d12x_stats();
     const auto kx = hle::kernelx_stats();
     std::cout << std::format(
-        "Guest exited with code {} | D3D12.X(dev={}, q={}, cmd={}, res={}, zmem={}) | KernelX(allocs={}, frees={}, peak={} B)\n",
+        "Guest exited with code {} | D3D12.X(dev={}, q={}, cmd={}, res={}, pso_recomp={}, cache_hit={}, present={}) | KernelX(allocs={}, frees={}, peak={} B)\n",
         *rc, d3d.devices_created, d3d.queues_created, d3d.cmd_lists_created,
-        d3d.resources_created, d3d.zero_memory_calls, kx.alloc_count, kx.free_count, kx.peak_bytes);
+        d3d.resources_created, d3d.pso_recompiled, d3d.pso_cache_hits, d3d.present_calls,
+        kx.alloc_count, kx.free_count, kx.peak_bytes);
     return *rc;
 }
 

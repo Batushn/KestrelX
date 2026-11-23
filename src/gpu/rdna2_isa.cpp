@@ -305,9 +305,12 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.enc = Encoding::SMEM;
             d.opcode = (w0 >> 18) & 0xFFu;
             d.dst = (w0 >> 6) & 0x7Fu;
-            d.src0 = w0 & 0x3Fu;
+            d.src0 = (w0 & 0x3Fu) << 1;
             d.offset = words[i + 1] & 0x1FFFFFu;
-            d.mnemonic = std::format("smem_{}", d.opcode);
+            if (d.opcode == 0) d.mnemonic = "s_load_dword";
+            else if (d.opcode == 1) d.mnemonic = "s_load_dwordx2";
+            else if (d.opcode == 2) d.mnemonic = "s_load_dwordx4";
+            else d.mnemonic = std::format("smem_{}", d.opcode);
         } else if ((w0 >> 26) == 0x38u && i + 1 < count) {
             d.size = 8;
             d.enc = Encoding::MUBUF;
@@ -315,10 +318,18 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.offset = w0 & 0xFFFu;
             d.mnemonic = std::format("mubuf_{}", d.opcode);
         } else if ((w0 >> 26) == 0x36u && i + 1 < count) {
+            const uint32_t w1 = words[i + 1];
             d.size = 8;
             d.enc = Encoding::DS;
             d.opcode = (w0 >> 18) & 0xFFu;
-            d.mnemonic = std::format("ds_{}", d.opcode);
+            d.offset = w0 & 0xFFFFu;
+            d.dst = (w1 >> 24) & 0xFFu;
+            d.src2 = (w1 >> 16) & 0xFFu;  // data1
+            d.src1 = (w1 >> 8) & 0xFFu;   // data0
+            d.src0 = w1 & 0xFFu;          // addr
+            if (d.opcode == 13) d.mnemonic = "ds_write_b32";
+            else if (d.opcode == 54) d.mnemonic = "ds_read_b32";
+            else d.mnemonic = std::format("ds_{}", d.opcode);
         } else if ((w0 >> 26) == 0x3Eu && i + 1 < count) {
             d.size = 8;
             d.enc = Encoding::EXP;

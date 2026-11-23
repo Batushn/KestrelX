@@ -94,6 +94,18 @@ inline void global_mem(std::vector<uint32_t>& out, uint32_t op, uint32_t vdst_or
     out.push_back(w0);
     out.push_back(w1);
 }
+inline void smem(std::vector<uint32_t>& out, uint32_t op, uint32_t sdst, uint32_t sbase_pair, uint32_t offset = 0) {
+    const uint32_t w0 = (0x3Cu << 26) | ((op & 0xFFu) << 18) | ((sdst & 0x7Fu) << 6) | ((sbase_pair >> 1) & 0x3Fu);
+    const uint32_t w1 = offset & 0x1FFFFFu;
+    out.push_back(w0);
+    out.push_back(w1);
+}
+inline void ds(std::vector<uint32_t>& out, uint32_t op, uint32_t vdst, uint32_t addr, uint32_t data0 = 0, uint32_t data1 = 0, uint16_t offset = 0) {
+    const uint32_t w0 = (0x36u << 26) | ((op & 0xFFu) << 18) | offset;
+    const uint32_t w1 = ((vdst & 0xFFu) << 24) | ((data1 & 0xFFu) << 16) | ((data0 & 0xFFu) << 8) | (addr & 0xFFu);
+    out.push_back(w0);
+    out.push_back(w1);
+}
 }  // namespace encode
 
 }  // namespace kestrel::gpu

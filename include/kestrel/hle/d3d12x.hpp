@@ -14,10 +14,49 @@ struct D3D12XStats {
     uint64_t resources_created = 0;
     uint64_t zero_memory_calls = 0;
     uint64_t present_calls = 0;
+    uint64_t pso_recompiled = 0;
+    uint64_t pso_cache_hits = 0;
+};
+
+// Pure COM wrapper around ID3D12CommandQueue (zero driver vtable patching).
+class KxCommandQueueProxy final : public ID3D12CommandQueue {
+public:
+    explicit KxCommandQueueProxy(ID3D12CommandQueue* inner);
+    ~KxCommandQueueProxy();
+
+    ID3D12CommandQueue* inner() const { return inner_; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override;
+    ULONG STDMETHODCALLTYPE AddRef() override;
+    ULONG STDMETHODCALLTYPE Release() override;
+
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) override;
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) override;
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) override;
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR Name) override;
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppvDevice) override;
+
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource* pResource, UINT NumResourceRegions, const D3D12_TILED_RESOURCE_COORDINATE* pResourceRegionStartCoordinates, const D3D12_TILE_REGION_SIZE* pResourceRegionSizes, ID3D12Heap* pHeap, UINT NumRanges, const D3D12_TILE_RANGE_FLAGS* pRangeFlags, const UINT* pHeapRangeStartOffsets, const UINT* pRangeTileCounts, D3D12_TILE_MAPPING_FLAGS Flags) override;
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource* pDstResource, const D3D12_TILED_RESOURCE_COORDINATE* pDstRegionStartCoordinate, ID3D12Resource* pSrcResource, const D3D12_TILED_RESOURCE_COORDINATE* pSrcRegionStartCoordinate, const D3D12_TILE_REGION_SIZE* pRegionSize, D3D12_TILE_MAPPING_FLAGS Flags) override;
+    void STDMETHODCALLTYPE ExecuteCommandLists(UINT NumCommandLists, ID3D12CommandList* const* ppCommandLists) override;
+    void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void* pData, UINT Size) override;
+    void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void* pData, UINT Size) override;
+    void STDMETHODCALLTYPE EndEvent() override;
+    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* pFence, UINT64 Value) override;
+    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* pFence, UINT64 Value) override;
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* pFrequency) override;
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* pGpuTimestamp, UINT64* pCpuTimestamp) override;
+    D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override;
+
+private:
+    std::atomic<ULONG> ref_{1};
+    ID3D12CommandQueue* inner_ = nullptr;
 };
 
 // Pure COM wrapper around a real PC ID3D12Device.
-// Zero driver vtable mutation ? safe across NVIDIA, AMD, Intel, and Wine/vkd3d-proton.
+// Zero driver vtable mutation — safe across NVIDIA, AMD, Intel, and Wine/vkd3d-proton.
+// Automatically intercepts native RDNA2 compute shader containers ("KXRN") in
+// CreateComputePipelineState, recompiles to target-wave SM 6.6 DXIL via DXC, and caches them.
 class KxDeviceProxy final : public ID3D12Device {
 public:
     explicit KxDeviceProxy(ID3D12Device* inner);
@@ -75,6 +114,7 @@ public:
 private:
     std::atomic<ULONG> ref_{1};
     ID3D12Device* inner_ = nullptr;
+    bool supports_wave64_ = false;
 };
 
 void set_d3d12x_preferred_adapter(int adapter_index);

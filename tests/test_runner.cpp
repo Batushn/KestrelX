@@ -281,6 +281,96 @@ void test_rdna2_recomp_real_dual_gpu_execution() {
     KX_CHECK(hw_tested >= 1, "at least one hardware GPU verified");
 }
 
+void test_rdna2_smem_lds_barrier_dual_gpu() {
+    // Clean-room RDNA2 workgroup LDS reverse-shuffle + SMEM scalar constant load:
+    //   Buffer layout (65 uint32s):
+    //     g_mem[0..63] = lane input values (1000 + i)
+    //     g_mem[64]    = scalar constant K = 77 (loaded via SMEM s_load_dword at offset 256)
+    //   Program:
+    //     s_load_dword s4, s[0:1], 0x100          ; s4 = g_mem[64] = 77 (s0=0)
+    //     v_lshlrev_b32 v1, 2, v0                 ; v1 = tid * 4
+    //     global_load_dword v2, v1                ; v2 = g_mem[tid]
+    //     ds_write_b32 v1, v2                     ; g_lds[tid] = v2
+    //     s_barrier                               ; GroupMemoryBarrierWithGroupSync()
+    //     v_xor_b32 v4, 63, v0                    ; v4 = 63 - tid
+    //     v_lshlrev_b32 v4, 2, v4                 ; v4 = (63 - tid) * 4
+    //     ds_read_b32 v5, v4                      ; v5 = g_lds[63 - tid]
+    //     v_add_nc_u32 v6, s4, v5                 ; v6 = g_lds[63 - tid] + K
+    //     global_store_dword v1, v6               ; g_mem[tid] = v6
+    //     s_endpgm
+    using namespace gpu::encode;
+    std::vector<uint32_t> prog;
+    smem(prog, 0, 4, 0, 256);                   // s_load_dword s4, s[0:1], 256
+    prog.push_back(vop2(26, 1, 130, 0));        // v_lshlrev_b32 v1, 2, v0
+    global_mem(prog, 12, 2, 1, 127, 0);         // global_load_dword v2, v1
+    ds(prog, 13, 0, 1, 2, 0, 0);                // ds_write_b32 v1, v2
+    prog.push_back(sopp(10));                   // s_barrier
+    prog.push_back(vop2(29, 4, 128 + 63, 0));   // v_xor_b32 v4, 63, v0
+    prog.push_back(vop2(26, 4, 130, 4));        // v_lshlrev_b32 v4, 2, v4
+    ds(prog, 54, 5, 4, 0, 0, 0);                // ds_read_b32 v5, v4
+    prog.push_back(vop2(37, 6, 4, 5));          // v_add_nc_u32 v6, s4, v5
+    global_mem(prog, 28, 6, 1, 127, 0);         // global_store_dword v1, v6
+    prog.push_back(sopp(1));                    // s_endpgm
+
+    auto dec = gpu::decode_rdna2(prog.data(), prog.size());
+    auto ir = gpu::lift_rdna2_to_ir(dec);
+    KX_CHECK(ir.unknown_count == 0, "all SMEM/LDS/barrier instructions lifted");
+    KX_CHECK(ir.uses_lds, "IR must detect LDS usage");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "D3D12 adapters available");
+
+    constexpr uint32_t kLanes = 64;
+    constexpr uint32_t kScalarAdd = 77;
+    std::vector<uint32_t> init_buf(kLanes + 1);
+    for (uint32_t i = 0; i < kLanes; ++i) init_buf[i] = 1000u + i * 3u;
+    init_buf[kLanes] = kScalarAdd;
+    uint32_t roots[8]{0, 0, 0, 0, 0, 0, 0, 0};
+
+    int verified = 0;
+    for (const auto& a : *adapters) {
+        if (a.is_software) continue;
+        std::vector<gpu::WaveMode> modes;
+        if (a.supports_wave32) modes.push_back(gpu::WaveMode::Wave32);
+        if (a.supports_wave64) modes.push_back(gpu::WaveMode::Wave64);
+        for (gpu::WaveMode mode : modes) {
+            auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = mode, .group_size_x = 64});
+            KX_CHECK(recomp.hlsl.find("groupshared uint g_lds[8192];") != std::string::npos, "LDS declaration");
+            KX_CHECK(recomp.hlsl.find("GroupMemoryBarrierWithGroupSync();") != std::string::npos, "barrier emission");
+            auto dxil = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+            KX_CHECK(dxil.has_value(), dxil.error().message);
+            auto res = gpu::run_compute_dxil_on_gpu(a.index, dxil->dxil, init_buf, roots, 1);
+            KX_CHECK(res.has_value(), res.error().message);
+            for (uint32_t i = 0; i < kLanes; ++i) {
+                const uint32_t expected = init_buf[63u - i] + kScalarAdd;
+                KX_CHECK(res->output_u32[i] == expected,
+                         std::format("LDS+SMEM mismatch on {} Wave{} lane {}: got {} != {}",
+                                     a.name, static_cast<uint32_t>(mode), i, res->output_u32[i], expected));
+            }
+            std::cout << std::format("    -> Hardware verified LDS+SMEM: [{}] {} | Wave{} | 64/64 reversed+added bit-exact\n",
+                                     a.index, a.name, static_cast<uint32_t>(mode));
+        }
+        ++verified;
+    }
+    KX_CHECK(verified >= 1, "at least one hardware GPU verified for LDS+SMEM");
+}
+
+void test_strict_unsupported_opcode_refusal() {
+    // Unknown SOP1 opcode 0x7F must be flagged in IR and rejected by DXC via #error (never silently ignored).
+    using namespace gpu::encode;
+    std::vector<uint32_t> prog = {sop1(0x7F, 0, 1), sopp(1)};
+    auto ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(prog.data(), prog.size()));
+    KX_CHECK(ir.unknown_count == 1, "unknown opcode must increment unknown_count");
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+    KX_CHECK(recomp.hlsl.find("#error Unsupported RDNA2 opcode") != std::string::npos, "must emit #error");
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    KX_CHECK(!compiled.has_value(), "DXC must reject shader containing unsupported RDNA2 opcode");
+}
+
 void test_gfx10_tiling_roundtrip() {
     const std::vector<gpu::SwizzleMode> modes = {
         gpu::SwizzleMode::Linear,
@@ -303,6 +393,28 @@ void test_gfx10_tiling_roundtrip() {
         auto tiled = gpu::swizzle_2d(desc, linear.data(), static_cast<size_t>(w) * bpp);
         auto unswizzled = gpu::deswizzle_2d(desc, tiled.data(), tiled.size());
         KX_CHECK(unswizzled == linear, std::format("GFX10 swizzle round-trip failed for mode {}", static_cast<int>(m)));
+    }
+}
+
+void test_gfx10_bcn_and_mip_chain() {
+    // Verify BC1 (8B/4x4 block) and BC7 (16B/4x4 block) round-trip tiling + 5-level mip chain layout
+    for (uint32_t bpp : {8u, 16u}) {
+        gpu::SurfaceDesc desc{256, 256, bpp, gpu::SwizzleMode::Sw64KB_S_X, 0x3Cu, 4, 4};
+        const uint32_t bx = 256 / 4, by = 256 / 4;
+        std::vector<uint8_t> linear(static_cast<size_t>(bx) * by * bpp);
+        for (size_t i = 0; i < linear.size(); ++i) linear[i] = static_cast<uint8_t>((i * 53u + 7u) & 0xFFu);
+
+        auto tiled = gpu::swizzle_2d(desc, linear.data(), static_cast<size_t>(bx) * bpp);
+        auto back = gpu::deswizzle_2d(desc, tiled.data(), tiled.size());
+        KX_CHECK(back == linear, std::format("BCn bpp={} round-trip failed", bpp));
+
+        auto mips = gpu::compute_gfx10_mip_chain(desc, 5);
+        KX_CHECK(mips.size() == 5, "expected 5 mip levels");
+        KX_CHECK(mips[0].blocks_x == 64 && mips[4].blocks_x == 4, "mip block dimensions");
+        for (size_t i = 1; i < mips.size(); ++i) {
+            KX_CHECK((mips[i].offset % 256) == 0, "mip offset 256B aligned");
+            KX_CHECK(mips[i].offset >= mips[i - 1].offset + mips[i - 1].size, "non-overlapping mips");
+        }
     }
 }
 
@@ -331,7 +443,7 @@ void test_end_to_end_pe_loader_guest_title() {
 
     auto mod = loader.load_image(title_dir / cfg->executables[0].name);
     KX_CHECK(mod.has_value(), mod.error().message);
-    KX_CHECK((*mod)->hle_imports >= 10, "expected >= 10 HLE console imports resolved");
+    KX_CHECK((*mod)->hle_imports >= 15, "expected >= 15 HLE console imports resolved");
     KX_CHECK((*mod)->guest_imports >= 2, "expected guest DLL imports resolved");
     KX_CHECK((*mod)->tls_callbacks_run >= 1, "expected PE TLS callback to run");
 
@@ -344,20 +456,23 @@ void test_end_to_end_pe_loader_guest_title() {
     KX_CHECK(fs::exists(save_file), "guest save file missing in S:\\ overlay");
     KX_CHECK(!fs::exists(title_dir / "save.bin"), "game_root must remain unmodified");
 
-    // Verify D3D12.X KxDeviceProxy actually served device, queue, command list, and resources!
+    // Verify D3D12.X KxDeviceProxy + KxCommandQueueProxy + KXRN PSO auto-recompilation & cache hit!
     const auto d3d = hle::d3d12x_stats();
     KX_CHECK(d3d.devices_created >= 1 && d3d.queues_created >= 1 &&
-             d3d.cmd_lists_created >= 1 && d3d.resources_created >= 2 && d3d.zero_memory_calls >= 1,
-             "KxDeviceProxy call counters mismatch");
+             d3d.cmd_lists_created >= 1 && d3d.resources_created >= 2 &&
+             d3d.zero_memory_calls >= 1 && d3d.present_calls >= 1 &&
+             d3d.pso_recompiled >= 1 && d3d.pso_cache_hits >= 1,
+             "KxDeviceProxy / PSO auto-recomp / PresentX counters mismatch");
 
     const auto kx = hle::kernelx_stats();
     KX_CHECK(kx.alloc_count >= 1 && kx.free_count == kx.alloc_count && kx.live_bytes == 0,
              "KernelX XMemAlloc/XMemFree leak check");
 
     std::cout << std::format(
-        "    -> Guest title PASS: HLE_imports={}, GuestDLL_imports={}, Relocs={}, TLS={}, D3D12X(dev={}, res={})\n",
-        (*mod)->hle_imports, (*mod)->guest_imports, (*mod)->relocs_applied,
-        (*mod)->tls_callbacks_run, d3d.devices_created, d3d.resources_created);
+        "    -> Guest title PASS: HLE_imports={}, GuestDLL_imports={}, TLS={}, D3D12X(dev={}, q={}, res={}, pso_recomp={}, cache_hit={}, present={})\n",
+        (*mod)->hle_imports, (*mod)->guest_imports, (*mod)->tls_callbacks_run,
+        d3d.devices_created, d3d.queues_created, d3d.resources_created,
+        d3d.pso_recompiled, d3d.pso_cache_hits, d3d.present_calls);
 
     fs::remove_all(data_dir, ec);
 }
@@ -374,8 +489,11 @@ int main() {
     run_test("RDNA2 (GFX10.3) decoder, CFG IR lifter & dual Wave32/Wave64 HLSL emission", test_rdna2_decoder_and_ir_cfg);
     run_test("In-process DXC SM 6.6 compilation & DXBC/DXIL container verification", test_dxbc_container_and_dxc_compile);
     run_test("End-to-end RDNA2 -> IR -> HLSL -> DXC -> Real Dual-GPU Hardware Execution", test_rdna2_recomp_real_dual_gpu_execution);
+    run_test("RDNA2 SMEM + DS (LDS) + s_barrier Workgroup Shuffle on Dual-GPU Hardware", test_rdna2_smem_lds_barrier_dual_gpu);
+    run_test("Strict recompiler refusal of unsupported RDNA2 opcodes", test_strict_unsupported_opcode_refusal);
     run_test("GFX10 2D texture swizzle/deswizzle round-trip (all 7 modes)", test_gfx10_tiling_roundtrip);
-    run_test("End-to-end PE32+ Loader + Guest DLL + TLS + SEH + KernelX + VFS + D3D12.X KxDeviceProxy GPU Render", test_end_to_end_pe_loader_guest_title);
+    run_test("GFX10 BC1/BC7 block-compressed tiling & 5-level mip-chain layout", test_gfx10_bcn_and_mip_chain);
+    run_test("End-to-end PE32+ Loader + Guest DLL + TLS + SEH + Wide-VFS + KxDeviceProxy PSO Auto-Recomp + PresentX", test_end_to_end_pe_loader_guest_title);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

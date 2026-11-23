@@ -6,3 +6,7 @@ EXPORTS
     TitleMemoryStatus
     GetConsoleType
     CreateFileA
+    CreateFileW
+    DeleteFileA
+    DeleteFileW
+    GetFileAttributesExW

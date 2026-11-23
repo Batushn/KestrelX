@@ -47,5 +47,7 @@ __declspec(dllimport) void __stdcall XTaskQueueCloseHandle(void* queue);
 
 __declspec(dllimport) HRESULT __stdcall D3D12XboxCreateDevice(const void* params, REFIID riid, void** out_dev);
 __declspec(dllimport) void __stdcall D3D12ZeroMemoryX(void* dst, size_t size);
+__declspec(dllimport) HRESULT __stdcall D3D12PresentX(ID3D12CommandQueue* queue, uint32_t flags, const void* present_params, const void* flip_params);
+__declspec(dllimport) HRESULT __stdcall D3D12WaitFrameEventX(uint64_t token, uint32_t timeout_ms, void* out_event);
 
 }  // extern "C"

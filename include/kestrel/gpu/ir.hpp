@@ -52,9 +52,13 @@ enum class IrOp : uint8_t {
     VFractF32,
     VCmp,
     VCndMask,
-    // Memory
+    // Memory & LDS
+    SLoadDword,
     GlobalLoadDword,
     GlobalStoreDword,
+    DsReadB32,
+    DsWriteB32,
+    Barrier,
     // Control flow
     Branch,
     CondBranch,
@@ -112,6 +116,7 @@ struct IrFunction {
     uint32_t max_sgpr = 0;
     uint32_t inst_count = 0;
     uint32_t unknown_count = 0;
+    bool uses_lds = false;
 };
 
 IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded);

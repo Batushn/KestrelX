@@ -4,3 +4,5 @@ EXPORTS
     D3D12XboxCreateDevice
     D3D12ZeroMemoryX
     D3D12SerializeRootSignature
+    D3D12PresentX
+    D3D12WaitFrameEventX

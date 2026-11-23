@@ -10,10 +10,11 @@
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge)](CMakeLists.txt)
 [![D3D12 Ultimate](https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge)](docs/ARCHITECTURE.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT_Clean--Room-blue?style=for-the-badge)](LICENSE)
+[![Discord: Community](https://img.shields.io/badge/Discord-Join_Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/KxsNwBwhVs)
 
 *Built from scratch in C++23 under the MIT license — zero proprietary code, zero game assets, zero cryptographic keys.*
 
-[Visual Showcase](#hardware-visual-showcase) • [Progress Dashboard](#live-progress-dashboard) • [Architecture](#architecture) • [Hardware Receipts](#verified-hardware-test-receipts) • [Build & Run](#building--running) • [Contribute](#contributing)
+[Visual Showcase](#hardware-visual-showcase) • [Progress Dashboard](#live-progress-dashboard) • [Architecture](#architecture) • [Hardware Receipts](#verified-hardware-test-receipts) • [Build & Run](#building--running) � [Discord](https://discord.gg/KxsNwBwhVs) • [Contribute](#contributing)
 
 </div>
 
@@ -254,7 +255,7 @@ docs/        # Architecture documentation & hardware-captured renders (first_lig
 
 ## Contributing
 
-Contributions are warmly welcome! Every subsystem is modular and backed by fast, self-contained tests that run without any proprietary game files. See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), join the [Welcome Discussion](https://github.com/Batushn/KestrelX/discussions/9), or pick up one of the open [`good first issue`](https://github.com/Batushn/KestrelX/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) tasks.
+Contributions are warmly welcome! Join our official **[Discord Community](https://discord.gg/KxsNwBwhVs)** to discuss architecture, shader compilation, and collaborate in real-time. Every subsystem is modular and backed by fast, self-contained tests that run without any proprietary game files. See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), join the [Welcome Discussion](https://github.com/Batushn/KestrelX/discussions/9), or pick up one of the open [`good first issue`](https://github.com/Batushn/KestrelX/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) tasks.
 
 ## Legal & Clean-Room Policy
 

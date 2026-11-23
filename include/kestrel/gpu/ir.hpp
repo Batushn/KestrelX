@@ -185,7 +185,16 @@ struct IrFunction {
     std::vector<DescriptorSlot> buf_srv_bindings;
 };
 
+struct IrOptStats {
+    uint32_t unreachable_blocks_removed = 0;
+    uint32_t copies_propagated = 0;
+    uint32_t constants_folded = 0;
+    uint32_t dead_insts_removed = 0;
+    uint32_t dead_flags_removed = 0;
+};
+
 IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded);
+IrOptStats optimize_ir(IrFunction& fn);
 std::string dump_ir(const IrFunction& fn);
 
 }  // namespace kestrel::gpu

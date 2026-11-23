@@ -30,6 +30,7 @@ struct RecompOptions {
     uint32_t max_mesh_verts = 0;   // 0 = auto from IrFunction::max_mesh_verts (default 64)
     uint32_t max_mesh_prims = 0;   // 0 = auto from IrFunction::max_mesh_prims (default 64)
     bool mesh_has_payload = false; // true when paired with an Amplification Shader
+    bool enable_ir_opt = true;
 };
 
 struct RecompResult {

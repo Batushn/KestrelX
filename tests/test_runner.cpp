@@ -4605,7 +4605,7 @@ void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
         KX_CHECK(dec.size() == 2 && dec[0].mnemonic == tc.mnemonic, std::format("VOPC decode {}", tc.mnemonic));
         auto ir = gpu::lift_rdna2_to_ir(dec);
         KX_CHECK(ir.unknown_count == 0, std::format("VOPC lift {}", tc.mnemonic));
-        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32, .enable_ir_opt = false});
         KX_CHECK(recomp.hlsl.find(tc.expected_hlsl) != std::string::npos,
                  std::format("VOPC {} expected '{}' in:\n{}", tc.mnemonic, tc.expected_hlsl, recomp.hlsl));
         auto dxil = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
@@ -4616,7 +4616,7 @@ void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
     {
         std::vector<uint32_t> bad_vopc = {vopc(0xFF, 256 + 1, 2), sopp(1)};
         auto ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(bad_vopc.data(), bad_vopc.size()));
-        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32, .enable_ir_opt = false});
         KX_CHECK(recomp.hlsl.find("#error Unsupported RDNA2 VCmp predicate") != std::string::npos,
                  "Unknown VOPC must emit #error");
         KX_CHECK(!dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6").has_value(),
@@ -4625,7 +4625,7 @@ void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
     {
         std::vector<uint32_t> bad_sopc = {sopc(0x3F, 0, 1), sopp(1)};
         auto ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(bad_sopc.data(), bad_sopc.size()));
-        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32, .enable_ir_opt = false});
         KX_CHECK(recomp.hlsl.find("#error Unsupported RDNA2 SCmp predicate") != std::string::npos,
                  "Unknown SOPC must emit #error");
         KX_CHECK(!dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6").has_value(),
@@ -4654,7 +4654,7 @@ void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
     for (const auto& tc : sopc_cases) {
         std::vector<uint32_t> prog = {sopc(tc.op, 0, 1), sopp(1)};
         auto ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(prog.data(), prog.size()));
-        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32, .enable_ir_opt = false});
         KX_CHECK(recomp.hlsl.find(tc.expected_hlsl) != std::string::npos,
                  std::format("SOPC op={} expected '{}'", tc.op, tc.expected_hlsl));
     }
@@ -4704,7 +4704,7 @@ void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
     }
     KX_CHECK(exec_branches == 2, std::format("Expected 2 exec CondBranch ops, got {}", exec_branches));
 
-    auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32, .enable_ir_opt = false});
     KX_CHECK(recomp.hlsl.find("g_mem.Load2") != std::string::npos, "global_load_dwordx2 Load2");
     KX_CHECK(recomp.hlsl.find("g_mem.Load4") != std::string::npos, "global_load_dwordx4 Load4");
     KX_CHECK(recomp.hlsl.find("g_mem.Store2") != std::string::npos, "global_store_dwordx2 Store2");
@@ -5952,6 +5952,272 @@ void test_shader_cache_lru_quota_multidim_and_threads() {
     fs::remove_all(cache_dir, ec);
 }
 
+void test_rdna2_ir_optimizer_passes() {
+    using gpu::IrBlock;
+    using gpu::IrFunction;
+    using gpu::IrInst;
+    using gpu::IrOp;
+    using gpu::IrOperand;
+
+    auto make_vgpr = [](uint32_t r) {
+        IrOperand o{};
+        o.kind = IrOperand::Kind::Vgpr;
+        o.reg = r;
+        return o;
+    };
+    auto make_sgpr = [](uint32_t r) {
+        IrOperand o{};
+        o.kind = IrOperand::Kind::Sgpr;
+        o.reg = r;
+        return o;
+    };
+    auto make_imm_i = [](int32_t v) {
+        IrOperand o{};
+        o.kind = IrOperand::Kind::InlineInt;
+        o.imm_i = v;
+        return o;
+    };
+    auto make_lit = [](uint32_t v) {
+        IrOperand o{};
+        o.kind = IrOperand::Kind::Literal;
+        o.lit_u32 = v;
+        return o;
+    };
+
+    IrFunction fn{};
+    fn.max_vgpr = 16;
+    fn.max_sgpr = 16;
+
+    // Block 0: entry -> jumps unconditionally to Block 2 (Block 1 is unreachable)
+    IrBlock b0{};
+    b0.id = 0;
+    {
+        IrInst i{};
+        i.op = IrOp::VMov;
+        i.dst = make_vgpr(1);
+        i.src0 = make_imm_i(10);
+        b0.insts.push_back(i);
+    }
+    {
+        IrInst i{};
+        i.op = IrOp::VMov;
+        i.dst = make_vgpr(2);
+        i.src0 = make_vgpr(1);
+        b0.insts.push_back(i);
+    }
+    {
+        // v3 = v2 + 32 -> copy-propagates v2->10 and constant-folds to 42
+        IrInst i{};
+        i.op = IrOp::VAddU32;
+        i.dst = make_vgpr(3);
+        i.src0 = make_vgpr(2);
+        i.src1 = make_imm_i(32);
+        b0.insts.push_back(i);
+    }
+    {
+        // Dead ALU op (v4 never used)
+        IrInst i{};
+        i.op = IrOp::VMulLoU32;
+        i.dst = make_vgpr(4);
+        i.src0 = make_vgpr(0);
+        i.src1 = make_imm_i(7);
+        b0.insts.push_back(i);
+    }
+    {
+        // Dead SCmp (scc overwritten/never read)
+        IrInst i{};
+        i.op = IrOp::SCmp;
+        i.subop = "s_cmp_eq_u32";
+        i.src0 = make_sgpr(0);
+        i.src1 = make_imm_i(0);
+        b0.insts.push_back(i);
+    }
+    {
+        // Dead VCmp (vcc never read)
+        IrInst i{};
+        i.op = IrOp::VCmp;
+        i.subop = "v_cmp_lt_f32";
+        i.src0 = make_vgpr(0);
+        i.src1 = make_imm_i(1);
+        b0.insts.push_back(i);
+    }
+    {
+        // Precision-sensitive constant folds: VFractF32, VMed3F32(NaN), VBfeI32
+        IrInst i{};
+        i.op = IrOp::VFractF32;
+        i.dst = make_vgpr(5);
+        i.src0 = make_lit(0xAF4DF204u);
+        b0.insts.push_back(i);
+    }
+    {
+        IrInst i{};
+        i.op = IrOp::VMed3F32;
+        i.dst = make_vgpr(6);
+        i.src0 = make_lit(0x3F800000u);  // 1.0f
+        i.src1 = make_lit(0x40000000u);  // 2.0f
+        i.src2 = make_lit(0x7FC00000u);  // NaN
+        b0.insts.push_back(i);
+    }
+    {
+        IrInst i{};
+        i.op = IrOp::VBfeI32;
+        i.dst = make_vgpr(7);
+        i.src0 = make_lit(0xD2F90159u);
+        i.src1 = make_imm_i(28);
+        i.src2 = make_imm_i(16);
+        b0.insts.push_back(i);
+    }
+    {
+        IrInst br{};
+        br.op = IrOp::Branch;
+        br.target_block = 2;
+        b0.insts.push_back(br);
+    }
+    b0.successors = {2};
+
+    // Block 1: unreachable
+    IrBlock b1{};
+    b1.id = 1;
+    {
+        IrInst i{};
+        i.op = IrOp::EndPgm;
+        b1.insts.push_back(i);
+    }
+
+    // Block 2: live stores + EndPgm
+    IrBlock b2{};
+    b2.id = 2;
+    for (uint32_t idx = 0; idx < 4; ++idx) {
+        const uint32_t regs[4] = {3, 5, 6, 7};
+        IrInst st{};
+        st.op = IrOp::GlobalStoreDword;
+        st.src0 = make_vgpr(0);
+        st.src1 = make_vgpr(regs[idx]);
+        st.offset = idx * 4u;
+        b2.insts.push_back(st);
+    }
+    {
+        IrInst end{};
+        end.op = IrOp::EndPgm;
+        b2.insts.push_back(end);
+    }
+    b2.predecessors = {0};
+
+    fn.blocks = {std::move(b0), std::move(b1), std::move(b2)};
+    const auto stats = gpu::optimize_ir(fn);
+
+    KX_CHECK(stats.unreachable_blocks_removed == 1, "Pruned 1 unreachable block");
+    KX_CHECK(fn.blocks.size() == 2, "2 blocks remain after pruning");
+    KX_CHECK(fn.blocks[0].insts.back().op == IrOp::Branch && fn.blocks[0].insts.back().target_block == 1,
+             "Branch target remapped to block 1");
+    KX_CHECK(stats.copies_propagated >= 1, "Copy propagation fired");
+    KX_CHECK(stats.constants_folded >= 4, "Constant folding fired on VAddU32 + precision ops");
+    KX_CHECK(stats.dead_insts_removed >= 3, "Dead v1, v2, v4 eliminated");
+    KX_CHECK(stats.dead_flags_removed == 2, "Dead SCmp and VCmp eliminated");
+
+    // Verify folded values in Block 0 (live across CFG edge into Block 2)
+    auto find_vmov_lit = [&](uint32_t vreg, uint32_t& out_lit) -> bool {
+        for (const auto& inst : fn.blocks[0].insts) {
+            if (inst.op == IrOp::VMov && inst.dst.kind == IrOperand::Kind::Vgpr && inst.dst.reg == vreg &&
+                inst.src0.kind == IrOperand::Kind::Literal) {
+                out_lit = inst.src0.lit_u32;
+                return true;
+            }
+        }
+        return false;
+    };
+    uint32_t lit = 0;
+    KX_CHECK(find_vmov_lit(3, lit) && lit == 42u, "Folded v3 == 42 in Block 0");
+    KX_CHECK(find_vmov_lit(5, lit) && lit == 0x3F7FFFFFu, "Folded VFractF32 == 0x3F7FFFFF in Block 0");
+    KX_CHECK(find_vmov_lit(6, lit) && lit == 0x3F800000u, "Folded VMed3F32(NaN) == 1.0f in Block 0");
+    KX_CHECK(find_vmov_lit(7, lit) && lit == 0xFFFFFFFDu, "Folded VBfeI32 == 0xFFFFFFFD in Block 0");
+    KX_CHECK(fn.blocks[1].insts.size() == 5, "4 GlobalStoreDword + EndPgm preserved in Block 1");
+}
+
+void test_rdna2_ir_opt_dual_gpu_parity() {
+    using namespace gpu::encode;
+    std::vector<uint32_t> prog;
+
+    auto mov_v_lit = [&](uint32_t vdst, uint32_t val) {
+        prog.push_back(vop1(1, vdst, 255));
+        prog.push_back(val);
+    };
+
+    // v1 = v0 << 2 (byte address for lane i)
+    prog.push_back(vop2(26, 1, 130, 0));
+    // v2 = g_mem[v1] (float input)
+    global_mem(prog, 12, 2, 1, 127, 0);
+
+    // Redundant copies + dead ALU + dead flags
+    prog.push_back(vop1(1, 8, 256 + 2));       // v8 = v2 (copy)
+    prog.push_back(vop1(1, 9, 256 + 8));       // v9 = v8 (chained copy)
+    mov_v_lit(10, 0x40400000u);                // v10 = 3.0f
+    mov_v_lit(11, 0x3F800000u);                // v11 = 1.0f
+    prog.push_back(vop2(3, 12, 256 + 10, 11)); // v12 = v10 + v11 (folds to 4.0f)
+    prog.push_back(vop2(7, 13, 256 + 10, 11)); // dead v13 = v10 * v11 (unused)
+    prog.push_back(sopc(6, 0, 128));           // dead s_cmp_eq_u32 s0, 0 (overwritten below)
+
+    // Live v_cmp_lt_f32 + v_cndmask_b32: v14 = (v9 < 0.0f) ? 2.0f : v12
+    prog.push_back(vopc(0x11, 256 + 9, 128));  // v_cmp_lt_f32 vcc, v9, 0
+    prog.push_back(vop1(1, 15, 244));          // v15 = 2.0f
+    prog.push_back(vop2(1, 14, 256 + 12, 15)); // v_cndmask_b32 v14, v12, v15
+
+    // Live s_cmp_eq_u32 + s_cbranch_scc1
+    prog.push_back(sopc(6, 0, 128));           // s_cmp_eq_u32 s0, 0
+    prog.push_back(sopp(5, 2));                // s_cbranch_scc1 +2
+    prog.push_back(vop2(3, 14, 242, 14));      // v14 = 1.0f + v14
+    prog.push_back(sopp(2, 1));                // s_branch +1
+    prog.push_back(vop2(3, 14, 240, 14));      // v14 = 0.5f + v14
+
+    // Store result
+    global_mem(prog, 28, 14, 1, 127, 0);
+    prog.push_back(sopp(1));                   // s_endpgm
+
+    auto dec = gpu::decode_rdna2(prog.data(), prog.size());
+    auto ir = gpu::lift_rdna2_to_ir(dec);
+    KX_CHECK(ir.unknown_count == 0, "All parity shader ops decoded");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value(), adapters.error().message);
+
+    constexpr uint32_t kCount = 64;
+    std::vector<uint32_t> input_u32(kCount);
+    for (uint32_t i = 0; i < kCount; ++i) {
+        const float x = static_cast<float>(i) * 0.25f - 8.0f;
+        std::memcpy(&input_u32[i], &x, sizeof(float));
+    }
+    uint32_t roots[8]{};
+
+    int tested = 0;
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        const gpu::WaveMode mode = ad.supports_wave64 ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
+
+        auto unopt_recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = mode, .enable_ir_opt = false});
+        auto opt_recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = mode, .enable_ir_opt = true});
+        KX_CHECK(opt_recomp.hlsl.size() < unopt_recomp.hlsl.size(),
+                 std::format("Optimized HLSL smaller on {} ({} < {})",
+                             ad.name, opt_recomp.hlsl.size(), unopt_recomp.hlsl.size()));
+
+        auto dxil_unopt = dxc.compile_hlsl(unopt_recomp.hlsl, "main", "cs_6_6");
+        auto dxil_opt = dxc.compile_hlsl(opt_recomp.hlsl, "main", "cs_6_6");
+        KX_CHECK(dxil_unopt.has_value(), dxil_unopt.error().message);
+        KX_CHECK(dxil_opt.has_value(), dxil_opt.error().message);
+
+        auto run_unopt = gpu::run_compute_dxil_on_gpu(ad.index, dxil_unopt->dxil, input_u32, roots, 1);
+        auto run_opt = gpu::run_compute_dxil_on_gpu(ad.index, dxil_opt->dxil, input_u32, roots, 1);
+        KX_CHECK(run_unopt.has_value(), run_unopt.error().message);
+        KX_CHECK(run_opt.has_value(), run_opt.error().message);
+        KX_CHECK(run_unopt->output_u32 == run_opt->output_u32,
+                 std::format("Bit-for-bit parity on {} (opt vs unopt)", ad.name));
+        ++tested;
+    }
+    KX_CHECK(tested > 0, "At least one hardware D3D12 adapter tested");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -5981,6 +6247,8 @@ int main(int argc, char** argv) {
     run_test("Strict recompiler refusal of unsupported RDNA2 opcodes", test_strict_unsupported_opcode_refusal);
     run_test("Persistent on-disk DXIL shader cache & corruption recovery", test_persistent_disk_shader_cache);
     run_test("Disk shader cache LRU quota, multi-dim key hardening & thread safety", test_shader_cache_lru_quota_multidim_and_threads);
+    run_test("RDNA2 IR Optimizer Passes (Unreachable Prune, Copy Prop, Const Fold, Liveness DCE)", test_rdna2_ir_optimizer_passes);
+    run_hw_test("RDNA2 IR Optimizer Dual-GPU Hardware Bit-Exact Parity (Opt vs Unopt)", test_rdna2_ir_opt_dual_gpu_parity);
     run_test("D3D12.X ID3D12Device1..10 QI, Stream PSO Recomp & CmdListProxy Telemetry", test_d3d12_device_qi_stream_pso_and_cmdlist_telemetry);
     run_test("GFX10 2D texture swizzle/deswizzle round-trip (all 7 modes)", test_gfx10_tiling_roundtrip);
     run_test("GFX10 BC1/BC7 block-compressed tiling & 5-level mip-chain layout", test_gfx10_bcn_and_mip_chain);

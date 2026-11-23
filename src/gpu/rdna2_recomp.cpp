@@ -689,7 +689,9 @@ RootSignatureRemapPlan build_root_remap_plan(const IrFunction& fn, ShaderStage s
     return plan;
 }
 
-RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
+RecompResult emit_hlsl_from_ir(const IrFunction& fn_in, const RecompOptions& opt) {
+    IrFunction opt_fn;
+    const IrFunction& fn = opt.enable_ir_opt ? (opt_fn = fn_in, optimize_ir(opt_fn), opt_fn) : fn_in;
     RecompResult res{};
     res.wave_mode = opt.wave_mode;
     res.vgpr_count = std::max<uint32_t>(fn.max_vgpr, 4u);

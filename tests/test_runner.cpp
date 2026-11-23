@@ -123,21 +123,146 @@ void test_overlay_vfs_cow_and_security() {
     fs::remove_all(tmp, ec);
 }
 
+using LiveVehStubFn = void (*)(uint64_t arg0, uint64_t arg1, uint64_t* out_rax, uint64_t* out_rdx);
+
+std::atomic<uintptr_t> g_veh_test_ud2_addr{0};
+
+LONG CALLBACK veh_test_ud2_redirect_handler(EXCEPTION_POINTERS* info) {
+    if (!info || !info->ExceptionRecord || !info->ContextRecord) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const uintptr_t expected_ud2 = g_veh_test_ud2_addr.load(std::memory_order_acquire);
+    if (expected_ud2 != 0 &&
+        info->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
+        static_cast<uintptr_t>(info->ContextRecord->Rip) == expected_ud2) {
+        // Advance RIP past the 2-byte UD2 onto the Zen 2 instruction bytes and
+        // continue searching so KestrelX's real kestrel_veh_handler runs next.
+        info->ContextRecord->Rip = static_cast<DWORD64>(expected_ud2 + 2);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+__declspec(noinline) bool invoke_stub_expect_ud(LiveVehStubFn fn,
+                                                uint64_t arg0,
+                                                uint64_t arg1,
+                                                uint64_t* out_rax,
+                                                uint64_t* out_rdx,
+                                                DWORD* caught_code) {
+    __try {
+        fn(arg0, arg1, out_rax, out_rdx);
+        return false;
+    } __except (GetExceptionCode() == EXCEPTION_ILLEGAL_INSTRUCTION
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        if (caught_code) {
+            *caught_code = GetExceptionCode();
+        }
+        return true;
+    }
+}
+
+void build_live_veh_stub(uint8_t* page, const uint8_t* zen2_bytes, size_t zen2_len, uintptr_t& ud2_addr) {
+    // Pure leaf x64 stub (no RSP modification, volatile regs only):
+    //   mov rax, rcx           (48 89 C8)
+    //   mov rcx, rdx           (48 89 D1)
+    //   mov rdx, -1            (48 C7 C2 FF FF FF FF)
+    //   ud2                    (0F 0B)
+    //   <zen2_bytes...>
+    //   mov [r8], rax          (49 89 00)
+    //   mov [r9], rdx          (49 89 11)
+    //   ret                    (C3)
+    size_t off = 0;
+    const uint8_t prologue[] = {
+        0x48, 0x89, 0xC8,
+        0x48, 0x89, 0xD1,
+        0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    std::memcpy(page + off, prologue, sizeof(prologue));
+    off += sizeof(prologue);
+    ud2_addr = reinterpret_cast<uintptr_t>(page + off);
+    page[off++] = 0x0F;
+    page[off++] = 0x0B;
+    std::memcpy(page + off, zen2_bytes, zen2_len);
+    off += zen2_len;
+    const uint8_t epilogue[] = {
+        0x49, 0x89, 0x00,
+        0x49, 0x89, 0x11,
+        0xC3,
+    };
+    std::memcpy(page + off, epilogue, sizeof(epilogue));
+    FlushInstructionCache(GetCurrentProcess(), page, off + sizeof(epilogue));
+}
+
 void test_veh_zen2_decode_and_emulate() {
+    cpu::ScopedVehShim::reset_stats();
+
     const uint8_t clzero[3] = {0x0F, 0x01, 0xFC};
+    const uint8_t clzero_67[4] = {0x67, 0x0F, 0x01, 0xFC};
+    const uint8_t clzero_67_rex[5] = {0x67, 0x48, 0x0F, 0x01, 0xFC};
     const uint8_t monitorx[3] = {0x0F, 0x01, 0xFA};
     const uint8_t mwaitx[3] = {0x0F, 0x01, 0xFB};
+    const uint8_t mcommit[4] = {0xF3, 0x0F, 0x01, 0xFA};
+    const uint8_t mcommit_rex[5] = {0xF3, 0x48, 0x0F, 0x01, 0xFA};
+    const uint8_t rdpru[3] = {0x0F, 0x01, 0xFD};
+    const uint8_t bad_f3_rdpru[4] = {0xF3, 0x0F, 0x01, 0xFD};
+    const uint8_t bad_66_clzero[4] = {0x66, 0x0F, 0x01, 0xFC};
     const uint8_t nop[3] = {0x90, 0x90, 0x90};
 
-    auto d0 = cpu::decode_zen2_extension(clzero, 3);
-    KX_CHECK(d0.kind == cpu::Zen2Instruction::Clzero && d0.length == 3, "clzero decode");
-    auto d1 = cpu::decode_zen2_extension(monitorx, 3);
-    KX_CHECK(d1.kind == cpu::Zen2Instruction::Monitorx && d1.length == 3, "monitorx decode");
-    auto d2 = cpu::decode_zen2_extension(mwaitx, 3);
-    KX_CHECK(d2.kind == cpu::Zen2Instruction::Mwaitx && d2.length == 3, "mwaitx decode");
-    auto d3 = cpu::decode_zen2_extension(nop, 3);
-    KX_CHECK(d3.kind == cpu::Zen2Instruction::None, "non-zen2 decode");
+    auto d0 = cpu::decode_zen2_extension(clzero, sizeof(clzero));
+    KX_CHECK(d0.kind == cpu::Zen2Instruction::Clzero && d0.length == 3 && !d0.has_addr_size_override, "clzero decode");
+    auto d0_67 = cpu::decode_zen2_extension(clzero_67, sizeof(clzero_67));
+    KX_CHECK(d0_67.kind == cpu::Zen2Instruction::Clzero && d0_67.length == 4 && d0_67.has_addr_size_override, "0x67 clzero decode");
+    auto d0_67_rex = cpu::decode_zen2_extension(clzero_67_rex, sizeof(clzero_67_rex));
+    KX_CHECK(d0_67_rex.kind == cpu::Zen2Instruction::Clzero && d0_67_rex.length == 5 && d0_67_rex.has_addr_size_override, "0x67+REX clzero decode");
 
+    auto d1 = cpu::decode_zen2_extension(monitorx, sizeof(monitorx));
+    KX_CHECK(d1.kind == cpu::Zen2Instruction::Monitorx && d1.length == 3, "monitorx decode");
+    auto d2 = cpu::decode_zen2_extension(mwaitx, sizeof(mwaitx));
+    KX_CHECK(d2.kind == cpu::Zen2Instruction::Mwaitx && d2.length == 3, "mwaitx decode");
+    auto d_mc = cpu::decode_zen2_extension(mcommit, sizeof(mcommit));
+    KX_CHECK(d_mc.kind == cpu::Zen2Instruction::Mcommit && d_mc.length == 4, "mcommit decode");
+    auto d_mc_rex = cpu::decode_zen2_extension(mcommit_rex, sizeof(mcommit_rex));
+    KX_CHECK(d_mc_rex.kind == cpu::Zen2Instruction::Mcommit && d_mc_rex.length == 5, "mcommit+REX decode");
+    auto d_rdpru = cpu::decode_zen2_extension(rdpru, sizeof(rdpru));
+    KX_CHECK(d_rdpru.kind == cpu::Zen2Instruction::Rdpru && d_rdpru.length == 3, "rdpru decode");
+    KX_CHECK(cpu::decode_zen2_extension(bad_f3_rdpru, sizeof(bad_f3_rdpru)).kind == cpu::Zen2Instruction::None, "F3+RDPRU rejected");
+    KX_CHECK(cpu::decode_zen2_extension(bad_66_clzero, sizeof(bad_66_clzero)).kind == cpu::Zen2Instruction::None, "66+CLZERO rejected");
+    KX_CHECK(cpu::decode_zen2_extension(nop, sizeof(nop)).kind == cpu::Zen2Instruction::None, "non-zen2 decode");
+
+    // PREFETCHW (0F 0D /1) & PREFETCHWT1 (0F 0D /2) full ModRM + SIB + disp8/disp32 decoding & bounds checks
+    const uint8_t pfw_reg_ind[3] = {0x0F, 0x0D, 0x08};                                   // prefetchw [rax] (mod=0, reg=1, rm=0)
+    const uint8_t pfwt1_reg_ind[3] = {0x0F, 0x0D, 0x10};                                 // prefetchwt1 [rax] (mod=0, reg=2, rm=0)
+    const uint8_t pfw_rip[7] = {0x0F, 0x0D, 0x0D, 0x10, 0x00, 0x00, 0x00};               // prefetchw [rip+0x10] (mod=0, rm=5)
+    const uint8_t pfw_sib[4] = {0x0F, 0x0D, 0x0C, 0x24};                                 // prefetchw [rsp] (mod=0, rm=4, sib base=4)
+    const uint8_t pfw_sib_disp32[8] = {0x0F, 0x0D, 0x0C, 0x85, 0x78, 0x56, 0x34, 0x12};  // prefetchw [rax*4+disp32] (mod=0, sib base=5)
+    const uint8_t pfw_disp8[4] = {0x0F, 0x0D, 0x48, 0x20};                               // prefetchw [rax+0x20] (mod=1)
+    const uint8_t pfw_sib_disp8[5] = {0x0F, 0x0D, 0x4C, 0x24, 0x20};                     // prefetchw [rsp+0x20] (mod=1, sib)
+    const uint8_t pfw_disp32[7] = {0x0F, 0x0D, 0x88, 0x00, 0x01, 0x00, 0x00};            // prefetchw [rax+0x100] (mod=2)
+    const uint8_t pfwt1_rex_sib_disp32[9] = {0x41, 0x0F, 0x0D, 0x94, 0x34, 0x00, 0x01, 0x00, 0x00};  // prefetchwt1 [r12+rsi+0x100]
+    const uint8_t pfw_67_sib_disp8[7] = {0x67, 0x41, 0x0F, 0x0D, 0x4C, 0x24, 0x08};      // addr32 prefetchw [r12d+8]
+    const uint8_t pfw_invalid_mod3[3] = {0x0F, 0x0D, 0xC8};                              // mod=3 invalid
+    const uint8_t pfw_invalid_reg0[3] = {0x0F, 0x0D, 0x00};                              // /0 (not /1 or /2)
+
+    KX_CHECK(cpu::decode_zen2_extension(pfw_reg_ind, sizeof(pfw_reg_ind)).length == 3, "prefetchw [rax]");
+    KX_CHECK(cpu::decode_zen2_extension(pfwt1_reg_ind, sizeof(pfwt1_reg_ind)).kind == cpu::Zen2Instruction::Prefetchw, "prefetchwt1 [rax]");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_rip, sizeof(pfw_rip)).length == 7, "prefetchw [rip+disp32]");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_rip, sizeof(pfw_rip) - 1).kind == cpu::Zen2Instruction::None, "prefetchw [rip+disp32] truncated");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_sib, sizeof(pfw_sib)).length == 4, "prefetchw [rsp]");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_sib, 3).kind == cpu::Zen2Instruction::None, "prefetchw [rsp] truncated SIB");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_sib_disp32, sizeof(pfw_sib_disp32)).length == 8, "prefetchw [sib+disp32]");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_sib_disp32, 7).kind == cpu::Zen2Instruction::None, "prefetchw [sib+disp32] truncated");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_disp8, sizeof(pfw_disp8)).length == 4, "prefetchw [rax+disp8]");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_sib_disp8, sizeof(pfw_sib_disp8)).length == 5, "prefetchw [rsp+disp8]");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_disp32, sizeof(pfw_disp32)).length == 7, "prefetchw [rax+disp32]");
+    auto d_pfwt1_full = cpu::decode_zen2_extension(pfwt1_rex_sib_disp32, sizeof(pfwt1_rex_sib_disp32));
+    KX_CHECK(d_pfwt1_full.kind == cpu::Zen2Instruction::Prefetchw && d_pfwt1_full.length == 9, "prefetchwt1 REX+SIB+disp32");
+    auto d_pfw_67 = cpu::decode_zen2_extension(pfw_67_sib_disp8, sizeof(pfw_67_sib_disp8));
+    KX_CHECK(d_pfw_67.kind == cpu::Zen2Instruction::Prefetchw && d_pfw_67.length == 7 && d_pfw_67.has_addr_size_override, "0x67 prefetchw");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_invalid_mod3, sizeof(pfw_invalid_mod3)).kind == cpu::Zen2Instruction::None, "prefetchw mod=3 rejected");
+    KX_CHECK(cpu::decode_zen2_extension(pfw_invalid_reg0, sizeof(pfw_invalid_reg0)).kind == cpu::Zen2Instruction::None, "prefetch /0 rejected");
+
+    // 64-bit CLZERO emulation
     alignas(64) uint8_t line[64];
     std::memset(line, 0xCC, sizeof(line));
     // Test unaligned address inside the 64-byte line (AMD CLZERO clears aligned [RAX & ~63])
@@ -146,8 +271,185 @@ void test_veh_zen2_decode_and_emulate() {
     for (uint8_t b : line) {
         KX_CHECK(b == 0, "clzero must zero entire 64B cache line");
     }
+
+    // 0x67 address-size override CLZERO (masks to 32-bit EAX)
+    void* low_page = nullptr;
+    for (uintptr_t hint = 0x20000000ULL; hint < 0x70000000ULL; hint += 0x01000000ULL) {
+        low_page = VirtualAlloc(reinterpret_cast<LPVOID>(hint), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (low_page && reinterpret_cast<uintptr_t>(low_page) < 0x100000000ULL) {
+            break;
+        }
+        if (low_page) {
+            VirtualFree(low_page, 0, MEM_RELEASE);
+            low_page = nullptr;
+        }
+    }
+    KX_CHECK(low_page != nullptr, "allocated low-4GB page for 0x67 CLZERO test");
+    auto* low_bytes = static_cast<uint8_t*>(low_page);
+    std::memset(low_bytes, 0xAA, 64);
+    uint64_t tagged_rax = 0xDEADBEEF00000000ULL | (reinterpret_cast<uint64_t>(low_bytes) + 19ULL);
+    uint64_t rdx = 0;
+    // Without 0x67, upper garbage bits point to unmapped memory -> must be rejected cleanly!
+    KX_CHECK(!cpu::emulate_zen2_instruction(d0, tagged_rax, 0, rdx), "unmapped 64-bit CLZERO must fail safely");
+    KX_CHECK(low_bytes[0] == 0xAA, "failed CLZERO must not modify low buffer");
+    // With 0x67, upper 32 bits are masked -> resolves to low_bytes and zeros 64 bytes!
+    KX_CHECK(cpu::emulate_zen2_instruction(d0_67, tagged_rax, 0, rdx), "0x67 CLZERO must mask to 32-bit EAX");
+    for (size_t k = 0; k < 64; ++k) {
+        KX_CHECK(low_bytes[k] == 0, "0x67 CLZERO must zero entire 64B cache line");
+    }
+    VirtualFree(low_page, 0, MEM_RELEASE);
+
+    // Safe CLZERO VirtualQuery validation: nullptr, unmapped, reserved, PAGE_READONLY, PAGE_NOACCESS, PAGE_GUARD
+    uint64_t null_rax = 32;  // aligns to 0
+    KX_CHECK(!cpu::emulate_zen2_instruction(d0, null_rax, 0, rdx), "CLZERO null line rejected");
+
+    void* reserved_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
+    KX_CHECK(reserved_page != nullptr, "reserved page alloc");
+    uint64_t reserved_rax = reinterpret_cast<uint64_t>(reserved_page);
+    KX_CHECK(!cpu::emulate_zen2_instruction(d0, reserved_rax, 0, rdx), "CLZERO MEM_RESERVE rejected");
+    VirtualFree(reserved_page, 0, MEM_RELEASE);
+
+    void* ro_page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    KX_CHECK(ro_page != nullptr, "ro page alloc");
+    std::memset(ro_page, 0x5A, 64);
+    DWORD old_prot = 0;
+    KX_CHECK(VirtualProtect(ro_page, 4096, PAGE_READONLY, &old_prot) != 0, "set PAGE_READONLY");
+    uint64_t ro_rax = reinterpret_cast<uint64_t>(ro_page);
+    KX_CHECK(!cpu::emulate_zen2_instruction(d0, ro_rax, 0, rdx), "CLZERO PAGE_READONLY rejected");
+    KX_CHECK(static_cast<uint8_t*>(ro_page)[0] == 0x5A, "PAGE_READONLY data untouched");
+
+    KX_CHECK(VirtualProtect(ro_page, 4096, PAGE_NOACCESS, &old_prot) != 0, "set PAGE_NOACCESS");
+    KX_CHECK(!cpu::emulate_zen2_instruction(d0, ro_rax, 0, rdx), "CLZERO PAGE_NOACCESS rejected");
+
+    KX_CHECK(VirtualProtect(ro_page, 4096, PAGE_READWRITE | PAGE_GUARD, &old_prot) != 0, "set PAGE_GUARD");
+    KX_CHECK(!cpu::emulate_zen2_instruction(d0, ro_rax, 0, rdx), "CLZERO PAGE_GUARD rejected");
+    VirtualFree(ro_page, 0, MEM_RELEASE);
+
+    // MONITORX, MWAITX, MCOMMIT, PREFETCHW emulation
     KX_CHECK(cpu::emulate_zen2_instruction(cpu::Zen2Instruction::Monitorx, rax), "monitorx emulate");
     KX_CHECK(cpu::emulate_zen2_instruction(cpu::Zen2Instruction::Mwaitx, rax), "mwaitx emulate");
+    KX_CHECK(cpu::emulate_zen2_instruction(d_mc, rax, 0, rdx), "mcommit emulate");
+    KX_CHECK(cpu::emulate_zen2_instruction(d_pfwt1_full, rax, 0, rdx), "prefetchw emulate");
+
+    // RDPRU emulation: ECX=0 (MPERF), ECX=1 (APERF), ECX=2 (invalid)
+    uint64_t rdpru_rax = 0xFFFFFFFFFFFFFFFFULL;
+    uint64_t rdpru_rdx = 0xFFFFFFFFFFFFFFFFULL;
+    KX_CHECK(cpu::emulate_zen2_instruction(d_rdpru, rdpru_rax, 0, rdpru_rdx), "rdpru MPERF");
+    KX_CHECK((rdpru_rax >> 32) == 0 && (rdpru_rdx >> 32) == 0, "rdpru MPERF zero-extends RAX/RDX");
+    const uint64_t mperf0 = (rdpru_rdx << 32) | rdpru_rax;
+    KX_CHECK(mperf0 != 0, "rdpru MPERF non-zero");
+
+    rdpru_rax = 0xFFFFFFFFFFFFFFFFULL;
+    rdpru_rdx = 0xFFFFFFFFFFFFFFFFULL;
+    KX_CHECK(cpu::emulate_zen2_instruction(d_rdpru, rdpru_rax, 1, rdpru_rdx), "rdpru APERF");
+    KX_CHECK((rdpru_rax >> 32) == 0 && (rdpru_rdx >> 32) == 0, "rdpru APERF zero-extends RAX/RDX");
+    const uint64_t aperf0 = (rdpru_rdx << 32) | rdpru_rax;
+    KX_CHECK(aperf0 != 0, "rdpru APERF non-zero");
+
+    KX_CHECK(!cpu::emulate_zen2_instruction(d_rdpru, rdpru_rax, 2, rdpru_rdx), "rdpru invalid ECX=2 rejected");
+
+    const auto st = cpu::ScopedVehShim::stats();
+    KX_CHECK(st.clzero_emulated == 2, "clzero stat count");
+    KX_CHECK(st.monitorx_emulated == 1, "monitorx stat count");
+    KX_CHECK(st.mwaitx_emulated == 1, "mwaitx stat count");
+    KX_CHECK(st.mcommit_emulated == 1, "mcommit stat count");
+    KX_CHECK(st.rdpru_emulated == 2, "rdpru stat count");
+    KX_CHECK(st.prefetchw_emulated == 1, "prefetchw stat count");
+}
+
+void test_veh_live_scoped_shim() {
+    cpu::ScopedVehShim::reset_stats();
+    cpu::ScopedVehShim veh;
+
+    // Install a test-only first-chance VEH ahead of ScopedVehShim that redirects
+    // a deterministic hardware UD2 (#UD) directly onto the Zen 2 instruction bytes,
+    // exercising kestrel_veh_handler end-to-end on both Intel and AMD CPUs.
+    struct ScopedTestVeh {
+        void* handle = nullptr;
+        ScopedTestVeh() { handle = AddVectoredExceptionHandler(1, veh_test_ud2_redirect_handler); }
+        ~ScopedTestVeh() {
+            g_veh_test_ud2_addr.store(0, std::memory_order_release);
+            if (handle) RemoveVectoredExceptionHandler(handle);
+        }
+    } redirect_guard;
+    KX_CHECK(redirect_guard.handle != nullptr, "installed redirect test VEH");
+
+    struct ScopedRwxPage {
+        uint8_t* ptr = nullptr;
+        ScopedRwxPage() {
+            ptr = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        }
+        ~ScopedRwxPage() {
+            if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
+        }
+    } rwx;
+    KX_CHECK(rwx.ptr != nullptr, "allocated RWX test page");
+
+    auto* stub = reinterpret_cast<LiveVehStubFn>(rwx.ptr);
+    uintptr_t ud2_addr = 0;
+    uint64_t out_rax = 0;
+    uint64_t out_rdx = 0;
+
+    // 1. Live CLZERO via VEH
+    alignas(64) uint8_t cache_line[64];
+    std::memset(cache_line, 0xDD, sizeof(cache_line));
+    const uint8_t clzero_op[3] = {0x0F, 0x01, 0xFC};
+    build_live_veh_stub(rwx.ptr, clzero_op, sizeof(clzero_op), ud2_addr);
+    g_veh_test_ud2_addr.store(ud2_addr, std::memory_order_release);
+    stub(reinterpret_cast<uint64_t>(cache_line + 13), 0, &out_rax, &out_rdx);
+    for (uint8_t b : cache_line) {
+        KX_CHECK(b == 0, "live VEH CLZERO must zero 64B cache line");
+    }
+
+    // 2. Live MCOMMIT via VEH
+    const uint8_t mcommit_op[4] = {0xF3, 0x0F, 0x01, 0xFA};
+    build_live_veh_stub(rwx.ptr, mcommit_op, sizeof(mcommit_op), ud2_addr);
+    g_veh_test_ud2_addr.store(ud2_addr, std::memory_order_release);
+    stub(0xCAFEBABE12345678ULL, 0, &out_rax, &out_rdx);
+    KX_CHECK(out_rax == 0xCAFEBABE12345678ULL, "live VEH MCOMMIT preserves RAX and advances RIP by 4");
+
+    // 3. Live RDPRU (MPERF & APERF) via VEH
+    const uint8_t rdpru_op[3] = {0x0F, 0x01, 0xFD};
+    build_live_veh_stub(rwx.ptr, rdpru_op, sizeof(rdpru_op), ud2_addr);
+    g_veh_test_ud2_addr.store(ud2_addr, std::memory_order_release);
+    stub(0xFFFFFFFFFFFFFFFFULL, 0, &out_rax, &out_rdx);
+    KX_CHECK((out_rax >> 32) == 0 && (out_rdx >> 32) == 0 && ((out_rdx << 32) | out_rax) != 0,
+             "live VEH RDPRU MPERF returns zero-extended EDX:EAX");
+    stub(0xFFFFFFFFFFFFFFFFULL, 1, &out_rax, &out_rdx);
+    KX_CHECK((out_rax >> 32) == 0 && (out_rdx >> 32) == 0 && ((out_rdx << 32) | out_rax) != 0,
+             "live VEH RDPRU APERF returns zero-extended EDX:EAX");
+
+    // 4. Live PREFETCHW (6-byte REX + 0F 0D + ModRM + SIB + disp8) via VEH
+    const uint8_t pfw_op[6] = {0x41, 0x0F, 0x0D, 0x4C, 0x24, 0x10};
+    build_live_veh_stub(rwx.ptr, pfw_op, sizeof(pfw_op), ud2_addr);
+    g_veh_test_ud2_addr.store(ud2_addr, std::memory_order_release);
+    stub(0x1122334455667788ULL, 0, &out_rax, &out_rdx);
+    KX_CHECK(out_rax == 0x1122334455667788ULL, "live VEH PREFETCHW advances RIP by full 6 bytes");
+
+    // 5. Live CLZERO with PAGE_READONLY pointer must be safely rejected (no recursive fault)
+    void* ro_page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY);
+    KX_CHECK(ro_page != nullptr, "allocated PAGE_READONLY page");
+    build_live_veh_stub(rwx.ptr, clzero_op, sizeof(clzero_op), ud2_addr);
+    g_veh_test_ud2_addr.store(ud2_addr, std::memory_order_release);
+    DWORD caught = 0;
+    const bool ro_trapped = invoke_stub_expect_ud(stub, reinterpret_cast<uint64_t>(ro_page), 0, &out_rax, &out_rdx, &caught);
+    VirtualFree(ro_page, 0, MEM_RELEASE);
+    KX_CHECK(ro_trapped && caught == EXCEPTION_ILLEGAL_INSTRUCTION,
+             "live VEH CLZERO on PAGE_READONLY propagates EXCEPTION_ILLEGAL_INSTRUCTION safely");
+
+    // 6. Live unhandled UD2 (no redirect) increments unhandled_exceptions cleanly
+    g_veh_test_ud2_addr.store(0, std::memory_order_release);
+    caught = 0;
+    const bool ud_trapped = invoke_stub_expect_ud(stub, 0, 0, &out_rax, &out_rdx, &caught);
+    KX_CHECK(ud_trapped && caught == EXCEPTION_ILLEGAL_INSTRUCTION, "unhandled UD2 caught by SEH");
+
+    const auto st = cpu::ScopedVehShim::stats();
+    KX_CHECK(st.clzero_emulated == 1, "live clzero_emulated == 1");
+    KX_CHECK(st.mcommit_emulated == 1, "live mcommit_emulated == 1");
+    KX_CHECK(st.monitorx_emulated == 0, "live monitorx_emulated == 0");
+    KX_CHECK(st.rdpru_emulated == 2, "live rdpru_emulated == 2");
+    KX_CHECK(st.prefetchw_emulated == 1, "live prefetchw_emulated == 1");
+    KX_CHECK(st.unhandled_exceptions == 2, "live unhandled_exceptions == 2");
 }
 
 void test_rdna2_decoder_and_ir_cfg() {
@@ -4254,7 +4556,8 @@ int main() {
 
     run_test("MicrosoftGame.config XML parser", test_game_config_parser);
     run_test("Overlay VFS copy-on-write, whiteouts & path-traversal rejection", test_overlay_vfs_cow_and_security);
-    run_test("VEH AMD Zen 2 instruction decoder & emulator (CLZERO/MONITORX/MWAITX)", test_veh_zen2_decode_and_emulate);
+    run_test("VEH AMD Zen 2 instruction decoder & emulator (CLZERO/MONITORX/MWAITX/MCOMMIT/RDPRU/PREFETCHW)", test_veh_zen2_decode_and_emulate);
+    run_test("VEH live ScopedVehShim interception & safe CLZERO validation", test_veh_live_scoped_shim);
     run_test("RDNA2 (GFX10.3) decoder, CFG IR lifter & dual Wave32/Wave64 HLSL emission", test_rdna2_decoder_and_ir_cfg);
     run_test("In-process DXC SM 6.6 compilation & DXBC/DXIL container verification", test_dxbc_container_and_dxc_compile);
     run_test("End-to-end RDNA2 -> IR -> HLSL -> DXC -> Real Dual-GPU Hardware Execution", test_rdna2_recomp_real_dual_gpu_execution);

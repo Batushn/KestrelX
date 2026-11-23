@@ -3655,7 +3655,6 @@ void test_work_graph_rdna2_execute_indirect_dual_gpu() {
              "KxDeviceProxy / KxGraphicsCommandListProxy telemetry recorded Work Graph dispatches and barriers");
 }
 
-}  // namespace
 
 void test_rdna2_mesh_amplification_decode_ir_dxc() {
     using namespace gpu::encode;

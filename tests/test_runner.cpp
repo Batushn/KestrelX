@@ -4548,6 +4548,303 @@ void test_d3d12x_mesh_stream_pso_recompilation() {
     fs::remove_all(cache_dir, ec);
 }
 
+
+void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
+    using namespace gpu::encode;
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+
+    // 1. Verify all 18 VOPC predicates emit the exact HLSL comparison operator & compile via DXC
+    struct VopcCase {
+        uint32_t op;
+        const char* mnemonic;
+        const char* expected_hlsl;
+    };
+    const VopcCase vopc_cases[] = {
+        {0x11, "v_cmp_lt_f32", "vcc = (asfloat(v[1]) < asfloat(v[2]));"},
+        {0x12, "v_cmp_eq_f32", "vcc = (asfloat(v[1]) == asfloat(v[2]));"},
+        {0x13, "v_cmp_le_f32", "vcc = (asfloat(v[1]) <= asfloat(v[2]));"},
+        {0x14, "v_cmp_gt_f32", "vcc = (asfloat(v[1]) > asfloat(v[2]));"},
+        {0x15, "v_cmp_lg_f32", "vcc = (asfloat(v[1]) != asfloat(v[2]));"},
+        {0x16, "v_cmp_ge_f32", "vcc = (asfloat(v[1]) >= asfloat(v[2]));"},
+        {0x81, "v_cmp_lt_i32", "vcc = (asint(v[1]) < asint(v[2]));"},
+        {0x82, "v_cmp_eq_i32", "vcc = (asint(v[1]) == asint(v[2]));"},
+        {0x83, "v_cmp_le_i32", "vcc = (asint(v[1]) <= asint(v[2]));"},
+        {0x84, "v_cmp_gt_i32", "vcc = (asint(v[1]) > asint(v[2]));"},
+        {0x85, "v_cmp_ne_i32", "vcc = (asint(v[1]) != asint(v[2]));"},
+        {0x86, "v_cmp_ge_i32", "vcc = (asint(v[1]) >= asint(v[2]));"},
+        {0xC1, "v_cmp_lt_u32", "vcc = (v[1] < v[2]);"},
+        {0xC2, "v_cmp_eq_u32", "vcc = (v[1] == v[2]);"},
+        {0xC3, "v_cmp_le_u32", "vcc = (v[1] <= v[2]);"},
+        {0xC4, "v_cmp_gt_u32", "vcc = (v[1] > v[2]);"},
+        {0xC5, "v_cmp_ne_u32", "vcc = (v[1] != v[2]);"},
+        {0xC6, "v_cmp_ge_u32", "vcc = (v[1] >= v[2]);"},
+    };
+    for (const auto& tc : vopc_cases) {
+        std::vector<uint32_t> prog = {vopc(tc.op, 256 + 1, 2), sopp(1)};
+        auto dec = gpu::decode_rdna2(prog.data(), prog.size());
+        KX_CHECK(dec.size() == 2 && dec[0].mnemonic == tc.mnemonic, std::format("VOPC decode {}", tc.mnemonic));
+        auto ir = gpu::lift_rdna2_to_ir(dec);
+        KX_CHECK(ir.unknown_count == 0, std::format("VOPC lift {}", tc.mnemonic));
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        KX_CHECK(recomp.hlsl.find(tc.expected_hlsl) != std::string::npos,
+                 std::format("VOPC {} expected '{}' in:\n{}", tc.mnemonic, tc.expected_hlsl, recomp.hlsl));
+        auto dxil = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+        KX_CHECK(dxil.has_value(), std::format("VOPC {} DXC failed: {}", tc.mnemonic, dxil.error().message));
+    }
+
+    // 2. Verify unknown VOPC and SOPC predicates emit #error (never silently fall back)
+    {
+        std::vector<uint32_t> bad_vopc = {vopc(0xFF, 256 + 1, 2), sopp(1)};
+        auto ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(bad_vopc.data(), bad_vopc.size()));
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        KX_CHECK(recomp.hlsl.find("#error Unsupported RDNA2 VCmp predicate") != std::string::npos,
+                 "Unknown VOPC must emit #error");
+        KX_CHECK(!dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6").has_value(),
+                 "DXC must reject unknown VOPC predicate");
+    }
+    {
+        std::vector<uint32_t> bad_sopc = {sopc(0x3F, 0, 1), sopp(1)};
+        auto ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(bad_sopc.data(), bad_sopc.size()));
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        KX_CHECK(recomp.hlsl.find("#error Unsupported RDNA2 SCmp predicate") != std::string::npos,
+                 "Unknown SOPC must emit #error");
+        KX_CHECK(!dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6").has_value(),
+                 "DXC must reject unknown SOPC predicate");
+    }
+
+    // 3. Verify all 12 SOPC predicates emit the exact HLSL comparison operator
+    struct SopcCase {
+        uint32_t op;
+        const char* expected_hlsl;
+    };
+    const SopcCase sopc_cases[] = {
+        {0, "scc = (s[0] == s[1]);"},
+        {1, "scc = (s[0] != s[1]);"},
+        {2, "scc = (asint(s[0]) > asint(s[1]));"},
+        {3, "scc = (asint(s[0]) >= asint(s[1]));"},
+        {4, "scc = (asint(s[0]) < asint(s[1]));"},
+        {5, "scc = (asint(s[0]) <= asint(s[1]));"},
+        {6, "scc = (s[0] == s[1]);"},
+        {7, "scc = (s[0] != s[1]);"},
+        {8, "scc = (s[0] > s[1]);"},
+        {9, "scc = (s[0] >= s[1]);"},
+        {10, "scc = (s[0] < s[1]);"},
+        {11, "scc = (s[0] <= s[1]);"},
+    };
+    for (const auto& tc : sopc_cases) {
+        std::vector<uint32_t> prog = {sopc(tc.op, 0, 1), sopp(1)};
+        auto ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(prog.data(), prog.size()));
+        auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+        KX_CHECK(recomp.hlsl.find(tc.expected_hlsl) != std::string::npos,
+                 std::format("SOPC op={} expected '{}'", tc.op, tc.expected_hlsl));
+    }
+
+    // 4. Verify all newly lifted scalar, branch, vector ALU, and global x2/x4 opcodes lift with 0 unknowns,
+    //    track max_sgpr/max_vgpr accurately, and compile cleanly with DXC
+    std::vector<uint32_t> prog;
+    prog.push_back(sop1(4, 14, 0));                           // s_mov_b64 s[14:15], s[0:1] -> max_sgpr >= 16
+    prog.push_back(sop1(7, 12, 0));                           // s_not_b32 s12, s0
+    prog.push_back(sop1(8, 16, 14));                          // s_not_b64 s[16:17], s[14:15] -> max_sgpr >= 18
+    prog.push_back(sop2(10, 13, 12, 14));                     // s_cselect_b32 s13, s12, s14
+    prog.push_back(sop2(4, 12, 12, 13));                      // s_addc_u32 s12, s12, s13
+    prog.push_back(sop2(5, 13, 12, 14));                      // s_subb_u32 s13, s12, s14
+    prog.push_back(sopp(8, 1));                               // s_cbranch_execz +1
+    prog.push_back(sopp(9, 1));                               // s_cbranch_execnz +1
+    global_mem(prog, 13, 10, 0, 127, 0);                      // global_load_dwordx2 v[10:11], v0
+    global_mem(prog, 14, 12, 0, 127, 0);                      // global_load_dwordx4 v[12:15], v0 -> max_vgpr >= 16
+    prog.push_back(vop2(17, 2, 256 + 10, 11));                // v_min_i32
+    prog.push_back(vop2(18, 2, 256 + 10, 11));                // v_max_i32
+    prog.push_back(vop2(19, 2, 256 + 10, 11));                // v_min_u32
+    prog.push_back(vop2(20, 2, 256 + 10, 11));                // v_max_u32
+    prog.push_back(vop2(39, 2, 256 + 10, 11));                // v_subrev_nc_u32
+    vop3(prog, 0x148, 3, 256 + 12, 128 + 4, 128 + 8);         // v_bfe_u32
+    vop3(prog, 0x14A, 4, 256 + 12, 256 + 13, 256 + 14);       // v_bfi_b32
+    vop3(prog, 0x151, 5, 256 + 12, 256 + 13, 256 + 14);       // v_med3_f32
+    vop3(prog, 0x143, 6, 256 + 12, 256 + 13, 256 + 14);       // v_mad_u32_u24
+    global_mem(prog, 29, 18, 0, 127, 0);                      // global_store_dwordx2 v0, v[18:19] -> max_vgpr >= 20
+    global_mem(prog, 30, 20, 0, 127, 0);                      // global_store_dwordx4 v0, v[20:23] -> max_vgpr >= 24
+    prog.push_back(sopp(1));                                  // s_endpgm
+
+    auto dec = gpu::decode_rdna2(prog.data(), prog.size());
+    auto ir = gpu::lift_rdna2_to_ir(dec);
+    KX_CHECK(ir.unknown_count == 0, std::format("Expected 0 unknown opcodes, got {}", ir.unknown_count));
+    KX_CHECK(ir.max_sgpr >= 18, std::format("Expected max_sgpr >= 18, got {}", ir.max_sgpr));
+    KX_CHECK(ir.max_vgpr >= 24, std::format("Expected max_vgpr >= 24, got {}", ir.max_vgpr));
+    KX_CHECK(ir.uses_wave_ops, "s_cbranch_execz/execnz must flag uses_wave_ops");
+
+    // Verify s_cbranch_execz and s_cbranch_execnz lifted to IrOp::CondBranch (not IrOp::Nop)
+    int exec_branches = 0;
+    for (const auto& blk : ir.blocks) {
+        for (const auto& inst : blk.insts) {
+            if (inst.op == gpu::IrOp::CondBranch &&
+                (inst.subop == "s_cbranch_execz" || inst.subop == "s_cbranch_execnz")) {
+                ++exec_branches;
+            }
+        }
+    }
+    KX_CHECK(exec_branches == 2, std::format("Expected 2 exec CondBranch ops, got {}", exec_branches));
+
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = gpu::WaveMode::Wave32});
+    KX_CHECK(recomp.hlsl.find("g_mem.Load2") != std::string::npos, "global_load_dwordx2 Load2");
+    KX_CHECK(recomp.hlsl.find("g_mem.Load4") != std::string::npos, "global_load_dwordx4 Load4");
+    KX_CHECK(recomp.hlsl.find("g_mem.Store2") != std::string::npos, "global_store_dwordx2 Store2");
+    KX_CHECK(recomp.hlsl.find("g_mem.Store4") != std::string::npos, "global_store_dwordx4 Store4");
+    KX_CHECK(recomp.hlsl.find("WaveActiveBallot(true)") != std::string::npos, "exec branch ballot check");
+    auto dxil = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    KX_CHECK(dxil.has_value(), dxil.error().message);
+}
+
+void test_rdna2_vcmp_bitfield_scalar64_globalx4_dual_gpu() {
+    // End-to-end hardware GPU execution verifying bit-exact results for:
+    //   v_cmp_ge_i32, v_cmp_ne_u32, v_bfe_u32, v_bfi_b32, v_med3_f32,
+    //   v_min_i32, v_max_i32, v_min_u32, v_max_u32, v_subrev_nc_u32, v_mad_u32_u24,
+    //   s_mov_b64, s_not_b32, s_not_b64, s_cselect_b32, s_addc_u32, s_subb_u32,
+    //   s_cbranch_execz, s_cbranch_execnz, global_load_dwordx4, global_store_dwordx4
+    using namespace gpu::encode;
+    std::vector<uint32_t> prog;
+
+    // Scalar prologue: exercise 64-bit SGPR move/not, carry/borrow chain, s_cselect_b32, exec branches
+    prog.push_back(sop1(4, 10, 0));           // s_mov_b64 s[10:11], s[0:1]   (s10=0xFFFFFFF0, s11=5)
+    prog.push_back(sop2(0, 12, 10, 2));       // s_add_u32 s12, s10, s2       (s12=0x10, scc=1)
+    prog.push_back(sop2(4, 13, 11, 128));     // s_addc_u32 s13, s11, 0       (s13=6, scc=0)
+    prog.push_back(sop2(1, 14, 12, 2));       // s_sub_u32 s14, s12, s2       (s14=0xFFFFFFF0, scc=1)
+    prog.push_back(sop2(5, 15, 13, 128));     // s_subb_u32 s15, s13, 0       (s15=5, scc=0)
+    prog.push_back(sopc(6, 15, 1));           // s_cmp_eq_u32 s15, s1         (scc=1)
+    prog.push_back(sop2(10, 16, 13, 15));     // s_cselect_b32 s16, s13, s15  (s16=6)
+    prog.push_back(sop1(7, 17, 16));          // s_not_b32 s17, s16           (s17=~6)
+    prog.push_back(sop1(8, 18, 10));          // s_not_b64 s[18:19], s[10:11] (s18=0x0F, s19=~5)
+    prog.push_back(sopp(8, 1));               // s_cbranch_execz +1           (NOT taken on active wave)
+    prog.push_back(sop2(0, 16, 16, 129));     // s_add_u32 s16, s16, 1        (s16=7)
+    prog.push_back(sopp(9, 1));               // s_cbranch_execnz +1          (TAKEN on active wave)
+    prog.push_back(sop1(3, 16, 128));         // s_mov_b32 s16, 0             (skipped)
+    prog.push_back(sop2(18, 20, 17, 19));     // s_xor_b32 s20, s17, s19      (3)
+    prog.push_back(sop2(0, 20, 20, 16));      // s_add_u32 s20, s20, s16      (10)
+    prog.push_back(sop2(0, 20, 20, 18));      // s_add_u32 s20, s20, s18      (25)
+    prog.push_back(sop2(0, 20, 20, 14));      // s_add_u32 s20, s20, s14      (9)
+
+    // Vector body per lane i in [0..63], 16-byte stride (4 dwords per lane)
+    prog.push_back(vop2(26, 1, 128 + 4, 0));  // v_lshlrev_b32 v1, 4, v0
+    global_mem(prog, 14, 4, 1, 127, 0);       // global_load_dwordx4 v[4:7], v1
+
+    // v8: v_cmp_ge_i32 + v_cmp_ne_u32 + v_min_i32 + v_max_i32 + v_subrev_nc_u32
+    prog.push_back(vop1(1, 2, 192 + 5));      // v_mov_b32 v2, -5
+    prog.push_back(vopc(0x86, 256 + 4, 2));   // v_cmp_ge_i32 vcc, v4, v2
+    prog.push_back(vop1(1, 3, 128 + 1));      // v_mov_b32 v3, 1
+    prog.push_back(vop2(1, 8, 128 + 0, 3));   // v_cndmask_b32 v8, 0, v3, vcc
+    prog.push_back(vop1(1, 2, 255));          // v_mov_b32 v2, 0x80000005u
+    prog.push_back(0x80000005u);
+    prog.push_back(vopc(0xC5, 256 + 7, 2));   // v_cmp_ne_u32 vcc, v7, v2
+    prog.push_back(vop1(1, 3, 128 + 2));      // v_mov_b32 v3, 2
+    prog.push_back(vop2(1, 13, 128 + 0, 3));  // v_cndmask_b32 v13, 0, v3, vcc
+    prog.push_back(vop2(28, 8, 256 + 8, 13)); // v_or_b32 v8, v8, v13
+    prog.push_back(vop2(17, 13, 192 + 5, 4)); // v_min_i32 v13, -5, v4
+    prog.push_back(vop2(18, 13, 192 + 15, 13)); // v_max_i32 v13, -15, v13
+    prog.push_back(vop2(39, 13, 128 + 20, 13)); // v_subrev_nc_u32 v13, 20, v13  (v13 - 20)
+    prog.push_back(vop2(26, 13, 128 + 4, 13));  // v_lshlrev_b32 v13, 4, v13
+    prog.push_back(vop2(37, 8, 256 + 8, 13));   // v_add_nc_u32 v8, v8, v13
+
+    // v9: v_bfe_u32 + v_bfi_b32
+    vop3(prog, 0x148, 9, 256 + 5, 128 + 8, 128 + 12);  // v_bfe_u32 v9, v5, 8, 12
+    vop3(prog, 0x14A, 9, 3, 256 + 5, 256 + 9);         // v_bfi_b32 v9, s3, v5, v9
+
+    // v10: v_med3_f32
+    vop3(prog, 0x151, 10, 256 + 6, 245, 244);          // v_med3_f32 v10, v6, -2.0, 2.0
+
+    // v11: v_mad_u32_u24 + v_min_u32 + v_max_u32 + scalar s20
+    vop3(prog, 0x143, 11, 256 + 7, 128 + 3, 20);       // v_mad_u32_u24 v11, v7, 3, s20
+    prog.push_back(vop2(19, 12, 128 + 50, 0));         // v_min_u32 v12, 50, v0
+    prog.push_back(vop2(20, 12, 128 + 10, 12));        // v_max_u32 v12, 10, v12
+    prog.push_back(vop2(37, 11, 256 + 11, 12));        // v_add_nc_u32 v11, v11, v12
+
+    global_mem(prog, 30, 8, 1, 127, 0);                // global_store_dwordx4 v1, v[8:11]
+    prog.push_back(sopp(1));                           // s_endpgm
+
+    auto dec = gpu::decode_rdna2(prog.data(), prog.size());
+    auto ir = gpu::lift_rdna2_to_ir(dec);
+    KX_CHECK(ir.unknown_count == 0, std::format("Expected 0 unknown opcodes, got {}", ir.unknown_count));
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "D3D12 adapters available");
+
+    constexpr uint32_t kLanes = 64;
+    std::vector<uint32_t> init_buf(kLanes * 4);
+    for (uint32_t i = 0; i < kLanes; ++i) {
+        const int32_t a_i = static_cast<int32_t>(i) - 32;
+        const uint32_t packed_i = 0xA5000000u | (i * 0x010203u);
+        const float f_i = static_cast<float>(static_cast<int32_t>(i) - 20) * 0.5f;
+        uint32_t f_bits = 0;
+        std::memcpy(&f_bits, &f_i, 4);
+        const uint32_t u_i = ((i & 1u) != 0u) ? 0x80000005u : (0x80000000u + i);
+        init_buf[i * 4 + 0] = static_cast<uint32_t>(a_i);
+        init_buf[i * 4 + 1] = packed_i;
+        init_buf[i * 4 + 2] = f_bits;
+        init_buf[i * 4 + 3] = u_i;
+    }
+
+    const uint32_t roots[8]{0xFFFFFFF0u, 0x00000005u, 0x00000020u, 0x12345678u, 0, 0, 0, 0};
+
+    int hw_verified = 0;
+    for (const auto& a : *adapters) {
+        if (a.is_software) continue;
+        std::vector<gpu::WaveMode> modes;
+        if (a.supports_wave32) modes.push_back(gpu::WaveMode::Wave32);
+        if (a.supports_wave64) modes.push_back(gpu::WaveMode::Wave64);
+        if (modes.empty()) modes.push_back(gpu::WaveMode::Wave32);
+
+        for (gpu::WaveMode mode : modes) {
+            auto recomp = gpu::emit_hlsl_from_ir(ir, {.wave_mode = mode, .group_size_x = 64});
+            auto dxil = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+            KX_CHECK(dxil.has_value(), dxil.error().message);
+            auto res = gpu::run_compute_dxil_on_gpu(a.index, dxil->dxil, init_buf, roots, 1);
+            KX_CHECK(res.has_value(), res.error().message);
+
+            for (uint32_t i = 0; i < kLanes; ++i) {
+                const int32_t a_i = static_cast<int32_t>(i) - 32;
+                const uint32_t packed_i = 0xA5000000u | (i * 0x010203u);
+                const float f_i = static_cast<float>(static_cast<int32_t>(i) - 20) * 0.5f;
+                const uint32_t u_i = ((i & 1u) != 0u) ? 0x80000005u : (0x80000000u + i);
+
+                const uint32_t cmp_bits = ((a_i >= -5) ? 1u : 0u) | ((u_i != 0x80000005u) ? 2u : 0u);
+                const int32_t clamped_i = std::max(-15, std::min(-5, a_i));
+                const uint32_t subrev_u = static_cast<uint32_t>(clamped_i) - 20u;
+                const uint32_t exp0 = cmp_bits + (subrev_u << 4);
+
+                const uint32_t bfe = (packed_i >> 8) & 0xFFFu;
+                const uint32_t exp1 = (roots[3] & packed_i) | ((~roots[3]) & bfe);
+
+                const float med = std::max(-2.0f, std::min(2.0f, f_i));
+                uint32_t exp2 = 0;
+                std::memcpy(&exp2, &med, 4);
+
+                const uint32_t s20 = 9u;
+                const uint32_t clamped_u = std::max(10u, std::min(50u, i));
+                const uint32_t exp3 = ((u_i & 0xFFFFFFu) * 3u) + s20 + clamped_u;
+
+                KX_CHECK(res->output_u32[i * 4 + 0] == exp0,
+                         std::format("GPU {} Wave{} lane {} out0: got {:#x} != {:#x}",
+                                     a.name, static_cast<uint32_t>(mode), i, res->output_u32[i * 4 + 0], exp0));
+                KX_CHECK(res->output_u32[i * 4 + 1] == exp1,
+                         std::format("GPU {} Wave{} lane {} out1: got {:#x} != {:#x}",
+                                     a.name, static_cast<uint32_t>(mode), i, res->output_u32[i * 4 + 1], exp1));
+                KX_CHECK(res->output_u32[i * 4 + 2] == exp2,
+                         std::format("GPU {} Wave{} lane {} out2: got {:#x} != {:#x}",
+                                     a.name, static_cast<uint32_t>(mode), i, res->output_u32[i * 4 + 2], exp2));
+                KX_CHECK(res->output_u32[i * 4 + 3] == exp3,
+                         std::format("GPU {} Wave{} lane {} out3: got {:#x} != {:#x}",
+                                     a.name, static_cast<uint32_t>(mode), i, res->output_u32[i * 4 + 3], exp3));
+            }
+            std::cout << std::format("    -> Hardware verified VCmp/Bitfield/Scalar64/GlobalX4: [{}] {} | Wave{} | 64/64 lanes bit-exact\n",
+                                     a.index, a.name, static_cast<uint32_t>(mode));
+        }
+        ++hw_verified;
+    }
+    KX_CHECK(hw_verified >= 1, "at least one hardware GPU verified for VCmp/Bitfield/Scalar64/GlobalX4");
+}
+
+
 }  // namespace
 
 int main() {
@@ -4593,6 +4890,8 @@ int main() {
     run_test("RDNA2 Mesh (ms_6_6) & Amplification (as_6_6) Decode, IR Lift, HLSL & DXC Compile", test_rdna2_mesh_amplification_decode_ir_dxc);
     run_test("RDNA2 Mesh/Amplification DispatchMesh Quad Rasterization & Hardware Parity", test_rdna2_mesh_shader_dispatch_mesh_hardware_parity);
     run_test("D3D12.X KxDeviceProxy KXRM/KXRA/KXRP Stream PSO Recompilation & Disk Cache", test_d3d12x_mesh_stream_pso_recompilation);
+    run_test("RDNA2 VCmp/SCmp All Predicates & Lifted Scalar/Branch/ALU/GlobalX4 Emission", test_rdna2_vcmp_scmp_and_lifted_opcodes_emission);
+    run_test("RDNA2 VCmp + Bitfield + Scalar64 + GlobalX4 Compute on Dual-GPU Hardware", test_rdna2_vcmp_bitfield_scalar64_globalx4_dual_gpu);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

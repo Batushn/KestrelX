@@ -52,13 +52,14 @@ enum class IrOp : uint8_t {
     VFractF32,
     VCmp,
     VCndMask,
-    // Memory & LDS
+    // Memory, LDS & Graphics Export
     SLoadDword,
     GlobalLoadDword,
     GlobalStoreDword,
     DsReadB32,
     DsWriteB32,
     Barrier,
+    Exp,
     // Control flow
     Branch,
     CondBranch,
@@ -95,7 +96,11 @@ struct IrInst {
     IrOperand src0;
     IrOperand src1;
     IrOperand src2;
+    IrOperand src3;
     uint32_t offset = 0;
+    uint8_t exp_target = 0;
+    uint8_t exp_en = 0;
+    bool exp_done = false;
     bool clamp = false;
     uint32_t target_block = 0;
     bool branch_on_true = true;
@@ -117,6 +122,7 @@ struct IrFunction {
     uint32_t inst_count = 0;
     uint32_t unknown_count = 0;
     bool uses_lds = false;
+    bool uses_mem = false;
 };
 
 IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded);

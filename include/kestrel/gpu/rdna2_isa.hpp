@@ -36,12 +36,15 @@ struct DecodedInst {
     uint32_t src0 = 0;
     uint32_t src1 = 0;
     uint32_t src2 = 0;
+    uint32_t src3 = 0;
     int32_t simm16 = 0;
     bool has_literal = false;
     uint32_t literal = 0;
     uint32_t offset = 0;
     uint8_t abs_mask = 0;
     uint8_t neg_mask = 0;
+    uint8_t exp_en = 0;
+    bool exp_done = false;
     bool clamp = false;
     bool is_branch = false;
     bool is_terminator = false;
@@ -103,6 +106,17 @@ inline void smem(std::vector<uint32_t>& out, uint32_t op, uint32_t sdst, uint32_
 inline void ds(std::vector<uint32_t>& out, uint32_t op, uint32_t vdst, uint32_t addr, uint32_t data0 = 0, uint32_t data1 = 0, uint16_t offset = 0) {
     const uint32_t w0 = (0x36u << 26) | ((op & 0xFFu) << 18) | offset;
     const uint32_t w1 = ((vdst & 0xFFu) << 24) | ((data1 & 0xFFu) << 16) | ((data0 & 0xFFu) << 8) | (addr & 0xFFu);
+    out.push_back(w0);
+    out.push_back(w1);
+}
+// GFX10.3 EXP target constants: 0..7 = mrt0..7, 12..15 = pos0..3, 32..63 = param0..31
+inline void exp(std::vector<uint32_t>& out, uint8_t target, uint8_t en_mask,
+                uint32_t vsrc0, uint32_t vsrc1, uint32_t vsrc2, uint32_t vsrc3,
+                bool done = false, bool compr = false) {
+    const uint32_t w0 = (0x3Eu << 26) | (done ? (1u << 11) : 0u) | (compr ? (1u << 10) : 0u) |
+                        ((static_cast<uint32_t>(target) & 0x3Fu) << 4) | (static_cast<uint32_t>(en_mask) & 0xFu);
+    const uint32_t w1 = ((vsrc3 & 0xFFu) << 24) | ((vsrc2 & 0xFFu) << 16) |
+                        ((vsrc1 & 0xFFu) << 8) | (vsrc0 & 0xFFu);
     out.push_back(w0);
     out.push_back(w1);
 }

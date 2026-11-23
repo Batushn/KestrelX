@@ -37,7 +37,11 @@ Instead of patching driver internals in-place or translating GPU instructions wi
 
 ---
 
-## Current Status (v0.2.0 — Verified on Dual-GPU Hardware)
+## Current Status (v0.3.0 — Visual First Light on Dual-GPU Hardware)
+
+![KestrelX Visual First Light — Raw RDNA2 (GFX10.3) Vertex & Pixel Shaders dynamically recompiled to SM 6.6 DXIL and rasterized on D3D12 Ultimate](docs/first_light.png)
+
+*Above: 256×256 hardware frame captured directly from `D3D12PresentX` — rendered by the clean-room Xbox-ABI guest binary (`kestrel_test_title.exe`) submitting raw GFX10.3 RDNA2 Vertex (`KXRV`) & Pixel (`KXRP`) microcode through `KxDeviceProxy::CreateGraphicsPipelineState` → CFG IR → SM 6.6 `vs_6_6`/`ps_6_6` DXIL → D3D12 Ultimate. Verified on both **NVIDIA RTX 4060** and **AMD Radeon 780M** (max cross-vendor channel delta: `1/255`).*
 
 Everything below is implemented, builds cleanly with MSVC `/W4 /permissive-` (zero warnings), and passes on real hardware:
 
@@ -47,16 +51,18 @@ Everything below is implemented, builds cleanly with MSVC `/W4 /permissive-` (ze
 - **HLE Runtime:**
   - `kernelx.dll` / `xmem.dll`: `XMemAlloc`, `XMemFree`, `XMemSize`, `TitleMemoryStatus`, `GetConsoleType`, and VFS-intercepted `CreateFileA`, `CreateFileW`, `DeleteFileA`, `DeleteFileW`, `GetFileAttributesExW`.
   - `xgameruntime.dll`: `XGameGetXboxTitleId`, `XSystemGetDeviceType`, `XTaskQueueCreate`, `XTaskQueueSubmitCallback`, `XTaskQueueDispatch`, `XTaskQueueCloseHandle`.
-  - `d3d12_xs.dll` / `d3d12_x.dll`: `D3D12CreateDevice`, `D3D12XboxCreateDevice`, `D3D12ZeroMemoryX`, `D3D12SerializeRootSignature`, `D3D12PresentX`, `D3D12WaitFrameEventX`, pure COM `KxDeviceProxy` (`ID3D12Device`) with live `"KXRN"` RDNA2→DXIL compute PSO auto-recompilation & FNV-1a pipeline cache, and `KxCommandQueueProxy` (`ID3D12CommandQueue`).
+  - `d3d12_xs.dll` / `d3d12_x.dll`: `D3D12CreateDevice`, `D3D12XboxCreateDevice`, `D3D12ZeroMemoryX`, `D3D12SerializeRootSignature`, `D3D12PresentX`, `D3D12WaitFrameEventX`, pure COM `KxDeviceProxy` (`ID3D12Device`) with live `"KXRN"` (CS) / `"KXRV"` (VS) / `"KXRP"` (PS) RDNA2→DXIL PSO auto-recompilation & FNV-1a pipeline cache, `KxCommandQueueProxy` (`ID3D12CommandQueue`), and optional Win32 `WindowHost` + DXGI flip-model swapchain (`IDXGISwapChain3`) + headless BMP frame capture.
+  - `gameinput.dll`: Clean-room `GameInputCreate` COM bridge backed by Windows XInput (`xinput1_4.dll`), keyboard fallback, and deterministic mock provider.
+  - `xaudio2_9.dll` / `xaudio2_8.dll`: Clean-room `XAudio2Create` mastering/source voice lifecycle with thread-safe stereo float32/int16 PCM ring buffer, RMS energy metering, and underrun tracking.
 - **GPU & Shader Pipeline:**
   - GFX10.3 (RDNA2) instruction decoder & disassembler (`SOP1/2/C/K/P`, `VOP1/2/C/3`, `FLAT/GLOBAL`, `SMEM`, `MUBUF`, `DS`, `EXP`).
   - DXBC/DXIL shader container parser.
-  - CFG basic-block IR lifter (`lift_rdna2_to_ir`) covering `SOP`/`VOP`/`FLAT`/`SMEM`/`DS` (LDS) + `s_barrier` workgroup sync, with strict `#error` refusal on unsupported opcodes (no silent NOP emission).
-  - Dual-target SM 6.6 HLSL emitter (`[WaveSize(32)]` and `[WaveSize(64)]`) with structured CFG switch dispatch and 32 KB DXIL-compliant TGSM (`groupshared uint g_lds[8192]`) + `GroupMemoryBarrierWithGroupSync()`.
+  - CFG basic-block IR lifter (`lift_rdna2_to_ir`) covering `SOP`/`VOP`/`FLAT`/`SMEM`/`DS` (LDS) + `s_barrier` + `EXP` (`pos0`/`param0`/`mrt0`), with strict `#error` refusal on unsupported opcodes (no silent NOP emission).
+  - Multi-stage SM 6.6 HLSL emitter: dual-wave Compute (`[WaveSize(32)]` / `[WaveSize(64)]`, 32 KB DXIL-compliant TGSM `groupshared uint g_lds[8192]`), Vertex (`vs_6_6`), and Pixel (`ps_6_6`).
   - In-process DXC compiler (`IDxcCompiler3` via Windows SDK `dxcompiler.dll` + `dxil.dll`).
   - Clean-room GFX10 2D texture swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block-compressed tiling, and 256B-aligned multi-level mip-chain layout (`compute_gfx10_mip_chain`).
 
-> **Scope note:** KestrelX is in active early development (`v0.2.0`). It does **not** yet boot commercial Xbox Series X|S games; retail title compatibility requires expanding HLE coverage, full RDNA2 graphics shader stages (VS/PS/MS/AS/RT), descriptor/root-signature translation, and window/audio/input layers. See the [Roadmap](#roadmap) and open issues to get involved.
+> **Scope note:** KestrelX is in active early development (`v0.3.0`). It does **not** yet boot commercial Xbox Series X|S games; retail title compatibility requires expanding RDNA2 ISA coverage (`MUBUF`/`MTBUF`, `IMAGE_SAMPLE`, wave intrinsics, mesh/amplification stages), descriptor/root-signature translation, and broader GDK/Win32 HLE coverage. See the [Roadmap](#roadmap) and open issues to get involved.
 
 ---
 
@@ -80,13 +86,16 @@ KestrelX Verification Suite
     -> Hardware verified LDS+SMEM: [1] AMD Radeon(TM) 780M | Wave32 | 64/64 reversed+added bit-exact
     -> Hardware verified LDS+SMEM: [1] AMD Radeon(TM) 780M | Wave64 | 64/64 reversed+added bit-exact
   [PASS] RDNA2 SMEM + DS (LDS) + s_barrier Workgroup Shuffle on Dual-GPU Hardware
+  [PASS] RDNA2 EXP Vertex & Pixel (vs_6_6 / ps_6_6) Decode, IR Lift & DXC Compile
   [PASS] Strict recompiler refusal of unsupported RDNA2 opcodes
   [PASS] GFX10 2D texture swizzle/deswizzle round-trip (all 7 modes)
   [PASS] GFX10 BC1/BC7 block-compressed tiling & 5-level mip-chain layout
-    -> Guest title PASS: HLE_imports=20, GuestDLL_imports=2, TLS=1, D3D12X(dev=1, q=1, res=2, pso_recomp=1, cache_hit=1, present=1)
-  [PASS] End-to-end PE32+ Loader + Guest DLL + TLS + SEH + Wide-VFS + KxDeviceProxy PSO Auto-Recomp + PresentX
+  [PASS] GameInput -> XInput/Win32 controller bridge & mock verification
+  [PASS] XAudio2 stereo PCM ring-buffer, RMS energy & underrun verification
+    -> Guest title PASS: HLE_imports=22, GuestDLL_imports=2, TLS=1, D3D12X(dev=1, q=1, res=2, cs_pso=1, gfx_pso=2, cache_hit=3, present=1), GI(reads=1), XA2(frames=64)
+  [PASS] End-to-end PE32+ Loader + Guest DLL + Wide-VFS + GameInput + XAudio2 + RDNA2 VS/PS First Light
 
-Summary: 11 passed, 0 failed
+Summary: 14 passed, 0 failed
 ```
 
 CLI end-to-end run:
@@ -96,9 +105,9 @@ DXC loaded: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxcompil
 PASS [0] NVIDIA GeForce RTX 4060 Laptop GPU (Wave32, DXIL=3204 bytes, 0.814 ms, 64/64 lanes bit-exact)
 PASS [1] AMD Radeon(TM) 780M (Wave64, DXIL=3188 bytes, 0.169 ms, 64/64 lanes bit-exact)
 
-$ .\build\Release\kestrel.exe run build\Release\test_title
-Loaded kestrel_test_title.exe @ 0x0000000140000000 (relocs=0, hle_imports=20, guest_imports=2, host_imports=7, stubs=0)
-Guest exited with code 0 | D3D12.X(dev=1, q=1, cmd=1, res=2, pso_recomp=1, cache_hit=1, present=1) | KernelX(allocs=1, frees=1, peak=4096 B)
+$ .\build\Release\kestrel.exe run build\Release\test_title --capture first_light.bmp
+Loaded kestrel_test_title.exe @ 0x0000000140000000 (relocs=0, hle_imports=22, guest_imports=2, host_imports=8, stubs=0)
+Guest exited with code 0 | D3D12.X(dev=1, q=1, cmd=1, res=2, cs_pso=1, gfx_pso=2, cache_hit=3, present=1) | KernelX(allocs=1, peak=4096 B) | GameInput(reads=1) | XAudio2(frames=64)
 ```
 
 ---
@@ -130,8 +139,9 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Config Release
 # Run RDNA2 -> IR -> HLSL -> DXC -> GPU hardware self-test on all adapters
 .\build\Release\kestrel.exe selftest
 
-# Run the clean-room guest test title via PeLoader + Overlay VFS + KxDeviceProxy
-.\build\Release\kestrel.exe run build\Release\test_title
+# Run the clean-room guest test title (headless + BMP capture or live Win32 DXGI window)
+.\build\Release\kestrel.exe run build\Release\test_title --capture first_light.bmp
+.\build\Release\kestrel.exe run build\Release\test_title --windowed
 ```
 
 ---
@@ -144,22 +154,22 @@ include/kestrel/
   loader/    # MicrosoftGame.config parser, PE32+ parser, native PeLoader
   cpu/       # VEH AMD Zen 2 instruction decoder & emulator
   vfs/       # Copy-on-Write Overlay VFS with whiteouts
-  hle/       # HLE registry + call-counting stub thunks, kernelx, xgameruntime, d3d12x COM proxy
-  gpu/       # RDNA2 ISA decoder, DXBC parser, CFG IR, dual-wave HLSL recompiler, DXC, GPU runner, GFX10 tiling
+  hle/       # HLE registry + stub thunks, kernelx, xgameruntime, d3d12x COM proxy, WindowHost, GameInput, XAudio2
+  gpu/       # RDNA2 ISA decoder, DXBC parser, CFG IR, multi-stage HLSL recompiler, DXC, GPU runner, GFX10 tiling
 src/         # Corresponding C++23 implementations + CLI (src/cli/main.cpp)
 tests/       # Unit/GPU test runner + clean-room Xbox-ABI guest test title & fixtures
-docs/        # Architecture documentation
+docs/        # Architecture documentation & First-Light hardware capture
 ```
 
 ---
 
 ## Roadmap
 
-- [x] **v0.2 Foundation:** `SMEM` + `DS` (LDS) + `s_barrier` dual-GPU workgroup shuffle, strict unsupported-opcode refusal, `KxCommandQueueProxy` + live `"KXRN"` RDNA2 compute PSO auto-recompilation & FNV-1a cache + `PresentX`/`WaitFrameEventX`, wide-char VFS hooks (`CreateFileW`/`DeleteFileA`/`DeleteFileW`/`GetFileAttributesExW`), and BC1/BC7 + 5-level mip-chain GFX10 tiling.
-- [ ] **Graphics Shader Pipeline (`v0.3`):** RDNA2 `EXP` vertex/pixel exports, `MUBUF`/`MTBUF` structured buffers, wave intrinsics (`WaveActiveBallot` / `WaveReadLaneAt` for `v_readlane_b32` & `s_and_saveexec`), and `CreateGraphicsPipelineState` auto-recompilation in `KxDeviceProxy`.
-- [ ] **Window & Swapchain Presentation:** Win32 window host + DXGI flip-model swapchain (`IDXGISwapChain3`) wired directly to `KxCommandQueueProxy` & `D3D12PresentX`.
-- [ ] **Audio & Input HLE:** XAudio2 / WASAPI audio bridge and `GameInput` → XInput/Win32 controller bridge.
-- [ ] **Async I/O & Extended GDK HLE:** `CreateFile2`, `ReadFileEx`, WinStorage/DirectStorage stubs, `XUser` / `XStore` / `XPackage` runtime stubs, and `ID3D12Device1..10` COM proxy coverage.
+- [x] **v0.2 Foundation:** `SMEM` + `DS` (LDS) + `s_barrier` dual-GPU workgroup shuffle, strict unsupported-opcode refusal, `KxCommandQueueProxy` + live `"KXRN"` RDNA2 compute PSO auto-recompilation & FNV-1a cache + `PresentX`/`WaitFrameEventX`, wide-char VFS hooks, and BC1/BC7 + 5-level mip-chain GFX10 tiling.
+- [x] **v0.3 Visual First Light:** RDNA2 `EXP` (`pos0`/`param0`/`mrt0`) Vertex & Pixel (`vs_6_6`/`ps_6_6`) shader pipeline, `KxDeviceProxy::CreateGraphicsPipelineState` live auto-recompilation & cache, Win32 `WindowHost` + DXGI flip-model swapchain (`IDXGISwapChain3`) + headless BMP capture, `GameInput` → XInput/Win32 controller bridge, and `XAudio2` stereo PCM ring-buffer bridge.
+- [ ] **Shader Recompiler v0.4:** `MUBUF`/`MTBUF` structured buffers, `MIMG` (`image_sample` / `image_load`), wave intrinsics (`WaveActiveBallot` / `WaveReadLaneAt` for `v_readlane_b32` & `s_and_saveexec`), and persistent on-disk DXIL shader cache.
+- [ ] **D3D12.X Proxy Expansion:** `ID3D12Device1..10` COM proxy coverage, `KxGraphicsCommandListProxy` with draw/dispatch telemetry & resource-state validation, and textured 3D cube benchmark title.
+- [ ] **Async I/O, WASAPI Playback & Extended GDK HLE:** Live WASAPI shared-mode audio output thread, `CreateFile2`/`ReadFileEx` + DirectStorage stubs, and `XUser`/`XStore`/`XPackage` runtime stubs.
 
 ---
 

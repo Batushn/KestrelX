@@ -6,8 +6,10 @@
 #include "kestrel/gpu/rdna2_isa.hpp"
 #include "kestrel/gpu/rdna2_recomp.hpp"
 #include "kestrel/hle/d3d12x.hpp"
+#include "kestrel/hle/gameinput.hpp"
 #include "kestrel/hle/kernelx.hpp"
 #include "kestrel/hle/registry.hpp"
+#include "kestrel/hle/xaudio2.hpp"
 #include "kestrel/hle/xgameruntime.hpp"
 #include "kestrel/loader/game_config.hpp"
 #include "kestrel/loader/pe_image.hpp"
@@ -36,7 +38,7 @@ void print_usage() {
         "  kestrel inspect <dir|pe>          Inspect MicrosoftGame.config and/or PE32+ Xbox imports\n"
         "  kestrel disasm <shader.bin>       Decode & disassemble raw RDNA2 (GFX10.3) microcode\n"
         "  kestrel selftest [--adapter N]    Run RDNA2 -> IR -> HLSL -> DXC -> real GPU execution test\n"
-        "  kestrel run <dir|exe> [--adapter N] [--data-dir <dir>]\n"
+        "  kestrel run <dir|exe> [--adapter N] [--data-dir <dir>] [--windowed] [--capture <out.bmp>]\n"
         "                                    Load & execute an Xbox-ABI PE title with Overlay VFS & KxDeviceProxy\n";
 }
 
@@ -199,7 +201,7 @@ int cmd_selftest(int adapter_filter) {
     return 0;
 }
 
-int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir) {
+int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir, bool windowed, const fs::path& capture_path) {
     fs::path game_root = fs::is_directory(target) ? target : target.parent_path();
     fs::path exe_path = target;
     uint32_t title_id = 0x4B580001u;
@@ -232,9 +234,13 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir) {
     hle::set_kernelx_vfs(&overlay);
     hle::set_xgameruntime_title_id(title_id);
     hle::set_d3d12x_preferred_adapter(adapter_index);
+    hle::set_d3d12x_windowed(windowed, 512, 512);
+    hle::set_d3d12x_capture_path(capture_path);
     hle::register_kernelx(registry);
     hle::register_xgameruntime(registry);
     hle::register_d3d12x(registry);
+    hle::register_gameinput(registry);
+    hle::register_xaudio2(registry);
 
     cpu::ScopedVehShim veh;
     loader::PeLoader pe_loader(registry, game_root);
@@ -242,6 +248,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir) {
     auto mod = pe_loader.load_image(exe_path);
     if (!mod) {
         std::cerr << "PE load failed: " << mod.error().message << "\n";
+        hle::shutdown_d3d12x_window();
         return 1;
     }
 
@@ -252,6 +259,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir) {
         (*mod)->host_imports, (*mod)->stub_imports);
 
     auto rc = pe_loader.execute_entry(**mod);
+    hle::shutdown_d3d12x_window();
     if (!rc) {
         std::cerr << "Guest execution error: " << rc.error().message << "\n";
         return 1;
@@ -259,11 +267,14 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir) {
 
     const auto d3d = hle::d3d12x_stats();
     const auto kx = hle::kernelx_stats();
+    const auto gi = hle::gameinput_stats();
+    const auto xa = hle::xaudio2_stats();
     std::cout << std::format(
-        "Guest exited with code {} | D3D12.X(dev={}, q={}, cmd={}, res={}, pso_recomp={}, cache_hit={}, present={}) | KernelX(allocs={}, frees={}, peak={} B)\n",
+        "Guest exited with code {} | D3D12.X(dev={}, q={}, cmd={}, res={}, cs_pso={}, gfx_pso={}, cache_hit={}, present={}) | KernelX(allocs={}, peak={} B) | GameInput(reads={}) | XAudio2(frames={})\n",
         *rc, d3d.devices_created, d3d.queues_created, d3d.cmd_lists_created,
-        d3d.resources_created, d3d.pso_recompiled, d3d.pso_cache_hits, d3d.present_calls,
-        kx.alloc_count, kx.free_count, kx.peak_bytes);
+        d3d.resources_created, d3d.pso_recompiled, d3d.gfx_pso_recompiled,
+        d3d.pso_cache_hits + d3d.gfx_pso_cache_hits, d3d.present_calls,
+        kx.alloc_count, kx.peak_bytes, gi.readings_polled, xa.frames_submitted);
     return *rc;
 }
 
@@ -281,14 +292,18 @@ int main(int argc, char** argv) {
 
     int adapter = -1;
     fs::path data_dir;
+    bool windowed = false;
+    fs::path capture_path;
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--adapter" && i + 1 < argc) adapter = std::stoi(argv[++i]);
         else if (arg == "--data-dir" && i + 1 < argc) data_dir = argv[++i];
+        else if (arg == "--windowed") windowed = true;
+        else if (arg == "--capture" && i + 1 < argc) capture_path = argv[++i];
     }
 
     if (cmd == "selftest") return cmd_selftest(adapter);
-    if (cmd == "run" && argc >= 3) return cmd_run(argv[2], adapter, data_dir);
+    if (cmd == "run" && argc >= 3) return cmd_run(argv[2], adapter, data_dir, windowed, capture_path);
 
     print_usage();
     return 1;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(KestrelX VERSION 0.2.0 LANGUAGES CXX)
+project(KestrelX VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +32,9 @@ add_library(kestrel_core STATIC
     src/hle/kernelx.cpp
     src/hle/xgameruntime.cpp
     src/hle/d3d12x.cpp
+    src/hle/window_host.cpp
+    src/hle/gameinput.cpp
+    src/hle/xaudio2.cpp
     src/gpu/rdna2_isa.cpp
     src/gpu/shader_container.cpp
     src/gpu/ir.cpp
@@ -41,14 +44,14 @@ add_library(kestrel_core STATIC
     src/gpu/gfx10_tiling.cpp
 )
 target_include_directories(kestrel_core PUBLIC include)
-target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32)
+target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32 user32 gdi32)
 
 add_executable(kestrel src/cli/main.cpp)
 target_link_libraries(kestrel PRIVATE kestrel_core)
 
 # Synthetic console import libraries so our clean-room test title links against
-# console DLL names (kernelx.dll, xgameruntime.dll, d3d12_xs.dll) without
-# needing any proprietary SDK files.
+# console DLL names (kernelx.dll, xgameruntime.dll, d3d12_xs.dll, gameinput.dll,
+# xaudio2_9.dll) without needing any proprietary SDK files.
 set(STUB_LIB_DIR "${CMAKE_BINARY_DIR}/stub_libs")
 file(MAKE_DIRECTORY "${STUB_LIB_DIR}")
 
@@ -66,6 +69,8 @@ endfunction()
 add_stub_import_lib(kernelx tests/test_title/defs/kernelx.def)
 add_stub_import_lib(xgameruntime tests/test_title/defs/xgameruntime.def)
 add_stub_import_lib(d3d12_xs tests/test_title/defs/d3d12_xs.def)
+add_stub_import_lib(gameinput tests/test_title/defs/gameinput.def)
+add_stub_import_lib(xaudio2_9 tests/test_title/defs/xaudio2_9.def)
 
 # Clean-room Xbox-ABI guest DLL and executable for end-to-end loader/HLE/D3D12.X verification
 add_library(kestrel_test_dll SHARED tests/test_title/guest_dll.cpp)
@@ -81,12 +86,14 @@ add_executable(kestrel_test_title tests/test_title/main.cpp)
 target_include_directories(kestrel_test_title PRIVATE tests/test_title)
 target_compile_options(kestrel_test_title PRIVATE /GS-)
 target_link_options(kestrel_test_title PRIVATE /ENTRY:KestrelGuestEntry /DYNAMICBASE)
-add_dependencies(kestrel_test_title stub_kernelx stub_xgameruntime stub_d3d12_xs kestrel_test_dll)
+add_dependencies(kestrel_test_title stub_kernelx stub_xgameruntime stub_d3d12_xs stub_gameinput stub_xaudio2_9 kestrel_test_dll)
 target_link_libraries(kestrel_test_title PRIVATE
     kestrel_test_dll
     "${STUB_LIB_DIR}/kernelx.lib"
     "${STUB_LIB_DIR}/xgameruntime.lib"
     "${STUB_LIB_DIR}/d3d12_xs.lib"
+    "${STUB_LIB_DIR}/gameinput.lib"
+    "${STUB_LIB_DIR}/xaudio2_9.lib"
     vcruntime
 )
 set_target_properties(kestrel_test_title PROPERTIES

@@ -4,6 +4,7 @@
 #include <d3d12.h>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 
 namespace kestrel::hle {
 
@@ -16,6 +17,8 @@ struct D3D12XStats {
     uint64_t present_calls = 0;
     uint64_t pso_recompiled = 0;
     uint64_t pso_cache_hits = 0;
+    uint64_t gfx_pso_recompiled = 0;
+    uint64_t gfx_pso_cache_hits = 0;
 };
 
 // Pure COM wrapper around ID3D12CommandQueue (zero driver vtable patching).
@@ -118,6 +121,9 @@ private:
 };
 
 void set_d3d12x_preferred_adapter(int adapter_index);
+void set_d3d12x_windowed(bool enabled, uint32_t width = 640, uint32_t height = 640);
+void set_d3d12x_capture_path(const std::filesystem::path& bmp_path);
+void shutdown_d3d12x_window();
 void register_d3d12x(Registry& reg);
 D3D12XStats d3d12x_stats();
 void reset_d3d12x_stats();

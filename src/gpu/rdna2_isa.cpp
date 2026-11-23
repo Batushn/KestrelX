@@ -331,9 +331,16 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             else if (d.opcode == 54) d.mnemonic = "ds_read_b32";
             else d.mnemonic = std::format("ds_{}", d.opcode);
         } else if ((w0 >> 26) == 0x3Eu && i + 1 < count) {
+            const uint32_t w1 = words[i + 1];
             d.size = 8;
             d.enc = Encoding::EXP;
-            d.opcode = (w0 >> 4) & 0x3Fu;
+            d.opcode = (w0 >> 4) & 0x3Fu;  // target
+            d.exp_en = static_cast<uint8_t>(w0 & 0xFu);
+            d.exp_done = ((w0 >> 11) & 1u) != 0;
+            d.src0 = w1 & 0xFFu;
+            d.src1 = (w1 >> 8) & 0xFFu;
+            d.src2 = (w1 >> 16) & 0xFFu;
+            d.src3 = (w1 >> 24) & 0xFFu;
             d.mnemonic = "exp";
         } else if ((w0 >> 25) == 0x3Fu) {
             d.enc = Encoding::VOP1;
@@ -402,6 +409,14 @@ std::string disassemble_inst(const DecodedInst& d) {
                                format_rdna2_operand(d.src2, d.has_literal, d.literal));
         case Encoding::FLAT:
             return std::format("{} v{}, v{}, off:{:#x}", d.mnemonic, d.dst, d.src0, d.offset);
+        case Encoding::EXP: {
+            std::string tgt = (d.opcode <= 7) ? std::format("mrt{}", d.opcode)
+                              : (d.opcode >= 12 && d.opcode <= 15) ? std::format("pos{}", d.opcode - 12)
+                              : (d.opcode >= 32) ? std::format("param{}", d.opcode - 32)
+                              : std::format("tgt{}", d.opcode);
+            return std::format("exp {} v{}, v{}, v{}, v{}{}", tgt, d.src0, d.src1, d.src2, d.src3,
+                               d.exp_done ? " done" : "");
+        }
         default:
             return d.mnemonic;
     }

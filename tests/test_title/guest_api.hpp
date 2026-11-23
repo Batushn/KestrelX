@@ -50,4 +50,68 @@ __declspec(dllimport) void __stdcall D3D12ZeroMemoryX(void* dst, size_t size);
 __declspec(dllimport) HRESULT __stdcall D3D12PresentX(ID3D12CommandQueue* queue, uint32_t flags, const void* present_params, const void* flip_params);
 __declspec(dllimport) HRESULT __stdcall D3D12WaitFrameEventX(uint64_t token, uint32_t timeout_ms, void* out_event);
 
+// Clean-room GameInput guest ABI
+struct GuestGamepadState {
+    uint32_t buttons;
+    float left_trigger;
+    float right_trigger;
+    float left_thumbstick_x;
+    float left_thumbstick_y;
+    float right_thumbstick_x;
+    float right_thumbstick_y;
+};
+
+struct IGuestGameInputReading : public IUnknown {
+    virtual uint32_t STDMETHODCALLTYPE GetInputKind() = 0;
+    virtual uint64_t STDMETHODCALLTYPE GetTimestamp() = 0;
+    virtual bool STDMETHODCALLTYPE GetGamepadState(GuestGamepadState* state) = 0;
+};
+
+struct IGuestGameInput : public IUnknown {
+    virtual uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, void* dev, IGuestGameInputReading** out) = 0;
+};
+
+__declspec(dllimport) HRESULT __stdcall GameInputCreate(IGuestGameInput** out_gi);
+
+// Clean-room XAudio2 guest ABI
+struct GuestWaveFormat {
+    uint16_t format_tag;
+    uint16_t channels;
+    uint32_t sample_rate;
+    uint16_t bits_per_sample;
+};
+
+struct GuestAudioBuffer {
+    uint32_t flags;
+    uint32_t audio_bytes;
+    const uint8_t* audio_data;
+};
+
+struct IGuestMasteringVoice {
+    virtual ~IGuestMasteringVoice() = default;
+    virtual HRESULT STDMETHODCALLTYPE SetVolume(float volume) = 0;
+    virtual void STDMETHODCALLTYPE GetVolume(float* volume) = 0;
+    virtual void STDMETHODCALLTYPE DestroyVoice() = 0;
+};
+
+struct IGuestSourceVoice {
+    virtual ~IGuestSourceVoice() = default;
+    virtual HRESULT STDMETHODCALLTYPE Start(uint32_t flags) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Stop(uint32_t flags) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SubmitSourceBuffer(const GuestAudioBuffer* buf) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetVolume(float volume) = 0;
+    virtual uint32_t STDMETHODCALLTYPE GetBuffersQueued() = 0;
+    virtual void STDMETHODCALLTYPE DestroyVoice() = 0;
+};
+
+struct IGuestXAudio2 : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE CreateMasteringVoice(IGuestMasteringVoice** out, uint32_t ch, uint32_t sr) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateSourceVoice(IGuestSourceVoice** out, const GuestWaveFormat* fmt) = 0;
+    virtual HRESULT STDMETHODCALLTYPE StartEngine() = 0;
+    virtual void STDMETHODCALLTYPE StopEngine() = 0;
+};
+
+__declspec(dllimport) HRESULT __stdcall XAudio2Create(IGuestXAudio2** out_xa, uint32_t flags, uint32_t proc);
+
 }  // extern "C"

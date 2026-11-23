@@ -81,12 +81,15 @@ int test_d3d12x_render_and_readback() {
         return 106;
     }
 
+    constexpr uint32_t kRtW = 256;
+    constexpr uint32_t kRtH = 256;
+
     D3D12_HEAP_PROPERTIES default_hp{};
     default_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC tex_desc{};
     tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    tex_desc.Width = 64;
-    tex_desc.Height = 64;
+    tex_desc.Width = kRtW;
+    tex_desc.Height = kRtH;
     tex_desc.DepthOrArraySize = 1;
     tex_desc.MipLevels = 1;
     tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -95,9 +98,9 @@ int test_d3d12x_render_and_readback() {
 
     D3D12_CLEAR_VALUE cv{};
     cv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    cv.Color[0] = 64.0f / 255.0f;
-    cv.Color[1] = 128.0f / 255.0f;
-    cv.Color[2] = 191.0f / 255.0f;
+    cv.Color[0] = 18.0f / 255.0f;
+    cv.Color[1] = 26.0f / 255.0f;
+    cv.Color[2] = 46.0f / 255.0f;
     cv.Color[3] = 1.0f;
 
     ID3D12Resource* rt = nullptr;
@@ -106,6 +109,104 @@ int test_d3d12x_render_and_readback() {
                                             __uuidof(ID3D12Resource), reinterpret_cast<void**>(&rt)))) {
         rtv_heap->Release(); cmd->Release(); alloc->Release(); queue->Release(); dev->Release();
         return 107;
+    }
+
+    // Build empty Root Signature for graphics pipeline
+    D3D12_ROOT_SIGNATURE_DESC empty_rsd{};
+    ID3DBlob* gfx_rs_blob = nullptr;
+    ID3DBlob* gfx_rs_err = nullptr;
+    ID3D12RootSignature* gfx_rs = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&empty_rsd, D3D_ROOT_SIGNATURE_VERSION_1, &gfx_rs_blob, &gfx_rs_err)) ||
+        !gfx_rs_blob ||
+        FAILED(dev->CreateRootSignature(0, gfx_rs_blob->GetBufferPointer(), gfx_rs_blob->GetBufferSize(),
+                                        __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&gfx_rs)))) {
+        if (gfx_rs_blob) gfx_rs_blob->Release();
+        if (gfx_rs_err) gfx_rs_err->Release();
+        return 116;
+    }
+    gfx_rs_blob->Release();
+    if (gfx_rs_err) gfx_rs_err->Release();
+
+    // Clean-room RDNA2 (GFX10.3) Vertex Shader ("KXRV"):
+    //   v0 = SV_VertexID (0=Top Red, 1=Bottom-Right Green, 2=Bottom-Left Blue)
+    auto enc_vmov = [](uint32_t vd, uint32_t src0) -> uint32_t {
+        return (0x3Fu << 25) | ((vd & 0xFFu) << 17) | (1u << 9) | (src0 & 0x1FFu);
+    };
+    auto enc_vcmp_eq_u32 = [](uint32_t src0, uint32_t vsrc1) -> uint32_t {
+        return (0x3Eu << 25) | (0xC2u << 17) | ((vsrc1 & 0xFFu) << 9) | (src0 & 0x1FFu);
+    };
+    auto enc_vcndmask = [](uint32_t vd, uint32_t src0, uint32_t vsrc1) -> uint32_t {
+        return (1u << 25) | ((vd & 0xFFu) << 17) | ((vsrc1 & 0xFFu) << 9) | (src0 & 0x1FFu);
+    };
+    auto enc_exp_w0 = [](uint32_t target, uint32_t en, bool done) -> uint32_t {
+        return (0x3Eu << 26) | (done ? (1u << 11) : 0u) | ((target & 0x3Fu) << 4) | (en & 0xFu);
+    };
+    auto enc_exp_w1 = [](uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3) -> uint32_t {
+        return ((v3 & 0xFFu) << 24) | ((v2 & 0xFFu) << 16) | ((v1 & 0xFFu) << 8) | (v0 & 0xFFu);
+    };
+
+    const uint32_t kxrv_vs[] = {
+        0x5652584Bu, 0u,  // "KXRV" + reserved
+        // Vertex 0: pos=(0.0, 0.75, 0.0, 1.0), color=(1.0, 0.15, 0.25, 1.0)
+        enc_vmov(1, 128),                       // v1 = 0.0
+        enc_vmov(2, 255), 0x3F400000u,          // v2 = 0.75f
+        enc_vmov(3, 128),                       // v3 = 0.0
+        enc_vmov(4, 242),                       // v4 = 1.0
+        enc_vmov(5, 242),                       // v5 = 1.0 (R)
+        enc_vmov(6, 255), 0x3E19999Au,          // v6 = 0.15f (G)
+        enc_vmov(7, 255), 0x3E800000u,          // v7 = 0.25f (B)
+        enc_vmov(8, 242),                       // v8 = 1.0 (A)
+        // If v0 == 1: pos=(0.75, -0.65, 0, 1), color=(0.15, 0.95, 0.35, 1.0)
+        enc_vcmp_eq_u32(129, 0),
+        enc_vmov(9, 255), 0x3F400000u, enc_vcndmask(1, 256 + 1, 9),
+        enc_vmov(9, 255), 0xBF266666u, enc_vcndmask(2, 256 + 2, 9),
+        enc_vmov(9, 255), 0x3E19999Au, enc_vcndmask(5, 256 + 5, 9),
+        enc_vmov(9, 255), 0x3F733333u, enc_vcndmask(6, 256 + 6, 9),
+        enc_vmov(9, 255), 0x3EB33333u, enc_vcndmask(7, 256 + 7, 9),
+        // If v0 == 2: pos=(-0.75, -0.65, 0, 1), color=(0.20, 0.45, 1.0, 1.0)
+        enc_vcmp_eq_u32(130, 0),
+        enc_vmov(9, 255), 0xBF400000u, enc_vcndmask(1, 256 + 1, 9),
+        enc_vmov(9, 255), 0xBF266666u, enc_vcndmask(2, 256 + 2, 9),
+        enc_vmov(9, 255), 0x3E4CCCCDu, enc_vcndmask(5, 256 + 5, 9),
+        enc_vmov(9, 255), 0x3EE66666u, enc_vcndmask(6, 256 + 6, 9),
+        enc_vmov(9, 242),              enc_vcndmask(7, 256 + 7, 9),
+        // Export pos0 and param0
+        enc_exp_w0(12, 0xF, false), enc_exp_w1(1, 2, 3, 4),
+        enc_exp_w0(32, 0xF, true),  enc_exp_w1(5, 6, 7, 8),
+        (0x17Fu << 23) | (1u << 16),  // s_endpgm
+    };
+
+    // Clean-room RDNA2 (GFX10.3) Pixel Shader ("KXRP"): export interpolated param0 -> mrt0
+    const uint32_t kxrp_ps[] = {
+        0x5052584Bu, 0u,  // "KXRP" + reserved
+        enc_exp_w0(0, 0xF, true), enc_exp_w1(0, 1, 2, 3),
+        (0x17Fu << 23) | (1u << 16),  // s_endpgm
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gpd{};
+    gpd.pRootSignature = gfx_rs;
+    gpd.VS = {kxrv_vs, sizeof(kxrv_vs)};
+    gpd.PS = {kxrp_ps, sizeof(kxrp_ps)};
+    gpd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    gpd.SampleMask = UINT_MAX;
+    gpd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    gpd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    gpd.RasterizerState.DepthClipEnable = TRUE;
+    gpd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    gpd.NumRenderTargets = 1;
+    gpd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    gpd.SampleDesc.Count = 1;
+
+    ID3D12PipelineState* gfx_pso1 = nullptr;
+    ID3D12PipelineState* gfx_pso2 = nullptr;
+    if (FAILED(dev->CreateGraphicsPipelineState(&gpd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&gfx_pso1))) || !gfx_pso1) {
+        gfx_rs->Release();
+        return 117;
+    }
+    if (FAILED(dev->CreateGraphicsPipelineState(&gpd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&gfx_pso2))) || !gfx_pso2) {
+        gfx_pso1->Release();
+        gfx_rs->Release();
+        return 118;
     }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
@@ -128,13 +229,24 @@ int test_d3d12x_render_and_readback() {
     if (FAILED(dev->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &rb_desc,
                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                             __uuidof(ID3D12Resource), reinterpret_cast<void**>(&readback)))) {
+        gfx_pso2->Release(); gfx_pso1->Release(); gfx_rs->Release();
         rt->Release(); rtv_heap->Release(); cmd->Release(); alloc->Release(); queue->Release(); dev->Release();
         return 108;
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_h = rtv_heap->GetCPUDescriptorHandleForHeapStart();
     dev->CreateRenderTargetView(rt, nullptr, rtv_h);
+
+    D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kRtW), static_cast<float>(kRtH), 0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(kRtW), static_cast<LONG>(kRtH)};
     cmd->ClearRenderTargetView(rtv_h, cv.Color, 0, nullptr);
+    cmd->SetGraphicsRootSignature(gfx_rs);
+    cmd->SetPipelineState(gfx_pso1);
+    cmd->RSSetViewports(1, &vp);
+    cmd->RSSetScissorRects(1, &scissor);
+    cmd->OMSetRenderTargets(1, &rtv_h, FALSE, nullptr);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->DrawInstanced(3, 1, 0, 0);
 
     D3D12_RESOURCE_BARRIER bar{};
     bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -155,6 +267,15 @@ int test_d3d12x_render_and_readback() {
     src_loc.SubresourceIndex = 0;
 
     cmd->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+    D3D12_RESOURCE_BARRIER back_bar{};
+    back_bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    back_bar.Transition.pResource = rt;
+    back_bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    back_bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    back_bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd->ResourceBarrier(1, &back_bar);
+
     cmd->Close();
 
     ID3D12Fence* fence = nullptr;
@@ -174,10 +295,22 @@ int test_d3d12x_render_and_readback() {
     void* mapped = nullptr;
     D3D12_RANGE rr{0, static_cast<SIZE_T>(total_bytes)};
     if (SUCCEEDED(readback->Map(0, &rr, &mapped)) && mapped) {
-        const auto* px = static_cast<const uint8_t*>(mapped);
-        if (px[0] != 64 || px[1] != 128 || px[2] != 191 || px[3] != 255) {
-            rc = 109;
-        }
+        const auto* base = static_cast<const uint8_t*>(mapped);
+        auto px_at = [&](uint32_t x, uint32_t y) -> const uint8_t* {
+            return base + static_cast<size_t>(y) * fp.Footprint.RowPitch + x * 4u;
+        };
+        const uint8_t* bg = px_at(4, 4);
+        const uint8_t* top = px_at(128, 48);      // Near red apex
+        const uint8_t* br = px_at(200, 195);      // Near green bottom-right
+        const uint8_t* bl = px_at(56, 195);       // Near blue bottom-left
+        const uint8_t* mid = px_at(128, 136);     // Center interpolated
+
+        if (bg[0] != 18 || bg[1] != 26 || bg[2] != 46 || bg[3] != 255) rc = 109;
+        else if (!(top[0] > 180 && top[0] > top[1] + 80 && top[0] > top[2] + 80)) rc = 119;
+        else if (!(br[1] > 150 && br[1] > br[0] + 50)) rc = 120;
+        else if (!(bl[2] > 170 && bl[2] > bl[0] + 80)) rc = 121;
+        else if (static_cast<int>(mid[0]) + mid[1] + mid[2] < 240) rc = 122;
+
         D3D12_RANGE wr{0, 0};
         readback->Unmap(0, &wr);
     } else {
@@ -185,8 +318,6 @@ int test_d3d12x_render_and_readback() {
     }
 
     // Exercise KxDeviceProxy::CreateComputePipelineState with a raw RDNA2 ("KXRN") compute shader!
-    // Program: v1 = v0 << 2; v2 = g_mem[v1]; v3 = v2 + 10; g_mem[v1] = v3; s_endpgm
-    // First call compiles RDNA2 -> IR -> HLSL -> DXC -> DXIL; second call verifies cache hit!
     if (rc == 0) {
         D3D12_ROOT_PARAMETER rp[2]{};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -207,7 +338,6 @@ int test_d3d12x_render_and_readback() {
         if (SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err)) && rs_blob &&
             SUCCEEDED(dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
                                                __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&rs)))) {
-            // Raw KXRN header ("KXRN", group_size_x=64) + GFX10.3 dwords
             const uint32_t kxrn_shader[] = {
                 0x4E52584Bu,                                              // "KXRN"
                 64u,                                                      // numthreads(64,1,1)
@@ -243,10 +373,13 @@ int test_d3d12x_render_and_readback() {
     }
 
     if (rc == 0) {
-        if (FAILED(D3D12PresentX(queue, 0, nullptr, nullptr))) rc = 114;
+        if (FAILED(D3D12PresentX(queue, 1, rt, nullptr))) rc = 114;
         if (FAILED(D3D12WaitFrameEventX(0, 0, nullptr))) rc = 115;
     }
 
+    gfx_pso2->Release();
+    gfx_pso1->Release();
+    gfx_rs->Release();
     fence->Release();
     readback->Release();
     rt->Release();
@@ -316,6 +449,36 @@ extern "C" int __cdecl KestrelGuestEntry() {
     XTaskQueueCloseHandle(tq);
     if (g_task_fired != 0x12345678u) return 17;
 
-    // 7. Verify d3d12_xs.dll KxDeviceProxy on real D3D12 GPU (RTV clear + KXRN RDNA2 PSO auto-recomp + PresentX)
+    // 7. Verify gameinput.dll HLE controller reading
+    IGuestGameInput* gi = nullptr;
+    if (FAILED(GameInputCreate(&gi)) || !gi) return 21;
+    IGuestGameInputReading* reading = nullptr;
+    if (SUCCEEDED(gi->GetCurrentReading(0x00010000u, nullptr, &reading)) && reading) {
+        GuestGamepadState gs{};
+        reading->GetGamepadState(&gs);
+        reading->Release();
+    }
+    gi->Release();
+
+    // 8. Verify xaudio2_9.dll HLE stereo PCM submission
+    IGuestXAudio2* xa = nullptr;
+    if (FAILED(XAudio2Create(&xa, 0, 0)) || !xa) return 22;
+    IGuestMasteringVoice* mv = nullptr;
+    if (FAILED(xa->CreateMasteringVoice(&mv, 2, 48000)) || !mv) return 23;
+    GuestWaveFormat wf{3, 2, 48000, 32};
+    IGuestSourceVoice* sv = nullptr;
+    if (FAILED(xa->CreateSourceVoice(&sv, &wf)) || !sv) return 24;
+    float pcm[128]{};
+    for (int i = 0; i < 64; ++i) {
+        pcm[i * 2 + 0] = (i & 1) ? 0.25f : -0.25f;
+        pcm[i * 2 + 1] = pcm[i * 2 + 0];
+    }
+    GuestAudioBuffer ab{0, sizeof(pcm), reinterpret_cast<const uint8_t*>(pcm)};
+    if (FAILED(sv->Start(0)) || FAILED(sv->SubmitSourceBuffer(&ab))) return 25;
+    sv->DestroyVoice();
+    mv->DestroyVoice();
+    xa->Release();
+
+    // 9. Verify d3d12_xs.dll KxDeviceProxy on real D3D12 GPU (RDNA2 VS/PS RGB triangle + CS PSO + PresentX)
     return test_d3d12x_render_and_readback();
 }

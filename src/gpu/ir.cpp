@@ -178,6 +178,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                     ir.subop = d.mnemonic;
                     ir.dst = make_sgpr(d.dst);
                     ir.src0 = make_sgpr(d.src0);
+                    fn.uses_mem = true;
                     if (d.mnemonic == "s_load_dwordx2" && d.dst + 2 > fn.max_sgpr) fn.max_sgpr = d.dst + 2;
                     if (d.mnemonic == "s_load_dwordx4" && d.dst + 4 > fn.max_sgpr) fn.max_sgpr = d.dst + 4;
                 } else {
@@ -289,15 +290,29 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                     ir.op = IrOp::GlobalLoadDword;
                     ir.dst = make_vgpr(d.dst);
                     ir.src0 = make_vgpr(d.src0);
+                    fn.uses_mem = true;
                 } else if (d.mnemonic == "global_store_dword") {
                     ir.op = IrOp::GlobalStoreDword;
                     ir.src0 = make_vgpr(d.src0);  // addr
                     ir.src1 = make_vgpr(d.src1);  // data
+                    fn.uses_mem = true;
                 } else {
                     ir.op = IrOp::Unknown;
                     ir.subop = d.mnemonic;
                     ++fn.unknown_count;
                 }
+                break;
+
+            case Encoding::EXP:
+                ir.op = IrOp::Exp;
+                ir.subop = "exp";
+                ir.exp_target = static_cast<uint8_t>(d.opcode);
+                ir.exp_en = d.exp_en;
+                ir.exp_done = d.exp_done;
+                ir.src0 = make_vgpr(d.src0);
+                ir.src1 = make_vgpr(d.src1);
+                ir.src2 = make_vgpr(d.src2);
+                ir.src3 = make_vgpr(d.src3);
                 break;
 
             default:
@@ -311,6 +326,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
         track_regs(ir.src0, fn.max_vgpr, fn.max_sgpr);
         track_regs(ir.src1, fn.max_vgpr, fn.max_sgpr);
         track_regs(ir.src2, fn.max_vgpr, fn.max_sgpr);
+        track_regs(ir.src3, fn.max_vgpr, fn.max_sgpr);
 
         fn.blocks[cur_blk].insts.push_back(std::move(ir));
         fn.blocks[cur_blk].end_pc = d.pc + d.size;

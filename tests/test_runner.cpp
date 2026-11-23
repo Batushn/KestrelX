@@ -8,8 +8,10 @@
 #include "kestrel/gpu/rdna2_recomp.hpp"
 #include "kestrel/gpu/shader_container.hpp"
 #include "kestrel/hle/d3d12x.hpp"
+#include "kestrel/hle/gameinput.hpp"
 #include "kestrel/hle/kernelx.hpp"
 #include "kestrel/hle/registry.hpp"
+#include "kestrel/hle/xaudio2.hpp"
 #include "kestrel/hle/xgameruntime.hpp"
 #include "kestrel/loader/game_config.hpp"
 #include "kestrel/loader/pe_image.hpp"
@@ -418,9 +420,138 @@ void test_gfx10_bcn_and_mip_chain() {
     }
 }
 
+void test_rdna2_exp_vs_ps_compile() {
+    using namespace gpu::encode;
+    std::vector<uint32_t> vs;
+    vs.push_back(vop1(1, 1, 128));  // v1 = 0.0
+    vs.push_back(vop1(1, 2, 240));  // v2 = 0.5
+    vs.push_back(vop1(1, 3, 128));  // v3 = 0.0
+    vs.push_back(vop1(1, 4, 242));  // v4 = 1.0
+    exp(vs, 12, 0xF, 1, 2, 3, 4, false);  // pos0
+    exp(vs, 32, 0xF, 4, 2, 1, 4, true);   // param0
+    vs.push_back(sopp(1));                // s_endpgm
+
+    std::vector<uint32_t> ps;
+    exp(ps, 0, 0xF, 0, 1, 2, 3, true);    // mrt0
+    ps.push_back(sopp(1));                // s_endpgm
+
+    auto vs_dec = gpu::decode_rdna2(vs.data(), vs.size());
+    auto ps_dec = gpu::decode_rdna2(ps.data(), ps.size());
+    KX_CHECK(gpu::disassemble_inst(vs_dec[4]).find("exp pos0") != std::string::npos, "EXP pos0 disasm");
+    KX_CHECK(gpu::disassemble_inst(ps_dec[0]).find("exp mrt0") != std::string::npos, "EXP mrt0 disasm");
+
+    auto vs_ir = gpu::lift_rdna2_to_ir(vs_dec);
+    auto ps_ir = gpu::lift_rdna2_to_ir(ps_dec);
+    KX_CHECK(vs_ir.unknown_count == 0 && ps_ir.unknown_count == 0, "EXP VS/PS zero unknown opcodes");
+
+    auto vs_hlsl = gpu::emit_hlsl_from_ir(vs_ir, {.stage = gpu::ShaderStage::Vertex});
+    auto ps_hlsl = gpu::emit_hlsl_from_ir(ps_ir, {.stage = gpu::ShaderStage::Pixel});
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto vs_dxil = dxc.compile_hlsl(vs_hlsl.hlsl, "main", "vs_6_6");
+    KX_CHECK(vs_dxil.has_value(), vs_dxil.error().message);
+    auto ps_dxil = dxc.compile_hlsl(ps_hlsl.hlsl, "main", "ps_6_6");
+    KX_CHECK(ps_dxil.has_value(), ps_dxil.error().message);
+
+    auto vs_parsed = gpu::parse_dxbc_container(vs_dxil->dxil.data(), vs_dxil->dxil.size());
+    auto ps_parsed = gpu::parse_dxbc_container(ps_dxil->dxil.data(), ps_dxil->dxil.size());
+    KX_CHECK(vs_parsed.has_value() && vs_parsed->has_dxil, "Valid vs_6_6 DXIL container");
+    KX_CHECK(ps_parsed.has_value() && ps_parsed->has_dxil, "Valid ps_6_6 DXIL container");
+}
+
+void test_gameinput_xinput_bridge() {
+    hle::reset_gameinput_stats();
+
+    // 1. Verify raw XInput button, trigger, deadzone & stick translation
+    auto st = hle::translate_xinput_raw(
+        0x1000u | 0x0100u | 0x0001u,  // A + LB + DPadUp
+        255, 10,                      // LT full, RT inside deadzone
+        32767, 500,                   // LX full right, LY inside deadzone
+        -32768, 16384);
+    KX_CHECK((st.buttons & hle::KxGamepadA) != 0, "A button mapped");
+    KX_CHECK((st.buttons & hle::KxGamepadLeftShoulder) != 0, "LB button mapped");
+    KX_CHECK((st.buttons & hle::KxGamepadDPadUp) != 0, "DPadUp mapped");
+    KX_CHECK(st.left_trigger > 0.99f && st.right_trigger == 0.0f, "Trigger deadzone & scale");
+    KX_CHECK(st.left_thumbstick_x > 0.99f && st.left_thumbstick_y == 0.0f, "Left stick deadzone & scale");
+    KX_CHECK(st.right_thumbstick_x < -0.99f && st.right_thumbstick_y > 0.49f, "Right stick scale");
+
+    // 2. Verify GameInputCreate COM interface with mock connected & disconnected states
+    hle::Registry reg;
+    hle::register_gameinput(reg);
+    auto* create_fn = reinterpret_cast<HRESULT(__stdcall*)(hle::IKxGameInput**)>(
+        reg.resolve_name("gameinput.dll", "GameInputCreate"));
+    KX_CHECK(create_fn != nullptr, "GameInputCreate registered");
+
+    hle::IKxGameInput* gi = nullptr;
+    KX_CHECK(SUCCEEDED(create_fn(&gi)) && gi != nullptr, "GameInputCreate S_OK");
+
+    hle::set_gameinput_mock_state(st, true);
+    hle::IKxGameInputReading* reading = nullptr;
+    KX_CHECK(SUCCEEDED(gi->GetCurrentReading(hle::KxGameInputKindGamepad, nullptr, &reading)) && reading, "Connected reading");
+    hle::KxGameInputGamepadState got{};
+    KX_CHECK(reading->GetGamepadState(&got), "GetGamepadState");
+    KX_CHECK(got.buttons == st.buttons && got.left_trigger > 0.99f, "Mock reading matches");
+    reading->Release();
+
+    hle::set_gameinput_mock_state({}, false);
+    hle::IKxGameInputReading* disc = nullptr;
+    KX_CHECK(FAILED(gi->GetCurrentReading(hle::KxGameInputKindGamepad, nullptr, &disc)) && disc == nullptr,
+             "Disconnected gamepad returns failure");
+
+    hle::clear_gameinput_mock_state();
+    gi->Release();
+}
+
+void test_xaudio2_pcm_ring_buffer() {
+    hle::reset_xaudio2_stats();
+    hle::Registry reg;
+    hle::register_xaudio2(reg);
+    auto* create_fn = reinterpret_cast<HRESULT(__stdcall*)(hle::IKxXAudio2**, uint32_t, uint32_t)>(
+        reg.resolve_name("xaudio2_9.dll", "XAudio2Create"));
+    KX_CHECK(create_fn != nullptr, "XAudio2Create registered");
+
+    hle::IKxXAudio2* xa = nullptr;
+    KX_CHECK(SUCCEEDED(create_fn(&xa, 0, 0)) && xa != nullptr, "XAudio2Create S_OK");
+    hle::IKxMasteringVoice* mv = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateMasteringVoice(&mv, 2, 48000)) && mv != nullptr, "CreateMasteringVoice");
+
+    // Submit 440 Hz stereo int16 PCM sine wave (480 frames = 10 ms @ 48 kHz)
+    hle::KxWaveFormat fmt{1, 2, 48000, 16};
+    hle::IKxSourceVoice* sv = nullptr;
+    KX_CHECK(SUCCEEDED(xa->CreateSourceVoice(&sv, &fmt)) && sv != nullptr, "CreateSourceVoice");
+    KX_CHECK(SUCCEEDED(sv->Start(0)), "SourceVoice Start");
+
+    constexpr size_t kFrames = 480;
+    std::vector<int16_t> sine(kFrames * 2);
+    for (size_t i = 0; i < kFrames; ++i) {
+        const double phase = 2.0 * 3.14159265358979323846 * 440.0 * static_cast<double>(i) / 48000.0;
+        const auto s = static_cast<int16_t>(std::sin(phase) * 16384.0);
+        sine[i * 2 + 0] = s;
+        sine[i * 2 + 1] = s;
+    }
+    hle::KxAudioBuffer buf{0, static_cast<uint32_t>(sine.size() * sizeof(int16_t)),
+                           reinterpret_cast<const uint8_t*>(sine.data())};
+    KX_CHECK(SUCCEEDED(sv->SubmitSourceBuffer(&buf)), "SubmitSourceBuffer");
+
+    std::vector<float> drained(600 * 2, 0.0f);
+    const size_t got_frames = hle::xaudio2_drain_stereo_f32(drained.data(), 600);
+    KX_CHECK(got_frames == kFrames, "Drained exact 480 frames");
+
+    const auto st = hle::xaudio2_stats();
+    KX_CHECK(st.frames_submitted == kFrames && st.frames_consumed == kFrames, "Frame counters match");
+    KX_CHECK(st.underruns == 1, "Underrun tracked when draining past available frames");
+    KX_CHECK(st.last_rms > 0.30 && st.last_rms < 0.42, std::format("Expected sine RMS ~0.35, got {:.3f}", st.last_rms));
+
+    sv->DestroyVoice();
+    mv->DestroyVoice();
+    xa->Release();
+}
+
 void test_end_to_end_pe_loader_guest_title() {
     const fs::path title_dir = KESTREL_TEST_TITLE_DIR;
     const fs::path data_dir = fs::temp_directory_path() / "KestrelX_TestTitleData";
+    const fs::path bmp_out = data_dir / "first_light.bmp";
     std::error_code ec;
     fs::remove_all(data_dir, ec);
 
@@ -431,19 +562,24 @@ void test_end_to_end_pe_loader_guest_title() {
     hle::Registry reg;
     hle::reset_kernelx_stats();
     hle::reset_d3d12x_stats();
+    hle::reset_gameinput_stats();
+    hle::reset_xaudio2_stats();
     hle::set_kernelx_vfs(&overlay);
     hle::set_xgameruntime_title_id(cfg->title_id);
     hle::set_d3d12x_preferred_adapter(-1);
+    hle::set_d3d12x_capture_path(bmp_out);
     hle::register_kernelx(reg);
     hle::register_xgameruntime(reg);
     hle::register_d3d12x(reg);
+    hle::register_gameinput(reg);
+    hle::register_xaudio2(reg);
 
     cpu::ScopedVehShim veh;
     loader::PeLoader loader(reg, title_dir);
 
     auto mod = loader.load_image(title_dir / cfg->executables[0].name);
     KX_CHECK(mod.has_value(), mod.error().message);
-    KX_CHECK((*mod)->hle_imports >= 15, "expected >= 15 HLE console imports resolved");
+    KX_CHECK((*mod)->hle_imports >= 20, "expected >= 20 HLE console imports resolved");
     KX_CHECK((*mod)->guest_imports >= 2, "expected guest DLL imports resolved");
     KX_CHECK((*mod)->tls_callbacks_run >= 1, "expected PE TLS callback to run");
 
@@ -456,23 +592,40 @@ void test_end_to_end_pe_loader_guest_title() {
     KX_CHECK(fs::exists(save_file), "guest save file missing in S:\\ overlay");
     KX_CHECK(!fs::exists(title_dir / "save.bin"), "game_root must remain unmodified");
 
-    // Verify D3D12.X KxDeviceProxy + KxCommandQueueProxy + KXRN PSO auto-recompilation & cache hit!
+    // Verify BMP First-Light screenshot captured by D3D12PresentX!
+    KX_CHECK(fs::exists(bmp_out) && fs::file_size(bmp_out) >= 256u * 256u * 3u + 54u,
+             "First-Light 256x256 BMP capture missing or truncated");
+    {
+        std::ifstream ifs(bmp_out, std::ios::binary);
+        char sig[2]{};
+        ifs.read(sig, 2);
+        KX_CHECK(sig[0] == 'B' && sig[1] == 'M', "Valid BMP file header");
+    }
+
+    // Verify D3D12.X KxDeviceProxy + KxCommandQueueProxy + KXRN/KXRV/KXRP PSO auto-recomp & cache hits!
     const auto d3d = hle::d3d12x_stats();
     KX_CHECK(d3d.devices_created >= 1 && d3d.queues_created >= 1 &&
              d3d.cmd_lists_created >= 1 && d3d.resources_created >= 2 &&
              d3d.zero_memory_calls >= 1 && d3d.present_calls >= 1 &&
-             d3d.pso_recompiled >= 1 && d3d.pso_cache_hits >= 1,
-             "KxDeviceProxy / PSO auto-recomp / PresentX counters mismatch");
+             d3d.pso_recompiled >= 1 && d3d.pso_cache_hits >= 1 &&
+             d3d.gfx_pso_recompiled >= 2 && d3d.gfx_pso_cache_hits >= 2,
+             "KxDeviceProxy / Graphics+Compute PSO auto-recomp / PresentX counters mismatch");
 
     const auto kx = hle::kernelx_stats();
     KX_CHECK(kx.alloc_count >= 1 && kx.free_count == kx.alloc_count && kx.live_bytes == 0,
              "KernelX XMemAlloc/XMemFree leak check");
 
+    const auto gi = hle::gameinput_stats();
+    const auto xa = hle::xaudio2_stats();
+    KX_CHECK(gi.instances_created >= 1 && gi.readings_polled >= 1, "Guest GameInput HLE verified");
+    KX_CHECK(xa.engines_created >= 1 && xa.frames_submitted >= 64, "Guest XAudio2 HLE verified");
+
     std::cout << std::format(
-        "    -> Guest title PASS: HLE_imports={}, GuestDLL_imports={}, TLS={}, D3D12X(dev={}, q={}, res={}, pso_recomp={}, cache_hit={}, present={})\n",
+        "    -> Guest title PASS: HLE_imports={}, GuestDLL_imports={}, TLS={}, D3D12X(dev={}, q={}, res={}, cs_pso={}, gfx_pso={}, cache_hit={}, present={}), GI(reads={}), XA2(frames={})\n",
         (*mod)->hle_imports, (*mod)->guest_imports, (*mod)->tls_callbacks_run,
         d3d.devices_created, d3d.queues_created, d3d.resources_created,
-        d3d.pso_recompiled, d3d.pso_cache_hits, d3d.present_calls);
+        d3d.pso_recompiled, d3d.gfx_pso_recompiled, d3d.pso_cache_hits + d3d.gfx_pso_cache_hits,
+        d3d.present_calls, gi.readings_polled, xa.frames_submitted);
 
     fs::remove_all(data_dir, ec);
 }
@@ -490,10 +643,13 @@ int main() {
     run_test("In-process DXC SM 6.6 compilation & DXBC/DXIL container verification", test_dxbc_container_and_dxc_compile);
     run_test("End-to-end RDNA2 -> IR -> HLSL -> DXC -> Real Dual-GPU Hardware Execution", test_rdna2_recomp_real_dual_gpu_execution);
     run_test("RDNA2 SMEM + DS (LDS) + s_barrier Workgroup Shuffle on Dual-GPU Hardware", test_rdna2_smem_lds_barrier_dual_gpu);
+    run_test("RDNA2 EXP Vertex & Pixel (vs_6_6 / ps_6_6) Decode, IR Lift & DXC Compile", test_rdna2_exp_vs_ps_compile);
     run_test("Strict recompiler refusal of unsupported RDNA2 opcodes", test_strict_unsupported_opcode_refusal);
     run_test("GFX10 2D texture swizzle/deswizzle round-trip (all 7 modes)", test_gfx10_tiling_roundtrip);
     run_test("GFX10 BC1/BC7 block-compressed tiling & 5-level mip-chain layout", test_gfx10_bcn_and_mip_chain);
-    run_test("End-to-end PE32+ Loader + Guest DLL + TLS + SEH + Wide-VFS + KxDeviceProxy PSO Auto-Recomp + PresentX", test_end_to_end_pe_loader_guest_title);
+    run_test("GameInput -> XInput/Win32 controller bridge & mock verification", test_gameinput_xinput_bridge);
+    run_test("XAudio2 stereo PCM ring-buffer, RMS energy & underrun verification", test_xaudio2_pcm_ring_buffer);
+    run_test("End-to-end PE32+ Loader + Guest DLL + Wide-VFS + GameInput + XAudio2 + RDNA2 VS/PS First Light", test_end_to_end_pe_loader_guest_title);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

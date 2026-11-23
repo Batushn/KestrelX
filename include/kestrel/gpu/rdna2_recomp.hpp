@@ -12,7 +12,14 @@ enum class WaveMode : uint8_t {
     Wave64 = 64,  // Native match for AMD RDNA2/3 Wave64
 };
 
+enum class ShaderStage : uint8_t {
+    Compute,
+    Vertex,
+    Pixel,
+};
+
 struct RecompOptions {
+    ShaderStage stage = ShaderStage::Compute;
     WaveMode wave_mode = WaveMode::Wave32;
     uint32_t group_size_x = 64;
     uint32_t group_size_y = 1;

@@ -44,6 +44,7 @@ add_library(kestrel_core STATIC
     src/gpu/dxc_compiler.cpp
     src/gpu/gpu_runner.cpp
     src/gpu/gfx10_tiling.cpp
+    src/gpu/vrs.cpp
     src/formats/sgd5.cpp
 )
 target_include_directories(kestrel_core PUBLIC include)

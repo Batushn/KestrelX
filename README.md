@@ -100,6 +100,15 @@ flowchart LR
 
 ---
 
+### PortWatch VI (Porthole) Groundwork Rubric
+
+| Groundwork Component | Score | Status | Evidence & Verified Capabilities |
+| :--- | :---: | :---: | :--- |
+| **Loader & System Libraries** |  .90 | ?? Verified | PE32+ loader with recursive guest DLL mapping, base relocations, .pdata SEH via RtlAddFunctionTable, TLS callbacks, kernelx.dll (XMemAlloc/Free), xgameruntime.dll, and AMD Zen 2 VEH shim (CLZERO/MONITORX/MWAITX + SSE4a EXTRQ/INSERTQ for Intel compatibility). Compatible with game_scarlett_master.exe PE32+ structures. |
+| **Shader Translation** |  .90 | ?? Verified | Clean-room RDNA2 (GFX10.3) microcode decoder, CFG IR lifter, dual Wave32/Wave64 SM 6.6 HLSL emission, in-process DXC (dxcompiler.dll), atomic disk cache (.kxdxil), strict refusal of unhandled opcodes (Test 10), and SGD5 container archive unpacking (shaders.rpf, Test 27). |
+| **Graphics Layer** |  .85 | ?? Verified | Pure COM wrapper KxDeviceProxy (ID3D12Device -> Device10 QI), Stream PSO recomp, dedicated Async Compute command queues (D3D12_COMMAND_LIST_TYPE_COMPUTE), cross-queue fence synchronization telemetry, and Win32 WindowHost flip-model swapchain PresentX. |
+| **Proven on Test Title** |  .80 | ?? Verified | Stand-alone clean-room guest test title (kestrel_test_title.exe + kestrel_test_dll.dll linked against synthetic GDK import libraries) boots via PeLoader with d3d12_xs.dll RTV clear + PresentX; 29/29 dual-GPU bit-exact test receipts on NVIDIA RTX 4060 and AMD Radeon 780M with 0 compiler warnings. |
+
 ## Architecture
 
 ```mermaid

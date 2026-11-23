@@ -8,6 +8,7 @@
 #include "kestrel/gpu/rdna2_recomp.hpp"
 #include "kestrel/gpu/shader_cache.hpp"
 #include "kestrel/gpu/shader_container.hpp"
+#include "kestrel/gpu/vrs.hpp"
 #include "kestrel/hle/d3d12x.hpp"
 #include "kestrel/hle/dstorage.hpp"
 #include "kestrel/hle/gameinput.hpp"
@@ -2666,6 +2667,410 @@ void test_veh_zen2_sse4a_extrq_insertq() {
     KX_CHECK(st.insertq_emulated == 1, "Insertq counter incremented");
 }
 
+void test_vrs_tier2_encode_decode_combiners_and_image() {
+    using gpu::VrsCombiner;
+    using gpu::VrsShadingRate;
+
+    // 1. Verify all 7 D3D12/RDNA2 shading rates round-trip through tile encode/decode & D3D12 translation
+    struct RateCase {
+        VrsShadingRate rate;
+        uint8_t tile_byte;
+        D3D12_SHADING_RATE d3d_rate;
+        uint8_t ax;
+        uint8_t ay;
+    };
+    const RateCase cases[] = {
+        {VrsShadingRate::Rate1x1, 0x0, D3D12_SHADING_RATE_1X1, 1, 1},
+        {VrsShadingRate::Rate1x2, 0x1, D3D12_SHADING_RATE_1X2, 1, 2},
+        {VrsShadingRate::Rate2x1, 0x4, D3D12_SHADING_RATE_2X1, 2, 1},
+        {VrsShadingRate::Rate2x2, 0x5, D3D12_SHADING_RATE_2X2, 2, 2},
+        {VrsShadingRate::Rate2x4, 0x6, D3D12_SHADING_RATE_2X4, 2, 4},
+        {VrsShadingRate::Rate4x2, 0x9, D3D12_SHADING_RATE_4X2, 4, 2},
+        {VrsShadingRate::Rate4x4, 0xA, D3D12_SHADING_RATE_4X4, 4, 4},
+    };
+    for (const auto& c : cases) {
+        KX_CHECK(gpu::encode_vrs_tile_rate(c.rate) == c.tile_byte, "VRS tile byte encoding");
+        KX_CHECK(gpu::decode_vrs_tile_rate(c.tile_byte) == c.rate, "VRS tile byte decoding");
+        KX_CHECK(gpu::to_d3d12_shading_rate(c.rate) == c.d3d_rate, "to_d3d12_shading_rate");
+        KX_CHECK(gpu::from_d3d12_shading_rate(c.d3d_rate) == c.rate, "from_d3d12_shading_rate");
+        const auto axes = gpu::vrs_rate_axes(c.rate);
+        KX_CHECK(axes.x == c.ax && axes.y == c.ay, "vrs_rate_axes");
+        KX_CHECK(gpu::vrs_rate_from_axes(c.ax, c.ay) == c.rate, "vrs_rate_from_axes");
+    }
+
+    // Disallowed aspect ratios (1x4 = 0x2, 4x1 = 0x8) and high garbage bits clamp cleanly
+    KX_CHECK(gpu::decode_vrs_tile_rate(0x02u) == VrsShadingRate::Rate1x2, "1x4 clamps safely to 1x2");
+    KX_CHECK(gpu::decode_vrs_tile_rate(0x08u) == VrsShadingRate::Rate2x1, "4x1 clamps safely to 2x1");
+    KX_CHECK(gpu::decode_vrs_tile_rate(0xFFu) == VrsShadingRate::Rate4x4, "0xFF clamps safely to 4x4");
+
+    // 2. Verify all 5 combiners + D3D12 translation
+    KX_CHECK(gpu::to_d3d12_combiner(VrsCombiner::Passthrough) == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH, "combiner passthrough");
+    KX_CHECK(gpu::to_d3d12_combiner(VrsCombiner::Override) == D3D12_SHADING_RATE_COMBINER_OVERRIDE, "combiner override");
+    KX_CHECK(gpu::to_d3d12_combiner(VrsCombiner::Min) == D3D12_SHADING_RATE_COMBINER_MIN, "combiner min");
+    KX_CHECK(gpu::to_d3d12_combiner(VrsCombiner::Max) == D3D12_SHADING_RATE_COMBINER_MAX, "combiner max");
+    KX_CHECK(gpu::to_d3d12_combiner(VrsCombiner::Sum) == D3D12_SHADING_RATE_COMBINER_SUM, "combiner sum");
+    KX_CHECK(gpu::from_d3d12_combiner(D3D12_SHADING_RATE_COMBINER_SUM) == VrsCombiner::Sum, "from_d3d12_combiner");
+
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate2x1, VrsShadingRate::Rate4x4, VrsCombiner::Passthrough) == VrsShadingRate::Rate2x1, "Passthrough");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate1x1, VrsShadingRate::Rate2x4, VrsCombiner::Override) == VrsShadingRate::Rate2x4, "Override");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate2x4, VrsShadingRate::Rate4x2, VrsCombiner::Min) == VrsShadingRate::Rate2x2, "Min");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate1x2, VrsShadingRate::Rate2x1, VrsCombiner::Max) == VrsShadingRate::Rate2x2, "Max");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate2x1, VrsShadingRate::Rate1x2, VrsCombiner::Sum) == VrsShadingRate::Rate2x2, "Sum 2x1+1x2=2x2");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate2x2, VrsShadingRate::Rate2x2, VrsCombiner::Sum) == VrsShadingRate::Rate4x4, "Sum 2x2+2x2=4x4");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate2x2, VrsShadingRate::Rate1x2, VrsCombiner::Sum) == VrsShadingRate::Rate2x4, "Sum 2x2+1x2=2x4");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate2x2, VrsShadingRate::Rate2x1, VrsCombiner::Sum) == VrsShadingRate::Rate4x2, "Sum 2x2+2x1=4x2");
+    KX_CHECK(gpu::combine_shading_rates(VrsShadingRate::Rate4x4, VrsShadingRate::Rate4x4, VrsCombiner::Sum) == VrsShadingRate::Rate4x4, "Sum clamps at 4x4");
+
+    // 3. Verify RDNA2 VRS control register encode/decode round-trip
+    const gpu::Rdna2VrsControl ctrl_in{
+        .base_rate = VrsShadingRate::Rate2x1,
+        .combiner0 = VrsCombiner::Max,
+        .combiner1 = VrsCombiner::Override,
+        .enable_vrs_image = true,
+        .enable_per_primitive = true,
+        .tile_size = 16,
+    };
+    const uint32_t reg_word = gpu::encode_rdna2_vrs_control(ctrl_in);
+    const auto ctrl_out = gpu::decode_rdna2_vrs_control(reg_word);
+    KX_CHECK(ctrl_out.base_rate == ctrl_in.base_rate, "RDNA2 VRS ctrl base_rate");
+    KX_CHECK(ctrl_out.combiner0 == ctrl_in.combiner0, "RDNA2 VRS ctrl combiner0");
+    KX_CHECK(ctrl_out.combiner1 == ctrl_in.combiner1, "RDNA2 VRS ctrl combiner1");
+    KX_CHECK(ctrl_out.enable_vrs_image == ctrl_in.enable_vrs_image, "RDNA2 VRS ctrl enable_vrs_image");
+    KX_CHECK(ctrl_out.enable_per_primitive == ctrl_in.enable_per_primitive, "RDNA2 VRS ctrl enable_per_primitive");
+    KX_CHECK(ctrl_out.tile_size == 16u, "RDNA2 VRS ctrl tile_size=16");
+
+    // 4. Verify build_vrs_shading_rate_image dimensions & foveated tile mask layout
+    auto non_mult = gpu::build_vrs_shading_rate_image(100, 70, 16, VrsShadingRate::Rate2x2);
+    KX_CHECK(non_mult.tiles_x == 7u && non_mult.tiles_y == 5u && non_mult.data.size() == 35u, "Ceiling tile dimensions");
+    for (uint8_t b : non_mult.data) {
+        KX_CHECK(b == gpu::encode_vrs_tile_rate(VrsShadingRate::Rate2x2), "Uniform fill tile rate");
+    }
+
+    auto foveated = gpu::build_vrs_shading_rate_image(
+        256, 256, 16,
+        [](uint32_t tx, uint32_t ty, uint32_t nx, uint32_t ny) {
+            const bool in_center = (tx >= nx / 4 && tx < (nx * 3) / 4 && ty >= ny / 4 && ty < (ny * 3) / 4);
+            return in_center ? VrsShadingRate::Rate1x1 : VrsShadingRate::Rate4x4;
+        });
+    KX_CHECK(foveated.tiles_x == 16u && foveated.tiles_y == 16u && foveated.data.size() == 256u, "Foveated 256x256 / 16");
+    KX_CHECK(gpu::decode_vrs_tile_rate(foveated.data[0]) == VrsShadingRate::Rate4x4, "Corner tile is 4x4");
+    KX_CHECK(gpu::decode_vrs_tile_rate(foveated.data[8u * 16u + 8u]) == VrsShadingRate::Rate1x1, "Center tile is 1x1");
+}
+
+void test_vrs_tier2_hardware_render_and_proxy_telemetry() {
+    using gpu::VrsCombiner;
+    using gpu::VrsShadingRate;
+
+    // Compile a fullscreen triangle VS + per-pixel high-frequency checkerboard PS (sm 6.6)
+    const char* vs_src = R"(
+float4 main(uint vid : SV_VertexID) : SV_Position {
+    float2 p = float2((vid == 1u) ? 3.0f : -1.0f, (vid == 2u) ? -3.0f : 1.0f);
+    return float4(p, 0.0f, 1.0f);
+}
+)";
+    const char* ps_src = R"(
+float4 main(float4 pos : SV_Position) : SV_Target0 {
+    uint px = (uint)pos.x;
+    uint py = (uint)pos.y;
+    float r = float(px & 1u);
+    float g = float(py & 1u);
+    float b = float(((px >> 1u) ^ (py >> 1u)) & 1u);
+    return float4(r, g, b, 1.0f);
+}
+)";
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto vs_dxil = dxc.compile_hlsl(vs_src, "main", "vs_6_6");
+    auto ps_dxil = dxc.compile_hlsl(ps_src, "main", "ps_6_6");
+    KX_CHECK(vs_dxil.has_value(), vs_dxil.error().message);
+    KX_CHECK(ps_dxil.has_value(), ps_dxil.error().message);
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "Adapters available");
+
+    IDXGIFactory6* factory = nullptr;
+    KX_CHECK(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))), "CreateDXGIFactory1");
+
+    constexpr uint32_t kW = 256, kH = 256;
+    int hw_seen = 0;
+    int tier2_verified = 0;
+
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        IDXGIAdapter1* dxgi_ad = nullptr;
+        if (FAILED(factory->EnumAdapters1(ad.index, &dxgi_ad))) continue;
+
+        ID3D12Device* raw_dev = nullptr;
+        HRESULT hr = D3D12CreateDevice(dxgi_ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&raw_dev));
+        dxgi_ad->Release();
+        if (FAILED(hr) || !raw_dev) continue;
+        ++hw_seen;
+
+        hle::reset_d3d12x_stats();
+        auto* dev_proxy = new hle::KxDeviceProxy(raw_dev);
+        raw_dev->Release();
+        ID3D12Device* dev = dev_proxy;
+
+        // Verify KxDeviceProxy::CreateCommandList wraps ID3D12GraphicsCommandList1..5 + QI upgrades
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList5* cmd5 = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) && queue, "CreateCommandQueue");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) && alloc, "CreateCommandAllocator");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd5))) && cmd5,
+                 "CreateCommandList IID_ID3D12GraphicsCommandList5 via KxDeviceProxy");
+
+        ID3D12GraphicsCommandList1* cl1 = nullptr;
+        ID3D12GraphicsCommandList4* cl4 = nullptr;
+        KX_CHECK(SUCCEEDED(cmd5->QueryInterface(IID_PPV_ARGS(&cl1))) && cl1, "QI ID3D12GraphicsCommandList1");
+        KX_CHECK(SUCCEEDED(cmd5->QueryInterface(IID_PPV_ARGS(&cl4))) && cl4, "QI ID3D12GraphicsCommandList4");
+        cl4->Release();
+        cl1->Release();
+
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 opt6{};
+        KX_CHECK(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &opt6, sizeof(opt6))),
+                 "CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6)");
+
+        if (opt6.VariableShadingRateTier < D3D12_VARIABLE_SHADING_RATE_TIER_2 || opt6.ShadingRateImageTileSize == 0) {
+            // Even without Tier 2 hardware, verify proxy hook counters work cleanly on unexecuted command list
+            cmd5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
+            cmd5->RSSetShadingRateImage(nullptr);
+            const auto st_no_vrs = hle::d3d12x_stats();
+            KX_CHECK(st_no_vrs.vrs_rate_sets == 1 && st_no_vrs.vrs_image_binds == 1,
+                     "KxGraphicsCommandListProxy VRS telemetry recorded");
+            std::cout << std::format("    -> Hardware [{}] {} (VRS Tier {} — skipped Tier 2 render, proxy telemetry OK)\n",
+                                     ad.index, ad.name, static_cast<int>(opt6.VariableShadingRateTier));
+            cmd5->Close();
+            cmd5->Release();
+            alloc->Release();
+            queue->Release();
+            dev->Release();
+            continue;
+        }
+
+        const uint32_t tile_size = opt6.ShadingRateImageTileSize;
+        const VrsShadingRate outer_rate = opt6.AdditionalShadingRatesSupported ? VrsShadingRate::Rate4x4 : VrsShadingRate::Rate2x2;
+        const auto outer_axes = gpu::vrs_rate_axes(outer_rate);
+
+        // Build R8_UINT shading rate image: center [64..192)x[64..192) = 1x1, outer = 4x4 (or 2x2)
+        const auto sri = gpu::build_vrs_shading_rate_image(
+            kW, kH, tile_size,
+            [tile_size, outer_rate](uint32_t tx, uint32_t ty, uint32_t, uint32_t) {
+                const uint32_t px = tx * tile_size;
+                const uint32_t py = ty * tile_size;
+                const bool center = (px >= 64u && px < 192u && py >= 64u && py < 192u);
+                return center ? VrsShadingRate::Rate1x1 : outer_rate;
+            });
+
+        // Empty root signature + Graphics PSO
+        D3D12_ROOT_SIGNATURE_DESC rsd{0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ID3DBlob* rs_blob = nullptr;
+        ID3D12RootSignature* rs = nullptr;
+        KX_CHECK(SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, nullptr)), "SerializeRS");
+        KX_CHECK(SUCCEEDED(dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&rs))), "CreateRS");
+        rs_blob->Release();
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psd{};
+        psd.pRootSignature = rs;
+        psd.VS = {vs_dxil->dxil.data(), vs_dxil->dxil.size()};
+        psd.PS = {ps_dxil->dxil.data(), ps_dxil->dxil.size()};
+        psd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psd.SampleMask = UINT_MAX;
+        psd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psd.NumRenderTargets = 1;
+        psd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psd.SampleDesc.Count = 1;
+        ID3D12PipelineState* pso = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateGraphicsPipelineState(&psd, IID_PPV_ARGS(&pso))), "CreateVrsPSO");
+
+        D3D12_HEAP_PROPERTIES hp_def{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        D3D12_HEAP_PROPERTIES hp_up{D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        D3D12_HEAP_PROPERTIES hp_rb{D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+
+        // Render target (256x256 RGBA8)
+        D3D12_RESOURCE_DESC rt_desc{};
+        rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rt_desc.Width = kW; rt_desc.Height = kH; rt_desc.DepthOrArraySize = 1; rt_desc.MipLevels = 1;
+        rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rt_desc.SampleDesc.Count = 1;
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ID3D12Resource* rt = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &rt_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt))), "CreateRT");
+
+        // Shading Rate Image texture (R8_UINT)
+        D3D12_RESOURCE_DESC sri_desc{};
+        sri_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        sri_desc.Width = sri.tiles_x; sri_desc.Height = sri.tiles_y; sri_desc.DepthOrArraySize = 1; sri_desc.MipLevels = 1;
+        sri_desc.Format = DXGI_FORMAT_R8_UINT; sri_desc.SampleDesc.Count = 1;
+        ID3D12Resource* sri_tex = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &sri_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sri_tex))), "CreateSriTex");
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT sri_fp{};
+        UINT64 sri_up_bytes = 0;
+        dev->GetCopyableFootprints(&sri_desc, 0, 1, 0, &sri_fp, nullptr, nullptr, &sri_up_bytes);
+
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Height = 1; buf_desc.DepthOrArraySize = 1; buf_desc.MipLevels = 1;
+        buf_desc.SampleDesc.Count = 1; buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        buf_desc.Width = sri_up_bytes;
+        ID3D12Resource* sri_up = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&sri_up))), "CreateSriUpload");
+
+        void* mapped = nullptr;
+        KX_CHECK(SUCCEEDED(sri_up->Map(0, nullptr, &mapped)), "MapSriUpload");
+        for (uint32_t ty = 0; ty < sri.tiles_y; ++ty) {
+            std::memcpy(static_cast<uint8_t*>(mapped) + static_cast<size_t>(ty) * sri_fp.Footprint.RowPitch,
+                        sri.data.data() + static_cast<size_t>(ty) * sri.tiles_x, sri.tiles_x);
+        }
+        sri_up->Unmap(0, nullptr);
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT rt_fp{};
+        UINT64 rb_bytes = 0;
+        dev->GetCopyableFootprints(&rt_desc, 0, 1, 0, &rt_fp, nullptr, nullptr, &rb_bytes);
+        buf_desc.Width = rb_bytes;
+        ID3D12Resource* rb = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_rb, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))), "CreateRB");
+
+        D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        ID3D12DescriptorHeap* rtv_heap = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap))), "CreateRtvHeap");
+        const auto rtv_h = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateRenderTargetView(rt, nullptr, rtv_h);
+
+        // Upload shading rate image & transition to SHADING_RATE_SOURCE
+        D3D12_TEXTURE_COPY_LOCATION sri_dst{sri_tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION sri_src{sri_up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        sri_src.PlacedFootprint = sri_fp;
+        cmd5->CopyTextureRegion(&sri_dst, 0, 0, 0, &sri_src, nullptr);
+
+        D3D12_RESOURCE_BARRIER sri_bar{};
+        sri_bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        sri_bar.Transition = {sri_tex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE};
+        cmd5->ResourceBarrier(1, &sri_bar);
+
+        // Record VRS Tier 2 draw through KxGraphicsCommandListProxy
+        const float clear_col[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        cmd5->ClearRenderTargetView(rtv_h, clear_col, 0, nullptr);
+        cmd5->OMSetRenderTargets(1, &rtv_h, FALSE, nullptr);
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kW), static_cast<float>(kH), 0.0f, 1.0f};
+        D3D12_RECT sc{0, 0, static_cast<LONG>(kW), static_cast<LONG>(kH)};
+        cmd5->RSSetViewports(1, &vp);
+        cmd5->RSSetScissorRects(1, &sc);
+        cmd5->SetGraphicsRootSignature(rs);
+        cmd5->SetPipelineState(pso);
+
+        const D3D12_SHADING_RATE_COMBINER combiners[2] = {
+            gpu::to_d3d12_combiner(VrsCombiner::Passthrough),
+            gpu::to_d3d12_combiner(VrsCombiner::Override),
+        };
+        cmd5->RSSetShadingRate(gpu::to_d3d12_shading_rate(VrsShadingRate::Rate1x1), combiners);
+        cmd5->RSSetShadingRateImage(sri_tex);
+        cmd5->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd5->DrawInstanced(3, 1, 0, 0);
+
+        // Unbind shading rate image & restore 1x1
+        cmd5->RSSetShadingRateImage(nullptr);
+        cmd5->RSSetShadingRate(gpu::to_d3d12_shading_rate(VrsShadingRate::Rate1x1), nullptr);
+
+        // Readback
+        D3D12_RESOURCE_BARRIER rt_bar{};
+        rt_bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rt_bar.Transition = {rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                             D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cmd5->ResourceBarrier(1, &rt_bar);
+
+        D3D12_TEXTURE_COPY_LOCATION rb_dst{rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        rb_dst.PlacedFootprint = rt_fp;
+        D3D12_TEXTURE_COPY_LOCATION rb_src{rt, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        cmd5->CopyTextureRegion(&rb_dst, 0, 0, 0, &rb_src, nullptr);
+
+        KX_CHECK(SUCCEEDED(cmd5->Close()), "Close cmd5");
+        ID3D12CommandList* lists[] = {cmd5};
+        queue->ExecuteCommandLists(1, lists);
+
+        ID3D12Fence* fence = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "CreateFence");
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        queue->Signal(fence, 1);
+        fence->SetEventOnCompletion(1, ev);
+        KX_CHECK(WaitForSingleObject(ev, 5000) == WAIT_OBJECT_0, "VRS GPU fence wait");
+        CloseHandle(ev);
+
+        // Verify KxGraphicsCommandListProxy VRS Tier 2 telemetry counters
+        const auto stats = hle::d3d12x_stats();
+        KX_CHECK(stats.vrs_rate_sets == 2u, "Expected 2 RSSetShadingRate calls tracked");
+        KX_CHECK(stats.vrs_image_binds == 2u, "Expected 2 RSSetShadingRateImage calls tracked");
+        KX_CHECK(stats.draw_calls == 1u && stats.pso_binds == 1u && stats.barrier_calls == 2u,
+                 "Expected draw/pso/barrier telemetry on ID3D12GraphicsCommandList5 proxy");
+
+        // Verify hardware VRS Tier 2 shading behavior on readback pixels:
+        //  1) Center [64..192)x[64..192) was shaded at 1x1 -> every adjacent pixel alternates R (x) and G (y).
+        //  2) Outer [0..64)x[0..64) was shaded at outer_axes (4x4 or 2x2) -> every aligned coarse block is uniform!
+        uint8_t* pixels = nullptr;
+        KX_CHECK(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&pixels))), "MapRB");
+        auto pixel_at = [&](uint32_t x, uint32_t y) -> const uint8_t* {
+            return pixels + static_cast<size_t>(y) * rt_fp.Footprint.RowPitch + static_cast<size_t>(x) * 4u;
+        };
+
+        for (uint32_t y = 64u; y < 192u; y += 2u) {
+            for (uint32_t x = 64u; x < 192u; x += 2u) {
+                const uint8_t* p00 = pixel_at(x, y);
+                const uint8_t* p10 = pixel_at(x + 1u, y);
+                const uint8_t* p01 = pixel_at(x, y + 1u);
+                KX_CHECK(p00[3] == 255u && p10[3] == 255u && p01[3] == 255u, "Center alpha 255");
+                KX_CHECK(p00[0] != p10[0], "Center 1x1 must preserve per-pixel horizontal frequency");
+                KX_CHECK(p00[1] != p01[1], "Center 1x1 must preserve per-pixel vertical frequency");
+            }
+        }
+
+        for (uint32_t by = 0u; by < 64u; by += outer_axes.y) {
+            for (uint32_t bx = 0u; bx < 64u; bx += outer_axes.x) {
+                const uint8_t* ref = pixel_at(bx, by);
+                KX_CHECK(ref[3] == 255u, "Outer alpha 255");
+                for (uint32_t dy = 0u; dy < outer_axes.y; ++dy) {
+                    for (uint32_t dx = 0u; dx < outer_axes.x; ++dx) {
+                        const uint8_t* p = pixel_at(bx + dx, by + dy);
+                        KX_CHECK(p[0] == ref[0] && p[1] == ref[1] && p[2] == ref[2] && p[3] == ref[3],
+                                 std::format("Outer {}x{} coarse VRS block ({},{}) must broadcast uniform color",
+                                             outer_axes.x, outer_axes.y, bx, by));
+                    }
+                }
+            }
+        }
+        rb->Unmap(0, nullptr);
+
+        std::cout << std::format(
+            "    -> Hardware [{}] {} PASS (VRS Tier {} | tile={}x{} | center=1x1 outer={}x{} verified | rate_sets={} img_binds={})\n",
+            ad.index, ad.name, static_cast<int>(opt6.VariableShadingRateTier),
+            tile_size, tile_size, outer_axes.x, outer_axes.y,
+            stats.vrs_rate_sets, stats.vrs_image_binds);
+        ++tier2_verified;
+
+        fence->Release();
+        rtv_heap->Release();
+        rb->Release();
+        sri_up->Release();
+        sri_tex->Release();
+        rt->Release();
+        pso->Release();
+        rs->Release();
+        cmd5->Release();
+        alloc->Release();
+        queue->Release();
+        dev->Release();
+    }
+
+    factory->Release();
+    KX_CHECK(hw_seen >= 1, "At least one hardware GPU enumerated");
+    KX_CHECK(tier2_verified >= 1, "At least one hardware GPU verified for VRS Tier 2");
+}
+
 }  // namespace
 
 int main() {
@@ -2701,6 +3106,8 @@ int main() {
     run_test("SGD5 Game Shader Container Archive Parsing & Decompression", test_sgd5_shader_archive_and_decompression);
     run_test("RDNA2 VALU Hardware Precision Parity (NaN Med3, Fract Clamp, Signed BFE)", test_rdna2_valu_precision_parity);
     run_test("AMD Zen 2 VEH Shim SSE4a Instruction Emulation (EXTRQ / INSERTQ on Intel & AMD)", test_veh_zen2_sse4a_extrq_insertq);
+    run_test("RDNA2 VRS Tier 2 Rate/Tile Encode-Decode, Combiners & Shading Rate Image Builder", test_vrs_tier2_encode_decode_combiners_and_image);
+    run_test("D3D12.X ID3D12GraphicsCommandList5 VRS Tier 2 Hardware Render & Telemetry", test_vrs_tier2_hardware_render_and_proxy_telemetry);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

@@ -29,10 +29,13 @@ struct D3D12XStats {
     uint64_t pso_binds = 0;
     uint64_t compute_queues_created = 0;
     uint64_t inter_queue_fences = 0;
+    uint64_t vrs_rate_sets = 0;
+    uint64_t vrs_image_binds = 0;
 };
 
-// Pure COM wrapper around ID3D12GraphicsCommandList for draw/dispatch/barrier telemetry.
-class KxGraphicsCommandListProxy final : public ID3D12GraphicsCommandList {
+// Pure COM wrapper around ID3D12GraphicsCommandList..ID3D12GraphicsCommandList5
+// for draw/dispatch/barrier/VRS Tier 2 telemetry.
+class KxGraphicsCommandListProxy final : public ID3D12GraphicsCommandList5 {
 public:
     explicit KxGraphicsCommandListProxy(ID3D12GraphicsCommandList* inner);
     ~KxGraphicsCommandListProxy();
@@ -102,9 +105,43 @@ public:
     void STDMETHODCALLTYPE EndEvent() override;
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* pCommandSignature, UINT MaxCommandCount, ID3D12Resource* pArgumentBuffer, UINT64 ArgumentBufferOffset, ID3D12Resource* pCountBuffer, UINT64 CountBufferOffset) override;
 
+    // ID3D12GraphicsCommandList1
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource* pDstBuffer, UINT64 DstOffset, ID3D12Resource* pSrcBuffer, UINT64 SrcOffset, UINT Dependencies, ID3D12Resource* const* ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64* pDependentSubresourceRanges) override;
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource* pDstBuffer, UINT64 DstOffset, ID3D12Resource* pSrcBuffer, UINT64 SrcOffset, UINT Dependencies, ID3D12Resource* const* ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64* pDependentSubresourceRanges) override;
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT Min, FLOAT Max) override;
+    void STDMETHODCALLTYPE SetSamplePositions(UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION* pSamplePositions) override;
+    void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource* pSrcResource, UINT SrcSubresource, D3D12_RECT* pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode) override;
+    void STDMETHODCALLTYPE SetViewInstanceMask(UINT Mask) override;
+
+    // ID3D12GraphicsCommandList2
+    void STDMETHODCALLTYPE WriteBufferImmediate(UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* pParams, const D3D12_WRITEBUFFERIMMEDIATE_MODE* pModes) override;
+
+    // ID3D12GraphicsCommandList3
+    void STDMETHODCALLTYPE SetProtectedResourceSession(ID3D12ProtectedResourceSession* pProtectedResourceSession) override;
+
+    // ID3D12GraphicsCommandList4
+    void STDMETHODCALLTYPE BeginRenderPass(UINT NumRenderTargets, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* pRenderTargets, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* pDepthStencil, D3D12_RENDER_PASS_FLAGS Flags) override;
+    void STDMETHODCALLTYPE EndRenderPass() override;
+    void STDMETHODCALLTYPE InitializeMetaCommand(ID3D12MetaCommand* pMetaCommand, const void* pInitializationParametersData, SIZE_T InitializationParametersDataSizeInBytes) override;
+    void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand* pMetaCommand, const void* pExecutionParametersData, SIZE_T ExecutionParametersDataSizeInBytes) override;
+    void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc, UINT NumPostbuildInfoDescs, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs) override;
+    void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pDesc, UINT NumSourceAccelerationStructures, const D3D12_GPU_VIRTUAL_ADDRESS* pSourceAccelerationStructureData) override;
+    void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData, D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode) override;
+    void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject* pStateObject) override;
+    void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC* pDesc) override;
+
+    // ID3D12GraphicsCommandList5 (VRS Tier 1/2)
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE baseShadingRate, const D3D12_SHADING_RATE_COMBINER* combiners) override;
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* shadingRateImage) override;
+
 private:
     std::atomic<ULONG> ref_{1};
     ID3D12GraphicsCommandList* inner_ = nullptr;
+    ID3D12GraphicsCommandList1* inner1_ = nullptr;
+    ID3D12GraphicsCommandList2* inner2_ = nullptr;
+    ID3D12GraphicsCommandList3* inner3_ = nullptr;
+    ID3D12GraphicsCommandList4* inner4_ = nullptr;
+    ID3D12GraphicsCommandList5* inner5_ = nullptr;
 };
 
 // Pure COM wrapper around ID3D12CommandQueue (zero driver vtable patching).

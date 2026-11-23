@@ -40,6 +40,7 @@ add_library(kestrel_core STATIC
     src/gpu/shader_container.cpp
     src/gpu/shader_cache.cpp
     src/gpu/ir.cpp
+    src/gpu/ir_opt.cpp
     src/gpu/rdna2_recomp.cpp
     src/gpu/dxc_compiler.cpp
     src/gpu/gpu_runner.cpp

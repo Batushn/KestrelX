@@ -5162,6 +5162,136 @@ void test_xaudio2_pitch_resampling_submix_and_x3daudio() {
     xa->Release();
 }
 
+// ============================================================================
+
+struct SynthPeBuilder {
+    static constexpr uint32_t kHeaderSize = 0x400;
+    static constexpr uint32_t kTextRva = 0x1000;
+    static constexpr uint32_t kTextRaw = 0x400;
+    static constexpr uint32_t kTextSize = 0x1000;
+    static constexpr uint32_t kDataRva = 0x2000;
+    static constexpr uint32_t kDataRaw = 0x1400;
+    static constexpr uint32_t kDataSize = 0x1000;
+    static constexpr uint32_t kDefaultImageSize = 0x3000;
+
+    std::vector<uint8_t> raw;
+    uint32_t data_cursor = 0;
+
+    explicit SynthPeBuilder(bool is_dll = false, uint64_t image_base = 0x0000000140000000ull)
+        : raw(kDataRaw + kDataSize, 0) {
+        IMAGE_DOS_HEADER dos{};
+        dos.e_magic = IMAGE_DOS_SIGNATURE;
+        dos.e_lfanew = 0x80;
+        write_pod(0, dos);
+
+        const uint32_t sig = IMAGE_NT_SIGNATURE;
+        write_pod(0x80, sig);
+
+        IMAGE_FILE_HEADER fh{};
+        fh.Machine = IMAGE_FILE_MACHINE_AMD64;
+        fh.NumberOfSections = 2;
+        fh.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        fh.Characteristics = static_cast<uint16_t>(
+            IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | (is_dll ? IMAGE_FILE_DLL : 0));
+        write_pod(0x84, fh);
+
+        IMAGE_OPTIONAL_HEADER64 opt{};
+        opt.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        opt.ImageBase = image_base;
+        opt.SectionAlignment = 0x1000;
+        opt.FileAlignment = 0x200;
+        opt.SizeOfImage = kDefaultImageSize;
+        opt.SizeOfHeaders = kHeaderSize;
+        opt.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+        opt.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        write_pod(0x84 + sizeof(IMAGE_FILE_HEADER), opt);
+
+        const size_t sec_off = 0x84 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64);
+        IMAGE_SECTION_HEADER text{};
+        std::memcpy(text.Name, ".text", 5);
+        text.Misc.VirtualSize = kTextSize;
+        text.VirtualAddress = kTextRva;
+        text.SizeOfRawData = kTextSize;
+        text.PointerToRawData = kTextRaw;
+        text.Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+        write_pod(sec_off, text);
+
+        IMAGE_SECTION_HEADER data{};
+        std::memcpy(data.Name, ".data", 5);
+        data.Misc.VirtualSize = kDataSize;
+        data.VirtualAddress = kDataRva;
+        data.SizeOfRawData = kDataSize;
+        data.PointerToRawData = kDataRaw;
+        data.Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+        write_pod(sec_off + sizeof(IMAGE_SECTION_HEADER), data);
+    }
+
+    template <typename T>
+    void write_pod(size_t file_off, const T& v) {
+        std::memcpy(raw.data() + file_off, &v, sizeof(T));
+    }
+
+    IMAGE_OPTIONAL_HEADER64& opt_hdr() {
+        return *reinterpret_cast<IMAGE_OPTIONAL_HEADER64*>(raw.data() + 0x84 + sizeof(IMAGE_FILE_HEADER));
+    }
+
+    IMAGE_SECTION_HEADER& sec_hdr(size_t idx) {
+        const size_t sec_off = 0x84 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64);
+        return *reinterpret_cast<IMAGE_SECTION_HEADER*>(raw.data() + sec_off + idx * sizeof(IMAGE_SECTION_HEADER));
+    }
+
+    void set_data_dir(size_t index, uint32_t rva, uint32_t size) {
+        opt_hdr().DataDirectory[index].VirtualAddress = rva;
+        opt_hdr().DataDirectory[index].Size = size;
+    }
+
+    void write_text(uint32_t offset_in_text, const void* src, size_t len) {
+        std::memcpy(raw.data() + kTextRaw + offset_in_text, src, len);
+    }
+
+    uint32_t alloc_data(uint32_t bytes, uint32_t align = 8) {
+        data_cursor = (data_cursor + align - 1u) & ~(align - 1u);
+        const uint32_t rva = kDataRva + data_cursor;
+        data_cursor += bytes;
+        return rva;
+    }
+
+    size_t data_rva_to_raw(uint32_t rva) const {
+        return kDataRaw + (rva - kDataRva);
+    }
+
+    uint32_t write_cstring(std::string_view s) {
+        const uint32_t rva = alloc_data(static_cast<uint32_t>(s.size() + 1), 1);
+        std::memcpy(raw.data() + data_rva_to_raw(rva), s.data(), s.size());
+        raw[data_rva_to_raw(rva) + s.size()] = 0;
+        return rva;
+    }
+
+    uint32_t write_hint_name(std::string_view name, uint16_t hint = 0) {
+        const uint32_t rva = alloc_data(static_cast<uint32_t>(2 + name.size() + 1), 2);
+        const size_t off = data_rva_to_raw(rva);
+        write_pod(off, hint);
+        std::memcpy(raw.data() + off + 2, name.data(), name.size());
+        raw[off + 2 + name.size()] = 0;
+        return rva;
+    }
+
+    template <typename T>
+    void write_at_data_rva(uint32_t rva, const T& v) {
+        write_pod(data_rva_to_raw(rva), v);
+    }
+
+    void write_file(const fs::path& p) const {
+        std::ofstream ofs(p, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+    }
+};
+
+uint32_t __cdecl mock_delay_func() { return 0xCAFE1111u; }
+uint32_t __cdecl mock_delay_ord_func() { return 0xCAFE2222u; }
+uint32_t __cdecl mock_hle_fwd_func() { return 0xCAFE3333u; }
+uint32_t __cdecl mock_ord_reg_func() { return 0xCAFE4444u; }
+
 void test_pe_delay_load_import_parsing_and_loading() {
     // 1. Parse both RVA-based (grAttrs=1) and legacy VA-based (grAttrs=0) delay-load descriptors
     constexpr uint64_t kBase = 0x10000000ull;

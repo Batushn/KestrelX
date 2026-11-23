@@ -31,6 +31,8 @@ struct D3D12XStats {
     uint64_t inter_queue_fences = 0;
     uint64_t vrs_rate_sets = 0;
     uint64_t vrs_image_binds = 0;
+    uint64_t work_graphs_created = 0;
+    uint64_t work_graph_dispatches = 0;
 };
 
 // Pure COM wrapper around ID3D12GraphicsCommandList..ID3D12GraphicsCommandList5
@@ -261,6 +263,8 @@ void set_d3d12x_shader_cache_dir(const std::filesystem::path& cache_dir);
 void clear_d3d12x_memory_shader_cache();
 void shutdown_d3d12x_window();
 void register_d3d12x(Registry& reg);
+void record_work_graph_created();
+void record_work_graph_dispatch(uint64_t count = 1);
 D3D12XStats d3d12x_stats();
 void reset_d3d12x_stats();
 

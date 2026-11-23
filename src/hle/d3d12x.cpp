@@ -29,7 +29,9 @@ std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0},
     g_gfx_pso_recomp{0}, g_gfx_pso_cache_hits{0}, g_stream_pso_recomp{0},
     g_disk_cache_hits{0}, g_disk_cache_misses{0}, g_device_qi_upgrades{0},
     g_draw_calls{0}, g_dispatch_calls{0}, g_barrier_calls{0}, g_pso_binds{0},
-    g_compute_queues{0}, g_inter_queue_fences{0}, g_vrs_rate_sets{0}, g_vrs_image_binds{0};
+    g_compute_queues{0}, g_inter_queue_fences{0},
+    g_vrs_rate_sets{0}, g_vrs_image_binds{0},
+    g_work_graphs_created{0}, g_work_graph_dispatches{0};
 
 std::mutex g_present_mtx;
 bool g_windowed = false;
@@ -851,6 +853,14 @@ void register_d3d12x(Registry& reg) {
     }
 }
 
+void record_work_graph_created() {
+    g_work_graphs_created.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_work_graph_dispatch(uint64_t count) {
+    g_work_graph_dispatches.fetch_add(count, std::memory_order_relaxed);
+}
+
 D3D12XStats d3d12x_stats() {
     return {g_devices.load(), g_queues.load(), g_cmd_lists.load(), g_resources.load(),
             g_zero_mem.load(), g_presents.load(), g_pso_recomp.load(), g_pso_cache_hits.load(),
@@ -858,7 +868,8 @@ D3D12XStats d3d12x_stats() {
             g_disk_cache_hits.load(), g_disk_cache_misses.load(), g_device_qi_upgrades.load(),
             g_draw_calls.load(), g_dispatch_calls.load(), g_barrier_calls.load(), g_pso_binds.load(),
             g_compute_queues.load(), g_inter_queue_fences.load(),
-            g_vrs_rate_sets.load(), g_vrs_image_binds.load()};
+            g_vrs_rate_sets.load(), g_vrs_image_binds.load(),
+            g_work_graphs_created.load(), g_work_graph_dispatches.load()};
 }
 
 void reset_d3d12x_stats() {
@@ -866,7 +877,8 @@ void reset_d3d12x_stats() {
         g_pso_recomp = g_pso_cache_hits = g_gfx_pso_recomp = g_gfx_pso_cache_hits =
         g_stream_pso_recomp = g_disk_cache_hits = g_disk_cache_misses = g_device_qi_upgrades =
         g_draw_calls = g_dispatch_calls = g_barrier_calls = g_pso_binds = g_compute_queues =
-        g_inter_queue_fences = g_vrs_rate_sets = g_vrs_image_binds = 0;
+        g_inter_queue_fences = g_vrs_rate_sets = g_vrs_image_binds =
+        g_work_graphs_created = g_work_graph_dispatches = 0;
     {
         std::lock_guard lock(g_shader_cache_mtx);
         g_dxil_cache.clear();

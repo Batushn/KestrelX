@@ -11,6 +11,7 @@ const char* sopp_name(uint32_t op) {
         case 0: return "s_nop";
         case 1: return "s_endpgm";
         case 2: return "s_branch";
+        case 3: return "s_sendmsg";
         case 4: return "s_cbranch_scc0";
         case 5: return "s_cbranch_scc1";
         case 6: return "s_cbranch_vccz";
@@ -19,6 +20,7 @@ const char* sopp_name(uint32_t op) {
         case 9: return "s_cbranch_execnz";
         case 10: return "s_barrier";
         case 12: return "s_waitcnt";
+        case 16: return "s_sendmsg";
         case 27: return "s_endpgm_saved";
         default: return nullptr;
     }
@@ -439,16 +441,26 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
 std::string disassemble_inst(const DecodedInst& d) {
     switch (d.enc) {
         case Encoding::SOPP:
+            if (d.mnemonic == "s_sendmsg") {
+                const uint16_t raw = static_cast<uint16_t>(d.simm16);
+                const uint16_t msg_id = raw & 0xFu;
+                if (msg_id == kSendMsgGsAllocReq) return "s_sendmsg sendmsg(GS_ALLOC_REQ)";
+                if (msg_id == kSendMsgDispatchMesh) return "s_sendmsg sendmsg(DISPATCH_MESH)";
+                if (msg_id == kSendMsgGsDone) return "s_sendmsg sendmsg(GS_DONE)";
+                if (msg_id == kSendMsgGs) return "s_sendmsg sendmsg(GS)";
+                return std::format("s_sendmsg {:#x}", raw);
+            }
             return d.is_branch ? std::format("{} -> {:#x}", d.mnemonic, d.branch_target)
                                : (d.simm16 ? std::format("{} {}", d.mnemonic, d.simm16) : d.mnemonic);
         case Encoding::SOP1:
-            return std::format("{} s{}, {}", d.mnemonic, d.dst, format_rdna2_operand(d.src0, d.has_literal, d.literal));
+            return std::format("{} {}, {}", d.mnemonic, format_rdna2_operand(d.dst, false, 0),
+                               format_rdna2_operand(d.src0, d.has_literal, d.literal));
         case Encoding::SOP2:
-            return std::format("{} s{}, {}, {}", d.mnemonic, d.dst,
+            return std::format("{} {}, {}, {}", d.mnemonic, format_rdna2_operand(d.dst, false, 0),
                                format_rdna2_operand(d.src0, d.has_literal, d.literal),
                                format_rdna2_operand(d.src1, d.has_literal, d.literal));
         case Encoding::SOPK:
-            return std::format("{} s{}, {}", d.mnemonic, d.dst, d.simm16);
+            return std::format("{} {}, {}", d.mnemonic, format_rdna2_operand(d.dst, false, 0), d.simm16);
         case Encoding::SOPC:
             return std::format("{} {}, {}", d.mnemonic,
                                format_rdna2_operand(d.src0, d.has_literal, d.literal),
@@ -478,6 +490,7 @@ std::string disassemble_inst(const DecodedInst& d) {
         case Encoding::EXP: {
             std::string tgt = (d.opcode <= 7) ? std::format("mrt{}", d.opcode)
                               : (d.opcode >= 12 && d.opcode <= 15) ? std::format("pos{}", d.opcode - 12)
+                              : (d.opcode == kExpTargetPrim0) ? "prim0"
                               : (d.opcode >= 32) ? std::format("param{}", d.opcode - 32)
                               : std::format("tgt{}", d.opcode);
             return std::format("exp {} v{}, v{}, v{}, v{}{}", tgt, d.src0, d.src1, d.src2, d.src3,

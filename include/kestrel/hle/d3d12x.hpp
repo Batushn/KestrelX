@@ -183,7 +183,7 @@ private:
 
 // Pure COM wrapper around a real PC ID3D12Device / ID3D12Device1 / ID3D12Device2
 // with clean QueryInterface forwarding up to ID3D12Device10.
-// Automatically intercepts native RDNA2 containers ("KXRN"/"KXRV"/"KXRP") in
+// Automatically intercepts native RDNA2 containers ("KXRN"/"KXRV"/"KXRP"/"KXRM"/"KXRA") in
 // CreateComputePipelineState, CreateGraphicsPipelineState, and CreatePipelineState
 // (D3D12_PIPELINE_STATE_STREAM_DESC), recompiling to SM 6.6 DXIL with RAM + on-disk cache.
 class KxDeviceProxy final : public ID3D12Device2 {

@@ -3657,6 +3657,598 @@ void test_work_graph_rdna2_execute_indirect_dual_gpu() {
 
 }  // namespace
 
+void test_rdna2_mesh_amplification_decode_ir_dxc() {
+    using namespace gpu::encode;
+
+    // 1. Clean-room RDNA2 Mesh Shader (ms_6_6): 4 vertices, 2 triangles (quad)
+    std::vector<uint32_t> ms_words;
+    mesh_alloc(ms_words, 4, 2);
+    ms_words.push_back(vop2(27, 1, 128 + 3, 0));         // v1 = gidx & 3
+    ms_words.push_back(vop2(26, 1, 128 + 5, 1));         // v1 = (gidx & 3) * 32
+    mubuf(ms_words, 14, 2, 1, 0, 128, 0);                // buffer_load_dwordx4 v[2:5] (pos)
+    mubuf(ms_words, 14, 6, 1, 0, 128, 16);               // buffer_load_dwordx4 v[6:9] (color)
+    exp(ms_words, gpu::kExpTargetPos0, 0xFu, 2, 3, 4, 5, false);
+    exp(ms_words, gpu::kExpTargetParam0, 0xFu, 6, 7, 8, 9, false);
+    ms_words.push_back(vop2(26, 10, 128 + 1, 0));        // v10 = gidx * 2
+    ms_words.push_back(vop1(1, 11, 128 + 1));            // v11 = 1
+    ms_words.push_back(vop2(37, 12, 128 + 2, 0));        // v12 = gidx + 2
+    exp_prim0(ms_words, 10, 11, 12, true);
+    ms_words.push_back(sopp(1));                         // s_endpgm
+
+    auto ms_dec = gpu::decode_rdna2(ms_words.data(), ms_words.size());
+    KX_CHECK(ms_dec.size() >= 10, "Mesh shader decode count");
+    bool saw_sendmsg = false, saw_prim0 = false, saw_m0_disasm = false;
+    for (const auto& d : ms_dec) {
+        const std::string dis = gpu::disassemble_inst(d);
+        if (d.mnemonic == "s_sendmsg" && dis.find("GS_ALLOC_REQ") != std::string::npos) saw_sendmsg = true;
+        if (d.enc == gpu::Encoding::EXP && d.opcode == gpu::kExpTargetPrim0 && dis.find("prim0") != std::string::npos) saw_prim0 = true;
+        if (d.mnemonic == "s_mov_b32" && dis.find("m0") != std::string::npos) saw_m0_disasm = true;
+    }
+    KX_CHECK(saw_sendmsg && saw_prim0 && saw_m0_disasm, "Decoded s_sendmsg(GS_ALLOC_REQ), m0, and exp prim0");
+
+    auto ms_ir = gpu::lift_rdna2_to_ir(ms_dec);
+    KX_CHECK(ms_ir.unknown_count == 0, "Mesh shader IR has zero unknown ops");
+    KX_CHECK(ms_ir.max_mesh_verts == 4 && ms_ir.max_mesh_prims == 2, "IR tracked max_mesh_verts=4, max_mesh_prims=2");
+    KX_CHECK(ms_ir.mesh_param_mask == 1u, "IR tracked mesh_param_mask bit 0 (param0)");
+
+    bool has_set_counts = false, has_vtx_exp = false, has_prim_exp = false;
+    for (const auto& blk : ms_ir.blocks) {
+        for (const auto& inst : blk.insts) {
+            if (inst.op == gpu::IrOp::SetMeshOutputCounts) has_set_counts = true;
+            if (inst.op == gpu::IrOp::MeshExportVertex) has_vtx_exp = true;
+            if (inst.op == gpu::IrOp::MeshExportPrimitive) has_prim_exp = true;
+        }
+    }
+    KX_CHECK(has_set_counts && has_vtx_exp && has_prim_exp, "IR lifted SetMeshOutputCounts + MeshExportVertex + MeshExportPrimitive");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+
+    auto ms_recomp = gpu::emit_hlsl_from_ir(ms_ir, {
+        .stage = gpu::ShaderStage::Mesh,
+        .wave_mode = gpu::WaveMode::Wave32,
+        .group_size_x = 32,
+    });
+    KX_CHECK(ms_recomp.hlsl.find("[outputtopology(\"triangle\")]") != std::string::npos, "MS outputtopology");
+    KX_CHECK(ms_recomp.hlsl.find("SetMeshOutputCounts(") != std::string::npos, "MS SetMeshOutputCounts");
+    KX_CHECK(ms_recomp.hlsl.find("out vertices KxMeshVert kx_verts[4]") != std::string::npos, "MS out vertices[4]");
+    KX_CHECK(ms_recomp.hlsl.find("out indices uint3 kx_tris[2]") != std::string::npos, "MS out indices[2]");
+
+    auto ms_dxil = dxc.compile_hlsl(ms_recomp.hlsl, "main", "ms_6_6");
+    KX_CHECK(ms_dxil.has_value(), ms_dxil.error().message);
+    KX_CHECK(ms_dxil->dxil.size() > 64 && std::memcmp(ms_dxil->dxil.data(), "DXBC", 4) == 0, "Valid ms_6_6 DXIL");
+
+    // 2. Packed GFX10.3 prim0 (en=0x1) + param1 + payload-receiving MS (ms_6_6)
+    std::vector<uint32_t> ms_packed_words;
+    mesh_alloc(ms_packed_words, 3, 1);
+    ms_packed_words.push_back(vop1(1, 2, 128));          // v2 = 0.0
+    ms_packed_words.push_back(vop1(1, 3, 242));          // v3 = 1.0
+    exp(ms_packed_words, gpu::kExpTargetPos0, 0xFu, 2, 2, 2, 3, false);
+    exp(ms_packed_words, gpu::kExpTargetParam0 + 1, 0xFu, 3, 2, 2, 3, false);
+    // Packed prim0: null=0, i0=0, i1=1, i2=2 -> (0 << 1) | (1 << 10) | (2 << 19)
+    ms_packed_words.push_back(vop1(1, 4, 255));
+    ms_packed_words.push_back((0u << 1) | (1u << 10) | (2u << 19));
+    exp_prim0_packed(ms_packed_words, 4, true);
+    ms_packed_words.push_back(sopp(1));
+
+    auto ms_packed_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(ms_packed_words.data(), ms_packed_words.size()));
+    KX_CHECK(ms_packed_ir.unknown_count == 0 && ms_packed_ir.max_mesh_verts == 3 && ms_packed_ir.max_mesh_prims == 1,
+             "Packed MS IR metadata");
+    KX_CHECK((ms_packed_ir.mesh_param_mask & (1u << 1)) != 0u, "IR tracked param1 in mesh_param_mask");
+
+    auto ms_payload_recomp = gpu::emit_hlsl_from_ir(ms_packed_ir, {
+        .stage = gpu::ShaderStage::Mesh,
+        .wave_mode = gpu::WaveMode::Wave32,
+        .group_size_x = 32,
+        .mesh_has_payload = true,
+    });
+    KX_CHECK(ms_payload_recomp.hlsl.find("in payload KxMeshPayload kx_payload") != std::string::npos, "MS in payload");
+    KX_CHECK(ms_payload_recomp.hlsl.find("TEXCOORD1") != std::string::npos, "MS param1 TEXCOORD1");
+    auto ms_payload_dxil = dxc.compile_hlsl(ms_payload_recomp.hlsl, "main", "ms_6_6");
+    KX_CHECK(ms_payload_dxil.has_value(), ms_payload_dxil.error().message);
+
+    // 3. Clean-room RDNA2 Amplification Shader (as_6_6): write payload + DispatchMesh(1, 1, 1)
+    std::vector<uint32_t> as_words;
+    as_words.push_back(vop1(1, 1, 128));                 // v1 = 0 (byte offset 0)
+    as_words.push_back(vop1(1, 2, 242));                 // v2 = 1.0f
+    ds(as_words, 13, 0, 1, 2, 0, 0);                     // ds_write_b32 payload[0] = 1.0f
+    as_words.push_back(sopp(10));                        // s_barrier
+    dispatch_mesh(as_words, 1, 1, 1);
+    as_words.push_back(sopp(1));                         // s_endpgm
+
+    auto as_dec = gpu::decode_rdna2(as_words.data(), as_words.size());
+    bool saw_dispatch_disasm = false;
+    for (const auto& d : as_dec) {
+        if (gpu::disassemble_inst(d).find("DISPATCH_MESH") != std::string::npos) saw_dispatch_disasm = true;
+    }
+    KX_CHECK(saw_dispatch_disasm, "Decoded s_sendmsg(DISPATCH_MESH)");
+
+    auto as_ir = gpu::lift_rdna2_to_ir(as_dec);
+    KX_CHECK(as_ir.unknown_count == 0 && as_ir.uses_lds, "AS IR lift");
+    bool has_dispatch_op = false;
+    for (const auto& blk : as_ir.blocks) {
+        for (const auto& inst : blk.insts) {
+            if (inst.op == gpu::IrOp::DispatchMeshPayload) has_dispatch_op = true;
+        }
+    }
+    KX_CHECK(has_dispatch_op, "IR lifted DispatchMeshPayload");
+
+    auto as_recomp = gpu::emit_hlsl_from_ir(as_ir, {
+        .stage = gpu::ShaderStage::Amplification,
+        .wave_mode = gpu::WaveMode::Wave32,
+        .group_size_x = 32,
+    });
+    KX_CHECK(as_recomp.hlsl.find("groupshared KxMeshPayload kx_payload;") != std::string::npos, "AS groupshared payload");
+    KX_CHECK(as_recomp.hlsl.find("DispatchMesh(") != std::string::npos, "AS DispatchMesh emit");
+
+    auto as_dxil = dxc.compile_hlsl(as_recomp.hlsl, "main", "as_6_6");
+    KX_CHECK(as_dxil.has_value(), as_dxil.error().message);
+    KX_CHECK(as_dxil->dxil.size() > 64 && std::memcmp(as_dxil->dxil.data(), "DXBC", 4) == 0, "Valid as_6_6 DXIL");
+
+    // 4. Multi-block branching Amplification Shader compiles cleanly (top-level uniform DispatchMesh)
+    std::vector<uint32_t> as_cfg_words;
+    as_cfg_words.push_back(sopc(6, 4, 128));             // s_cmp_eq_u32 s4 (gid.x), 0
+    as_cfg_words.push_back(sopp(4, 3));                  // s_cbranch_scc0 +3 dwords -> skip dispatch_mesh(1,1,1)
+    dispatch_mesh(as_cfg_words, 1, 1, 1);                // 3 dwords (s_mov_b32 m0 + lit + s_sendmsg)
+    as_cfg_words.push_back(sopp(1));                     // s_endpgm
+    auto as_cfg_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(as_cfg_words.data(), as_cfg_words.size()));
+    KX_CHECK(as_cfg_ir.blocks.size() >= 2 && as_cfg_ir.unknown_count == 0, "Multi-block AS IR");
+    auto as_cfg_recomp = gpu::emit_hlsl_from_ir(as_cfg_ir, {
+        .stage = gpu::ShaderStage::Amplification,
+        .wave_mode = gpu::WaveMode::Wave32,
+        .group_size_x = 32,
+    });
+    auto as_cfg_dxil = dxc.compile_hlsl(as_cfg_recomp.hlsl, "main", "as_6_6");
+    KX_CHECK(as_cfg_dxil.has_value(), as_cfg_dxil.error().message);
+}
+
+void test_rdna2_mesh_shader_dispatch_mesh_hardware_parity() {
+    using namespace gpu::encode;
+
+    // 1. Standalone Mesh Shader (ms_6_6): loads 4 quad vertices (pos + color) from t1, emits 2 triangles
+    std::vector<uint32_t> ms_words;
+    mesh_alloc(ms_words, 4, 2);
+    ms_words.push_back(vop2(27, 1, 128 + 3, 0));         // v1 = gidx & 3
+    ms_words.push_back(vop2(26, 1, 128 + 5, 1));         // v1 = (gidx & 3) * 32
+    mubuf(ms_words, 14, 2, 1, 0, 128, 0);                // v[2:5] = pos.xyzw
+    mubuf(ms_words, 14, 6, 1, 0, 128, 16);               // v[6:9] = color.rgba
+    exp(ms_words, gpu::kExpTargetPos0, 0xFu, 2, 3, 4, 5, false);
+    exp(ms_words, gpu::kExpTargetParam0, 0xFu, 6, 7, 8, 9, false);
+    ms_words.push_back(vop2(26, 10, 128 + 1, 0));        // v10 = gidx * 2  (0, 2)
+    ms_words.push_back(vop1(1, 11, 128 + 1));            // v11 = 1         (1, 1)
+    ms_words.push_back(vop2(37, 12, 128 + 2, 0));        // v12 = gidx + 2  (2, 3)
+    exp_prim0(ms_words, 10, 11, 12, true);
+    ms_words.push_back(sopp(1));
+
+    // 2. Amplification Shader (as_6_6): writes RGBA tint (0.75, 0.30, 0.90, 1.0) into KxMeshPayload[0..3]
+    std::vector<uint32_t> as_words;
+    auto write_payload_f32 = [&](uint32_t dword_idx, float val) {
+        as_words.push_back(vop1(1, 1, 128 + dword_idx * 4));  // v1 = byte offset
+        as_words.push_back(vop1(1, 2, 255));
+        as_words.push_back(std::bit_cast<uint32_t>(val));
+        ds(as_words, 13, 0, 1, 2, 0, 0);                      // ds_write_b32 kx_payload.data[dword_idx]
+    };
+    write_payload_f32(0, 0.75f);
+    write_payload_f32(1, 0.30f);
+    write_payload_f32(2, 0.90f);
+    write_payload_f32(3, 1.00f);
+    as_words.push_back(sopp(10));                             // s_barrier
+    dispatch_mesh(as_words, 1, 1, 1);
+    as_words.push_back(sopp(1));
+
+    // 3. Payload-receiving Mesh Shader (ms_6_6): reads pos from t1 and RGBA color from s[8..11] (KxMeshPayload)
+    std::vector<uint32_t> ms_pay_words;
+    mesh_alloc(ms_pay_words, 4, 2);
+    ms_pay_words.push_back(vop2(27, 1, 128 + 3, 0));     // v1 = gidx & 3
+    ms_pay_words.push_back(vop2(26, 1, 128 + 5, 1));     // v1 = (gidx & 3) * 32
+    mubuf(ms_pay_words, 14, 2, 1, 0, 128, 0);            // v[2:5] = pos.xyzw
+    ms_pay_words.push_back(vop1(1, 6, 8));               // v6 = s8  (payload.data[0])
+    ms_pay_words.push_back(vop1(1, 7, 9));               // v7 = s9  (payload.data[1])
+    ms_pay_words.push_back(vop1(1, 8, 10));              // v8 = s10 (payload.data[2])
+    ms_pay_words.push_back(vop1(1, 9, 11));              // v9 = s11 (payload.data[3])
+    exp(ms_pay_words, gpu::kExpTargetPos0, 0xFu, 2, 3, 4, 5, false);
+    exp(ms_pay_words, gpu::kExpTargetParam0, 0xFu, 6, 7, 8, 9, false);
+    ms_pay_words.push_back(vop2(26, 10, 128 + 1, 0));
+    ms_pay_words.push_back(vop1(1, 11, 128 + 1));
+    ms_pay_words.push_back(vop2(37, 12, 128 + 2, 0));
+    exp_prim0(ms_pay_words, 10, 11, 12, true);
+    ms_pay_words.push_back(sopp(1));
+
+    // 4. Pixel Shader (ps_6_6): export interpolated param0 -> mrt0
+    std::vector<uint32_t> ps_words;
+    exp(ps_words, 0, 0xFu, 0, 1, 2, 3, true);
+    ps_words.push_back(sopp(1));
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+
+    auto ms_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(ms_words.data(), ms_words.size()));
+    auto as_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(as_words.data(), as_words.size()));
+    auto ms_pay_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(ms_pay_words.data(), ms_pay_words.size()));
+    auto ps_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(ps_words.data(), ps_words.size()));
+
+    auto ms_hlsl = gpu::emit_hlsl_from_ir(ms_ir, {.stage = gpu::ShaderStage::Mesh, .wave_mode = gpu::WaveMode::Wave32, .group_size_x = 32});
+    auto as_hlsl = gpu::emit_hlsl_from_ir(as_ir, {.stage = gpu::ShaderStage::Amplification, .wave_mode = gpu::WaveMode::Wave32, .group_size_x = 32});
+    auto ms_pay_hlsl = gpu::emit_hlsl_from_ir(ms_pay_ir, {.stage = gpu::ShaderStage::Mesh, .wave_mode = gpu::WaveMode::Wave32, .group_size_x = 32, .mesh_has_payload = true});
+    auto ps_hlsl = gpu::emit_hlsl_from_ir(ps_ir, {.stage = gpu::ShaderStage::Pixel});
+
+    auto ms_dxil = dxc.compile_hlsl(ms_hlsl.hlsl, "main", "ms_6_6");
+    auto as_dxil = dxc.compile_hlsl(as_hlsl.hlsl, "main", "as_6_6");
+    auto ms_pay_dxil = dxc.compile_hlsl(ms_pay_hlsl.hlsl, "main", "ms_6_6");
+    auto ps_dxil = dxc.compile_hlsl(ps_hlsl.hlsl, "main", "ps_6_6");
+    KX_CHECK(ms_dxil.has_value(), ms_dxil.error().message);
+    KX_CHECK(as_dxil.has_value(), as_dxil.error().message);
+    KX_CHECK(ms_pay_dxil.has_value(), ms_pay_dxil.error().message);
+    KX_CHECK(ps_dxil.has_value(), ps_dxil.error().message);
+
+    // Quad vertices covering [-0.8, 0.8] x [-0.8, 0.8] with solid color (0.20, 0.80, 0.40, 1.00)
+    const float quad_data[32] = {
+        -0.8f, -0.8f, 0.0f, 1.0f,  0.20f, 0.80f, 0.40f, 1.0f,
+         0.8f, -0.8f, 0.0f, 1.0f,  0.20f, 0.80f, 0.40f, 1.0f,
+        -0.8f,  0.8f, 0.0f, 1.0f,  0.20f, 0.80f, 0.40f, 1.0f,
+         0.8f,  0.8f, 0.0f, 1.0f,  0.20f, 0.80f, 0.40f, 1.0f,
+    };
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "Adapters available");
+
+    IDXGIFactory6* factory = nullptr;
+    KX_CHECK(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))), "CreateDXGIFactory1");
+
+    constexpr uint32_t kW = 256, kH = 256;
+    std::vector<uint8_t> ref_ms_pixels;
+    std::vector<uint8_t> ref_as_pixels;
+    int verified = 0;
+
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        IDXGIAdapter1* dxgi_ad = nullptr;
+        if (FAILED(factory->EnumAdapters1(ad.index, &dxgi_ad))) continue;
+        ID3D12Device2* dev2 = nullptr;
+        HRESULT hr = D3D12CreateDevice(dxgi_ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev2));
+        dxgi_ad->Release();
+        if (FAILED(hr) || !dev2) continue;
+
+        D3D12_FEATURE_DATA_D3D12_OPTIONS7 opt7{};
+        if (FAILED(dev2->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opt7, sizeof(opt7))) ||
+            opt7.MeshShaderTier < D3D12_MESH_SHADER_TIER_1) {
+            std::cout << std::format("    -> Hardware [{}] {} skipped (MeshShaderTier == NOT_SUPPORTED)\n",
+                                     ad.index, ad.name);
+            dev2->Release();
+            continue;
+        }
+
+        // Root signature: SRV t1 (ByteAddressBuffer g_buf0) visible to Mesh shader
+        D3D12_ROOT_PARAMETER rp{};
+        rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rp.Descriptor.ShaderRegister = 1;
+        rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        D3D12_ROOT_SIGNATURE_DESC rsd{1, &rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ID3DBlob* rs_blob = nullptr;
+        ID3D12RootSignature* rs = nullptr;
+        KX_CHECK(SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, nullptr)), "SerializeRS");
+        KX_CHECK(SUCCEEDED(dev2->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&rs))), "CreateRS");
+        rs_blob->Release();
+
+        struct alignas(void*) SubRS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; ID3D12RootSignature* v = nullptr; };
+        struct alignas(void*) SubAS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS; D3D12_SHADER_BYTECODE v{}; };
+        struct alignas(void*) SubMS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS; D3D12_SHADER_BYTECODE v{}; };
+        struct alignas(void*) SubPS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS; D3D12_SHADER_BYTECODE v{}; };
+        struct alignas(void*) SubRast { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER; D3D12_RASTERIZER_DESC v{}; };
+        struct alignas(void*) SubBlend { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND; D3D12_BLEND_DESC v{}; uint32_t pad = 0; };
+        struct alignas(void*) SubRTV { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS; D3D12_RT_FORMAT_ARRAY v{}; };
+        struct alignas(void*) SubSamp { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC; DXGI_SAMPLE_DESC v{1, 0}; uint32_t pad = 0; };
+        struct alignas(void*) SubMask { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; UINT v = UINT_MAX; };
+
+        auto init_common = [&](auto& s) {
+            s.rs.v = rs;
+            s.rast.v.FillMode = D3D12_FILL_MODE_SOLID;
+            s.rast.v.CullMode = D3D12_CULL_MODE_NONE;
+            s.blend.v.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            s.rtv.v.NumRenderTargets = 1;
+            s.rtv.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        };
+
+        struct MeshOnlyStream { SubRS rs; SubMS ms; SubPS ps; SubRast rast; SubBlend blend; SubRTV rtv; SubSamp samp; SubMask mask; } ms_stream{};
+        init_common(ms_stream);
+        ms_stream.ms.v = {ms_dxil->dxil.data(), ms_dxil->dxil.size()};
+        ms_stream.ps.v = {ps_dxil->dxil.data(), ps_dxil->dxil.size()};
+        D3D12_PIPELINE_STATE_STREAM_DESC ms_desc{sizeof(ms_stream), &ms_stream};
+        ID3D12PipelineState* ms_pso = nullptr;
+        KX_CHECK(SUCCEEDED(dev2->CreatePipelineState(&ms_desc, IID_PPV_ARGS(&ms_pso))) && ms_pso, "Create MS+PS PSO");
+
+        struct AmpMeshStream { SubRS rs; SubAS as; SubMS ms; SubPS ps; SubRast rast; SubBlend blend; SubRTV rtv; SubSamp samp; SubMask mask; } as_stream{};
+        init_common(as_stream);
+        as_stream.as.v = {as_dxil->dxil.data(), as_dxil->dxil.size()};
+        as_stream.ms.v = {ms_pay_dxil->dxil.data(), ms_pay_dxil->dxil.size()};
+        as_stream.ps.v = {ps_dxil->dxil.data(), ps_dxil->dxil.size()};
+        D3D12_PIPELINE_STATE_STREAM_DESC as_desc{sizeof(as_stream), &as_stream};
+        ID3D12PipelineState* as_pso = nullptr;
+        KX_CHECK(SUCCEEDED(dev2->CreatePipelineState(&as_desc, IID_PPV_ARGS(&as_pso))) && as_pso, "Create AS+MS+PS PSO");
+
+        D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList6* cmd6 = nullptr;
+        KX_CHECK(SUCCEEDED(dev2->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))), "CreateCommandQueue");
+        KX_CHECK(SUCCEEDED(dev2->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))), "CreateCommandAllocator");
+        KX_CHECK(SUCCEEDED(dev2->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd6))), "CreateCommandList6");
+        cmd6->Close();
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+        ID3D12DescriptorHeap* rtv_heap = nullptr;
+        dev2->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap));
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+
+        D3D12_HEAP_PROPERTIES hp_def{}; hp_def.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_HEAP_PROPERTIES hp_up{}; hp_up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_HEAP_PROPERTIES hp_rb{}; hp_rb.Type = D3D12_HEAP_TYPE_READBACK;
+
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = kW; td.Height = kH; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ID3D12Resource* rt = nullptr;
+        dev2->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt));
+        dev2->CreateRenderTargetView(rt, nullptr, rtv_handle);
+
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = kW * kH * 4; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* rb = nullptr;
+        dev2->CreateCommittedResource(&hp_rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb));
+
+        D3D12_RESOURCE_DESC vbd = bd; vbd.Width = sizeof(quad_data);
+        ID3D12Resource* vb = nullptr;
+        dev2->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &vbd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vb));
+        void* mapped = nullptr;
+        vb->Map(0, nullptr, &mapped);
+        std::memcpy(mapped, quad_data, sizeof(quad_data));
+        vb->Unmap(0, nullptr);
+
+        ID3D12Fence* fence = nullptr;
+        dev2->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        UINT64 fence_val = 0;
+
+        auto run_dispatch_mesh = [&](ID3D12PipelineState* pso) -> std::vector<uint8_t> {
+            alloc->Reset();
+            cmd6->Reset(alloc, pso);
+            cmd6->SetGraphicsRootSignature(rs);
+            cmd6->SetGraphicsRootShaderResourceView(0, vb->GetGPUVirtualAddress());
+            D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kW), static_cast<float>(kH), 0.0f, 1.0f};
+            D3D12_RECT sr{0, 0, static_cast<LONG>(kW), static_cast<LONG>(kH)};
+            cmd6->RSSetViewports(1, &vp);
+            cmd6->RSSetScissorRects(1, &sr);
+            cmd6->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+            const float clear_zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            cmd6->ClearRenderTargetView(rtv_handle, clear_zero, 0, nullptr);
+            cmd6->DispatchMesh(1, 1, 1);
+
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition = {rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            cmd6->ResourceBarrier(1, &b);
+
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+            dst_loc.pResource = rb;
+            dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst_loc.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, kW, kH, 1, kW * 4};
+            D3D12_TEXTURE_COPY_LOCATION src_loc{};
+            src_loc.pResource = rt;
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cmd6->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            cmd6->ResourceBarrier(1, &b);
+            cmd6->Close();
+
+            ID3D12CommandList* cls[] = {cmd6};
+            queue->ExecuteCommandLists(1, cls);
+            ++fence_val;
+            queue->Signal(fence, fence_val);
+            fence->SetEventOnCompletion(fence_val, ev);
+            WaitForSingleObject(ev, 5000);
+
+            std::vector<uint8_t> pixels(kW * kH * 4);
+            uint8_t* ptr = nullptr;
+            rb->Map(0, nullptr, reinterpret_cast<void**>(&ptr));
+            std::memcpy(pixels.data(), ptr, pixels.size());
+            rb->Unmap(0, nullptr);
+            return pixels;
+        };
+
+        // Pass A: Standalone Mesh Shader + Pixel Shader (expected quad color 0.20, 0.80, 0.40, 1.0 -> 51, 204, 102, 255)
+        auto ms_px = run_dispatch_mesh(ms_pso);
+        const size_t corner = (4 * kW + 4) * 4;
+        const size_t tri0_px = (192 * kW + 64) * 4;
+        const size_t tri1_px = (64 * kW + 192) * 4;
+        const size_t center = (128 * kW + 128) * 4;
+        KX_CHECK(ms_px[corner + 0] == 0 && ms_px[corner + 1] == 0 && ms_px[corner + 2] == 0 && ms_px[corner + 3] == 0,
+                 "MS corner outside quad is cleared black");
+        for (size_t off : {tri0_px, tri1_px, center}) {
+            KX_CHECK(std::abs(static_cast<int>(ms_px[off + 0]) - 51) <= 1 &&
+                     std::abs(static_cast<int>(ms_px[off + 1]) - 204) <= 1 &&
+                     std::abs(static_cast<int>(ms_px[off + 2]) - 102) <= 1 &&
+                     ms_px[off + 3] == 255,
+                     "MS+PS DispatchMesh quad pixel matches expected RGBA (51,204,102,255)");
+        }
+
+        // Pass B: Amplification Shader + Payload Mesh Shader + Pixel Shader (payload tint 0.75, 0.30, 0.90, 1.0 -> 191, 77, 230, 255)
+        auto as_px = run_dispatch_mesh(as_pso);
+        KX_CHECK(as_px[corner + 0] == 0 && as_px[corner + 1] == 0 && as_px[corner + 2] == 0 && as_px[corner + 3] == 0,
+                 "AS+MS corner outside quad is cleared black");
+        KX_CHECK(std::abs(static_cast<int>(as_px[center + 0]) - 191) <= 1 &&
+                 std::abs(static_cast<int>(as_px[center + 1]) - 77) <= 1 &&
+                 std::abs(static_cast<int>(as_px[center + 2]) - 230) <= 1 &&
+                 as_px[center + 3] == 255,
+                 "AS+MS+PS DispatchMesh payload tint matches expected RGBA (191,77,230,255)");
+
+        if (ref_ms_pixels.empty()) {
+            ref_ms_pixels = std::move(ms_px);
+            ref_as_pixels = std::move(as_px);
+        } else {
+            KX_CHECK(ref_ms_pixels == ms_px, "Cross-GPU bit-exact MS+PS DispatchMesh parity");
+            KX_CHECK(ref_as_pixels == as_px, "Cross-GPU bit-exact AS+MS+PS DispatchMesh parity");
+        }
+
+        std::cout << std::format("    -> Hardware [{}] {} PASS (MeshShaderTier {}, MS+PS & AS+MS+PS DispatchMesh quad verified)\n",
+                                 ad.index, ad.name, static_cast<int>(opt7.MeshShaderTier));
+        ++verified;
+
+        CloseHandle(ev);
+        fence->Release();
+        vb->Release(); rb->Release(); rt->Release(); rtv_heap->Release();
+        cmd6->Release(); alloc->Release(); queue->Release();
+        as_pso->Release(); ms_pso->Release(); rs->Release(); dev2->Release();
+    }
+    factory->Release();
+    KX_CHECK(verified >= 1, "Expected at least 1 hardware GPU supporting D3D12 Mesh Shaders");
+}
+
+void test_d3d12x_mesh_stream_pso_recompilation() {
+    using namespace gpu::encode;
+    const fs::path cache_dir = fs::temp_directory_path() / "KestrelX_MeshStreamPsoTest";
+    std::error_code ec;
+    fs::remove_all(cache_dir, ec);
+
+    hle::reset_d3d12x_stats();
+    hle::set_d3d12x_shader_cache_dir(cache_dir);
+
+    hle::Registry reg;
+    hle::register_d3d12x(reg);
+    using CreateDevFn = HRESULT(__stdcall*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    auto create_dev = reinterpret_cast<CreateDevFn>(reg.resolve_name("d3d12_xs.dll", "D3D12CreateDevice"));
+    ID3D12Device2* dev2 = nullptr;
+    KX_CHECK(SUCCEEDED(create_dev(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev2))) && dev2, "Create KxDeviceProxy ID3D12Device2");
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 opt7{};
+    if (FAILED(dev2->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opt7, sizeof(opt7))) ||
+        opt7.MeshShaderTier < D3D12_MESH_SHADER_TIER_1) {
+        std::cout << "    -> Default adapter does not support Mesh Shaders; skipping stream PSO hardware test\n";
+        dev2->Release();
+        fs::remove_all(cache_dir, ec);
+        return;
+    }
+
+    auto make_container = [](const char magic[4], uint32_t hdr_u32, const std::vector<uint32_t>& words) {
+        std::vector<uint8_t> out(8 + words.size() * 4);
+        std::memcpy(out.data(), magic, 4);
+        std::memcpy(out.data() + 4, &hdr_u32, 4);
+        std::memcpy(out.data() + 8, words.data(), words.size() * 4);
+        return out;
+    };
+
+    // Build clean-room KXRM (fullscreen triangle from immediate floats) + KXRP containers
+    std::vector<uint32_t> ms_words;
+    mesh_alloc(ms_words, 3, 1);
+    // Emit vertex positions using v0 (0, 1, 2):
+    // v2 = -1.0 + 4.0 * float(v0 & 1)   -> x = -1, 3, -1
+    // v3 = -1.0 + 4.0 * float(v0 >> 1)  -> y = -1, -1, 3
+    ms_words.push_back(vop2(27, 4, 128 + 1, 0));         // v4 = v0 & 1
+    ms_words.push_back(vop1(6, 4, 256 + 4));             // v4 = float(v4)
+    vop3(ms_words, 0x14B, 2, 256 + 4, 246, 243);         // v2 = fma(v4, 4.0, -1.0)
+    ms_words.push_back(vop2(22, 5, 128 + 1, 0));         // v5 = v0 >> 1
+    ms_words.push_back(vop1(6, 5, 256 + 5));             // v5 = float(v5)
+    vop3(ms_words, 0x14B, 3, 256 + 5, 246, 243);         // v3 = fma(v5, 4.0, -1.0)
+    ms_words.push_back(vop1(1, 6, 128));                 // v6 = 0.0f
+    ms_words.push_back(vop1(1, 7, 242));                 // v7 = 1.0f
+    exp(ms_words, gpu::kExpTargetPos0, 0xFu, 2, 3, 6, 7, false);
+    // Color (0.5, 1.0, 0.0, 1.0)
+    ms_words.push_back(vop1(1, 8, 240));                 // v8 = 0.5f
+    exp(ms_words, gpu::kExpTargetParam0, 0xFu, 8, 7, 6, 7, false);
+    ms_words.push_back(vop1(1, 9, 128 + 0));             // v9 = 0
+    ms_words.push_back(vop1(1, 10, 128 + 1));            // v10 = 1
+    ms_words.push_back(vop1(1, 11, 128 + 2));            // v11 = 2
+    exp_prim0(ms_words, 9, 10, 11, true);
+    ms_words.push_back(sopp(1));
+
+    std::vector<uint32_t> ps_words;
+    exp(ps_words, 0, 0xFu, 0, 1, 2, 3, true);
+    ps_words.push_back(sopp(1));
+
+    // Amplification shader container ("KXRA") dispatching (1, 1, 1)
+    std::vector<uint32_t> as_words;
+    as_words.push_back(vop1(1, 1, 128));
+    as_words.push_back(vop1(1, 2, 242));
+    ds(as_words, 13, 0, 1, 2, 0, 0);
+    as_words.push_back(sopp(10));
+    dispatch_mesh(as_words, 1, 1, 1);
+    as_words.push_back(sopp(1));
+
+    auto kxrm = make_container("KXRM", 32u, ms_words);
+    auto kxrp = make_container("KXRP", 0u, ps_words);
+    auto kxra = make_container("KXRA", 32u, as_words);
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob* rs_blob = nullptr;
+    ID3D12RootSignature* rs = nullptr;
+    KX_CHECK(SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, nullptr)), "SerializeRS");
+    KX_CHECK(SUCCEEDED(dev2->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&rs))), "CreateRS");
+    rs_blob->Release();
+
+    struct alignas(void*) SubRS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; ID3D12RootSignature* v = nullptr; };
+    struct alignas(void*) SubAS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS; D3D12_SHADER_BYTECODE v{}; };
+    struct alignas(void*) SubMS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS; D3D12_SHADER_BYTECODE v{}; };
+    struct alignas(void*) SubPS { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS; D3D12_SHADER_BYTECODE v{}; };
+    struct alignas(void*) SubRast { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER; D3D12_RASTERIZER_DESC v{}; };
+    struct alignas(void*) SubBlend { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND; D3D12_BLEND_DESC v{}; uint32_t pad = 0; };
+    struct alignas(void*) SubRTV { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS; D3D12_RT_FORMAT_ARRAY v{}; };
+    struct alignas(void*) SubSamp { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC; DXGI_SAMPLE_DESC v{1, 0}; uint32_t pad = 0; };
+    struct alignas(void*) SubMask { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; UINT v = UINT_MAX; };
+
+    struct MeshStream { SubRS rs; SubMS ms; SubPS ps; SubRast rast; SubBlend blend; SubRTV rtv; SubSamp samp; SubMask mask; } stream{};
+    stream.rs.v = rs;
+    stream.ms.v = {kxrm.data(), kxrm.size()};
+    stream.ps.v = {kxrp.data(), kxrp.size()};
+    stream.rast.v.FillMode = D3D12_FILL_MODE_SOLID;
+    stream.rast.v.CullMode = D3D12_CULL_MODE_NONE;
+    stream.blend.v.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    stream.rtv.v.NumRenderTargets = 1;
+    stream.rtv.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    // 1. Cold KXRM + KXRP stream PSO recompile
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    ID3D12PipelineState* pso1 = nullptr;
+    KX_CHECK(SUCCEEDED(dev2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso1))) && pso1, "Cold KXRM+KXRP stream PSO");
+    auto st1 = hle::d3d12x_stats();
+    KX_CHECK(st1.stream_pso_recompiled == 1 && st1.gfx_pso_recompiled == 2 && st1.disk_cache_misses == 2,
+             "Cold KXRM+KXRP stream PSO stats");
+
+    // 2. Evict RAM cache -> warm disk cache hit with zero new DXC compiles
+    hle::clear_d3d12x_memory_shader_cache();
+    ID3D12PipelineState* pso2 = nullptr;
+    KX_CHECK(SUCCEEDED(dev2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso2))) && pso2, "Warm disk-cache KXRM+KXRP stream PSO");
+    auto st2 = hle::d3d12x_stats();
+    KX_CHECK(st2.stream_pso_recompiled == 2 && st2.disk_cache_hits == 2 && st2.gfx_pso_recompiled == 2,
+             "Warm disk-cache KXRM+KXRP hit stats");
+
+    // 3. Full KXRA + KXRM + KXRP stream PSO recompile (auto-detects Amplification shader -> MS payload)
+    struct AmpMeshStream { SubRS rs; SubAS as; SubMS ms; SubPS ps; SubRast rast; SubBlend blend; SubRTV rtv; SubSamp samp; SubMask mask; } astream{};
+    astream.rs.v = rs;
+    astream.as.v = {kxra.data(), kxra.size()};
+    astream.ms.v = {kxrm.data(), kxrm.size()};
+    astream.ps.v = {kxrp.data(), kxrp.size()};
+    astream.rast.v = stream.rast.v;
+    astream.blend.v = stream.blend.v;
+    astream.rtv.v = stream.rtv.v;
+    D3D12_PIPELINE_STATE_STREAM_DESC adesc{sizeof(astream), &astream};
+    ID3D12PipelineState* pso3 = nullptr;
+    KX_CHECK(SUCCEEDED(dev2->CreatePipelineState(&adesc, IID_PPV_ARGS(&pso3))) && pso3, "KXRA+KXRM+KXRP stream PSO");
+    auto st3 = hle::d3d12x_stats();
+    // KXRP hits RAM cache; KXRA + payload-variant KXRM compile fresh -> +2 gfx_pso_recompiled (total 4)
+    KX_CHECK(st3.stream_pso_recompiled == 3 && st3.gfx_pso_recompiled == 4 && st3.gfx_pso_cache_hits >= 3,
+             "KXRA+KXRM+KXRP stream PSO cache isolation & recomp stats");
+
+    pso3->Release(); pso2->Release(); pso1->Release(); rs->Release(); dev2->Release();
+    fs::remove_all(cache_dir, ec);
+}
+
+}  // namespace
+
 int main() {
     std::cout << "KestrelX Verification Suite\n";
     std::cout << "===========================\n";
@@ -3696,6 +4288,9 @@ int main() {
     run_test("GameInput Device Hotplug Callbacks, Re-Entrancy & Telemetry", test_gameinput_hotplug_callbacks_and_telemetry);
     run_test("D3D12 Work Graph DAG Validation & 16B-Aligned RecordRingAllocator", test_work_graph_program_validation_and_ring_allocator);
     run_test("D3D12 Work Graph 2-Node RDNA2 ExecuteIndirect Producer->Consumer on Dual-GPU Hardware", test_work_graph_rdna2_execute_indirect_dual_gpu);
+    run_test("RDNA2 Mesh (ms_6_6) & Amplification (as_6_6) Decode, IR Lift, HLSL & DXC Compile", test_rdna2_mesh_amplification_decode_ir_dxc);
+    run_test("RDNA2 Mesh/Amplification DispatchMesh Quad Rasterization & Hardware Parity", test_rdna2_mesh_shader_dispatch_mesh_hardware_parity);
+    run_test("D3D12.X KxDeviceProxy KXRM/KXRA/KXRP Stream PSO Recompilation & Disk Cache", test_d3d12x_mesh_stream_pso_recompilation);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

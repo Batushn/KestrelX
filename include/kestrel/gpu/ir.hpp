@@ -77,6 +77,11 @@ enum class IrOp : uint8_t {
     DsWriteB32,
     Barrier,
     Exp,
+    // Mesh & Amplification shader pipeline ops
+    SetMeshOutputCounts,
+    MeshExportVertex,
+    MeshExportPrimitive,
+    DispatchMeshPayload,
     // Control flow
     Branch,
     CondBranch,
@@ -95,6 +100,7 @@ struct IrOperand {
         Scc,
         Vcc,
         Exec,
+        M0,
     };
     Kind kind = Kind::None;
     uint32_t reg = 0;
@@ -153,6 +159,9 @@ struct IrFunction {
     bool uses_tex = false;
     bool uses_wave_ops = false;
     uint32_t mrt_mask = 0;
+    uint32_t max_mesh_verts = 0;
+    uint32_t max_mesh_prims = 0;
+    uint32_t mesh_param_mask = 0;
     std::vector<DescriptorSlot> tex_bindings;
     std::vector<DescriptorSlot> samp_bindings;
     std::vector<DescriptorSlot> buf_srv_bindings;

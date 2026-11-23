@@ -86,32 +86,47 @@ size_t subobject_stride(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
 }
 
 // Clean-room native RDNA2 container headers:
-//   "KXRN" + uint32 group_size_x + GFX10.3 dwords -> Compute (cs_6_6)
-//   "KXRV" + uint32 reserved     + GFX10.3 dwords -> Vertex  (vs_6_6)
-//   "KXRP" + uint32 reserved     + GFX10.3 dwords -> Pixel   (ps_6_6)
+//   "KXRN" + uint32 group_size_x + GFX10.3 dwords -> Compute       (cs_6_6)
+//   "KXRV" + uint32 reserved     + GFX10.3 dwords -> Vertex        (vs_6_6)
+//   "KXRP" + uint32 reserved     + GFX10.3 dwords -> Pixel         (ps_6_6)
+//   "KXRM" + uint32 group_size_x + GFX10.3 dwords -> Mesh          (ms_6_6)
+//   "KXRA" + uint32 group_size_x + GFX10.3 dwords -> Amplification (as_6_6)
 bool try_recompile_kestrel_rdna2(
     const void* bytecode, SIZE_T length, gpu::ShaderStage expected_stage,
-    bool prefer_wave64, std::vector<uint8_t>& out_dxil, bool& out_cache_hit) {
+    bool prefer_wave64, std::vector<uint8_t>& out_dxil, bool& out_cache_hit,
+    bool mesh_has_payload = false) {
     out_cache_hit = false;
     if (!bytecode || length < 12) return false;
     const auto* bytes = static_cast<const uint8_t*>(bytecode);
 
-    const char* expected_magic = (expected_stage == gpu::ShaderStage::Compute) ? "KXRN"
-                               : (expected_stage == gpu::ShaderStage::Vertex)  ? "KXRV"
-                                                                               : "KXRP";
-    if (std::memcmp(bytes, expected_magic, 4) != 0) return false;
+    const char* expected_magic = nullptr;
+    switch (expected_stage) {
+        case gpu::ShaderStage::Compute:       expected_magic = "KXRN"; break;
+        case gpu::ShaderStage::Vertex:        expected_magic = "KXRV"; break;
+        case gpu::ShaderStage::Pixel:         expected_magic = "KXRP"; break;
+        case gpu::ShaderStage::Mesh:          expected_magic = "KXRM"; break;
+        case gpu::ShaderStage::Amplification: expected_magic = "KXRA"; break;
+    }
+    if (!expected_magic || std::memcmp(bytes, expected_magic, 4) != 0) return false;
 
     uint32_t group_x = 64;
     if (expected_stage == gpu::ShaderStage::Compute) {
         std::memcpy(&group_x, bytes + 4, 4);
         if (group_x == 0 || group_x > 1024) group_x = 64;
+    } else if (expected_stage == gpu::ShaderStage::Mesh ||
+               expected_stage == gpu::ShaderStage::Amplification) {
+        std::memcpy(&group_x, bytes + 4, 4);
+        if (group_x == 0 || group_x > 128) group_x = 32;
     }
 
     const size_t code_bytes = length - 8;
     if (code_bytes == 0 || (code_bytes % 4) != 0) return false;
 
-    const gpu::WaveMode wave = prefer_wave64 ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
-    const uint64_t cache_key = gpu::DiskShaderCache::make_key(expected_stage, wave, group_x, bytes, length);
+    const bool effective_wave64 = prefer_wave64 &&
+        !((expected_stage == gpu::ShaderStage::Mesh || expected_stage == gpu::ShaderStage::Amplification) && group_x < 64);
+    const gpu::WaveMode wave = effective_wave64 ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
+    const uint32_t cache_group_tag = group_x | (mesh_has_payload ? 0x80000000u : 0u);
+    const uint64_t cache_key = gpu::DiskShaderCache::make_key(expected_stage, wave, cache_group_tag, bytes, length);
 
     {
         std::lock_guard lock(g_shader_cache_mtx);
@@ -149,10 +164,20 @@ bool try_recompile_kestrel_rdna2(
     auto ir = gpu::lift_rdna2_to_ir(decoded);
     if (ir.unknown_count > 0) return false;
 
-    auto recomp = gpu::emit_hlsl_from_ir(ir, {.stage = expected_stage, .wave_mode = wave, .group_size_x = group_x});
-    const char* profile = (expected_stage == gpu::ShaderStage::Compute) ? "cs_6_6"
-                        : (expected_stage == gpu::ShaderStage::Vertex)  ? "vs_6_6"
-                                                                        : "ps_6_6";
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {
+        .stage = expected_stage,
+        .wave_mode = wave,
+        .group_size_x = group_x,
+        .mesh_has_payload = mesh_has_payload,
+    });
+    const char* profile = "cs_6_6";
+    switch (expected_stage) {
+        case gpu::ShaderStage::Compute:       profile = "cs_6_6"; break;
+        case gpu::ShaderStage::Vertex:        profile = "vs_6_6"; break;
+        case gpu::ShaderStage::Pixel:         profile = "ps_6_6"; break;
+        case gpu::ShaderStage::Mesh:          profile = "ms_6_6"; break;
+        case gpu::ShaderStage::Amplification: profile = "as_6_6"; break;
+    }
     auto compiled = g_dxc.compile_hlsl(recomp.hlsl, "main", profile);
     if (!compiled) return false;
 
@@ -759,7 +784,7 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::SetResidencyPriority(UINT n, ID3D12Page
     return inner1_ ? inner1_->SetResidencyPriority(n, o, p) : E_NOINTERFACE;
 }
 
-// ID3D12Device2 — stream-based PSO creation with automatic KXRN/KXRV/KXRP RDNA2->DXIL patching
+// ID3D12Device2 — stream-based PSO creation with automatic KXRN/KXRV/KXRP/KXRM/KXRA RDNA2->DXIL patching
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID r, void** o) {
     if (!inner2_) return E_NOINTERFACE;
     if (!d || !d->pPipelineStateSubobjectStream || d->SizeInBytes == 0) {
@@ -770,11 +795,31 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePipelineState(const D3D12_PIPELIN
     std::memcpy(stream_copy.data(), d->pPipelineStateSubobjectStream, d->SizeInBytes);
 
     std::vector<std::vector<uint8_t>> owned_dxil;
-    owned_dxil.reserve(4);
+    owned_dxil.reserve(6);
     bool patched_any = false;
 
     constexpr size_t bc_off = (sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + alignof(D3D12_SHADER_BYTECODE) - 1) &
                               ~(alignof(D3D12_SHADER_BYTECODE) - 1);
+
+    // Pre-scan for an Amplification Shader subobject so paired Mesh Shaders emit `in payload KxMeshPayload`
+    bool has_amplification = false;
+    {
+        size_t scan = 0;
+        while (scan + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= stream_copy.size()) {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type{};
+            std::memcpy(&type, stream_copy.data() + scan, sizeof(type));
+            const size_t stride = subobject_stride(type);
+            if (stride == 0 || scan + stride > stream_copy.size()) break;
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                D3D12_SHADER_BYTECODE bc{};
+                std::memcpy(&bc, stream_copy.data() + scan + bc_off, sizeof(bc));
+                if (bc.pShaderBytecode && bc.BytecodeLength > 0) {
+                    has_amplification = true;
+                }
+            }
+            scan += stride;
+        }
+    }
 
     size_t offset = 0;
     while (offset + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= stream_copy.size()) {
@@ -785,15 +830,21 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePipelineState(const D3D12_PIPELIN
 
         if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ||
             type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
             D3D12_SHADER_BYTECODE bc{};
             std::memcpy(&bc, stream_copy.data() + offset + bc_off, sizeof(bc));
             const auto stage = (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) ? gpu::ShaderStage::Vertex
                              : (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) ? gpu::ShaderStage::Pixel
+                             : (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) ? gpu::ShaderStage::Mesh
+                             : (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) ? gpu::ShaderStage::Amplification
                                                                                 : gpu::ShaderStage::Compute;
+            const bool mesh_payload = (stage == gpu::ShaderStage::Mesh) && has_amplification;
             std::vector<uint8_t> dxil;
             bool cache_hit = false;
-            if (try_recompile_kestrel_rdna2(bc.pShaderBytecode, bc.BytecodeLength, stage, supports_wave64_, dxil, cache_hit)) {
+            if (try_recompile_kestrel_rdna2(bc.pShaderBytecode, bc.BytecodeLength, stage,
+                                            supports_wave64_, dxil, cache_hit, mesh_payload)) {
                 owned_dxil.push_back(std::move(dxil));
                 D3D12_SHADER_BYTECODE patched_bc{owned_dxil.back().data(), owned_dxil.back().size()};
                 std::memcpy(stream_copy.data() + offset + bc_off, &patched_bc, sizeof(patched_bc));

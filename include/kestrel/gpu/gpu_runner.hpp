@@ -40,6 +40,8 @@ Result<ComputeDispatchResult> run_compute_dxil_on_gpu(
     const std::vector<uint8_t>& dxil,
     const std::vector<uint32_t>& initial_buffer_u32,
     const uint32_t root_constants[8],
-    uint32_t groups_x);
+    uint32_t groups_x,
+    uint32_t groups_y = 1,
+    uint32_t groups_z = 1);
 
 }  // namespace kestrel::gpu

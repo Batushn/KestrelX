@@ -28,7 +28,8 @@ std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0},
     g_zero_mem{0}, g_presents{0}, g_pso_recomp{0}, g_pso_cache_hits{0},
     g_gfx_pso_recomp{0}, g_gfx_pso_cache_hits{0}, g_stream_pso_recomp{0},
     g_disk_cache_hits{0}, g_disk_cache_misses{0}, g_device_qi_upgrades{0},
-    g_draw_calls{0}, g_dispatch_calls{0}, g_barrier_calls{0}, g_pso_binds{0};
+    g_draw_calls{0}, g_dispatch_calls{0}, g_barrier_calls{0}, g_pso_binds{0},
+    g_compute_queues{0}, g_inter_queue_fences{0};
 
 std::mutex g_present_mtx;
 bool g_windowed = false;
@@ -451,8 +452,8 @@ void STDMETHODCALLTYPE KxCommandQueueProxy::ExecuteCommandLists(UINT n, ID3D12Co
 void STDMETHODCALLTYPE KxCommandQueueProxy::SetMarker(UINT m, const void* d, UINT s) { inner_->SetMarker(m, d, s); }
 void STDMETHODCALLTYPE KxCommandQueueProxy::BeginEvent(UINT m, const void* d, UINT s) { inner_->BeginEvent(m, d, s); }
 void STDMETHODCALLTYPE KxCommandQueueProxy::EndEvent() { inner_->EndEvent(); }
-HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::Signal(ID3D12Fence* f, UINT64 v) { return inner_->Signal(f, v); }
-HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::Wait(ID3D12Fence* f, UINT64 v) { return inner_->Wait(f, v); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::Signal(ID3D12Fence* f, UINT64 v) { g_inter_queue_fences.fetch_add(1, std::memory_order_relaxed); return inner_->Signal(f, v); }
+HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::Wait(ID3D12Fence* f, UINT64 v) { g_inter_queue_fences.fetch_add(1, std::memory_order_relaxed); return inner_->Wait(f, v); }
 HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetTimestampFrequency(UINT64* f) { return inner_->GetTimestampFrequency(f); }
 HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetClockCalibration(UINT64* g, UINT64* c) { return inner_->GetClockCalibration(g, c); }
 D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE KxCommandQueueProxy::GetDesc() { return inner_->GetDesc(); }
@@ -521,6 +522,9 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandQueue(const D3D12_COMMAND_
     HRESULT hr = inner_->CreateCommandQueue(d, IID_PPV_ARGS(&raw));
     if (FAILED(hr)) return hr;
     g_queues.fetch_add(1, std::memory_order_relaxed);
+    if (d && d->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        g_compute_queues.fetch_add(1, std::memory_order_relaxed);
+    }
     auto* proxy = new KxCommandQueueProxy(raw);
     raw->Release();
     hr = proxy->QueryInterface(r, o);
@@ -740,14 +744,15 @@ D3D12XStats d3d12x_stats() {
             g_zero_mem.load(), g_presents.load(), g_pso_recomp.load(), g_pso_cache_hits.load(),
             g_gfx_pso_recomp.load(), g_gfx_pso_cache_hits.load(), g_stream_pso_recomp.load(),
             g_disk_cache_hits.load(), g_disk_cache_misses.load(), g_device_qi_upgrades.load(),
-            g_draw_calls.load(), g_dispatch_calls.load(), g_barrier_calls.load(), g_pso_binds.load()};
+            g_draw_calls.load(), g_dispatch_calls.load(), g_barrier_calls.load(), g_pso_binds.load(),
+            g_compute_queues.load(), g_inter_queue_fences.load()};
 }
 
 void reset_d3d12x_stats() {
     g_devices = g_queues = g_cmd_lists = g_resources = g_zero_mem = g_presents =
         g_pso_recomp = g_pso_cache_hits = g_gfx_pso_recomp = g_gfx_pso_cache_hits =
         g_stream_pso_recomp = g_disk_cache_hits = g_disk_cache_misses = g_device_qi_upgrades =
-        g_draw_calls = g_dispatch_calls = g_barrier_calls = g_pso_binds = 0;
+        g_draw_calls = g_dispatch_calls = g_barrier_calls = g_pso_binds = g_compute_queues = g_inter_queue_fences = 0;
     {
         std::lock_guard lock(g_shader_cache_mtx);
         g_dxil_cache.clear();

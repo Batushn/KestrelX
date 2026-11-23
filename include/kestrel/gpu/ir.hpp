@@ -150,6 +150,7 @@ struct IrFunction {
     bool uses_buf_srv = false;
     bool uses_tex = false;
     bool uses_wave_ops = false;
+    uint32_t mrt_mask = 0;
     std::vector<DescriptorSlot> tex_bindings;
     std::vector<DescriptorSlot> samp_bindings;
     std::vector<DescriptorSlot> buf_srv_bindings;

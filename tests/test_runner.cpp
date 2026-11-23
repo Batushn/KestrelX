@@ -1957,6 +1957,551 @@ void test_gdk_runtime_and_directstorage_bridge() {
     fs::remove_all(test_dir, ec);
 }
 
+
+// ============================================================================
+// Milestone v0.6.0 Verification Tests (Issues #18, #19, #20, #21)
+// ============================================================================
+
+void test_rdna2_compute_2d_workgroup_tiling_dual_gpu() {
+    using namespace gpu::encode;
+
+    // 2D Compute workgroup dispatch:
+    // Grid: 2 x 2 workgroups (groups_x=2, groups_y=2)
+    // Workgroup size: 8 x 8 threads (64 threads per workgroup = 256 threads total)
+    // Hardware input mapping:
+    //   v0 = tid.x (global x, 0..15)
+    //   v1 = tid.y (global y, 0..15)
+    //   v2 = gtid.x (local x, 0..7)
+    //   v3 = gtid.y (local y, 0..7)
+    //   s4 = gid.x (group x, 0..1)
+    //   s5 = gid.y (group y, 0..1)
+    std::vector<uint32_t> words;
+    // 1. global_idx = (v1 << 4) + v0; v4 = global_idx << 2; (byte addr in output buffer)
+    words.push_back(vop2(26, 4, 128 + 4, 1));       // v4 = v1 << 4
+    words.push_back(vop2(37, 4, 256 + 0, 4));       // v4 = v4 + v0
+    words.push_back(vop2(26, 4, 128 + 2, 4));       // v4 = v4 << 2
+    // 2. local_idx = (v3 << 3) + v2; v5 = local_idx << 2; (LDS byte addr)
+    words.push_back(vop2(26, 5, 128 + 3, 3));       // v5 = v3 << 3
+    words.push_back(vop2(37, 5, 256 + 2, 5));       // v5 = v5 + v2
+    words.push_back(vop2(26, 5, 128 + 2, 5));       // v5 = v5 << 2
+    // 3. ds_write_b32 v5, v2 (store local x into LDS)
+    ds(words, 13, 0, 5, 2, 0, 0);
+    // 4. s_barrier
+    words.push_back(sopp(10));
+    // 5. trans_idx = (v2 << 3) + v3; v6 = trans_idx << 2;
+    words.push_back(vop2(26, 6, 128 + 3, 2));       // v6 = v2 << 3
+    words.push_back(vop2(37, 6, 256 + 3, 6));       // v6 = v6 + v3
+    words.push_back(vop2(26, 6, 128 + 2, 6));       // v6 = v6 << 2
+    // 6. ds_read_b32 v7, v6 (read transposed local from LDS -> returns local y!)
+    ds(words, 54, 7, 6, 0, 0, 0);
+    // 7. v8 = v7 + (s4 * 100) + s5
+    // s6 = 100
+    words.push_back(sopk(0, 6, 100));
+    // v9 = s4 * s6
+    vop3(words, 0x169, 9, 4, 6, 0);
+    // v9 = v9 + s5 (s5 is SGPR 5, v9 is VGPR 9)
+    words.push_back(vop2(37, 9, 5, 9));
+    // v8 = v9 + v7 (v9 is VGPR 9 -> 256 + 9, v7 is VGPR 7)
+    words.push_back(vop2(37, 8, 256 + 9, 7));
+    // 8. global_store_dword v4, v8
+    global_mem(words, 28, 8, 4, 127, 0);
+    // s_endpgm
+    words.push_back(sopp(1));
+
+    auto decoded = gpu::decode_rdna2(words.data(), words.size());
+    auto ir = gpu::lift_rdna2_to_ir(decoded);
+    KX_CHECK(ir.unknown_count == 0 && ir.uses_lds, "Compute 2D IR lift");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {
+        .stage = gpu::ShaderStage::Compute,
+        .wave_mode = gpu::WaveMode::Wave32,
+        .group_size_x = 8,
+        .group_size_y = 8,
+        .group_size_z = 1
+    });
+    auto compiled = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    KX_CHECK(compiled.has_value(), compiled.error().message);
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "Adapters available");
+
+    constexpr uint32_t kTotalThreads = 16 * 16;
+    std::vector<uint32_t> init_buf(kTotalThreads, 0);
+    uint32_t roots[8]{};
+
+    std::vector<uint32_t> ref_output;
+    int tested = 0;
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        auto ran = gpu::run_compute_dxil_on_gpu(ad.index, compiled->dxil, init_buf, roots, 2, 2, 1);
+        KX_CHECK(ran.has_value(), ran.error().message);
+
+        for (uint32_t gy = 0; gy < 2; ++gy) {
+            for (uint32_t gx = 0; gx < 2; ++gx) {
+                for (uint32_t ly = 0; ly < 8; ++ly) {
+                    for (uint32_t lx = 0; lx < 8; ++lx) {
+                        const uint32_t gx_t = gx * 8 + lx;
+                        const uint32_t gy_t = gy * 8 + ly;
+                        const uint32_t idx = gy_t * 16 + gx_t;
+                        const uint32_t expected = ly + gx * 100 + gy;
+                        const uint32_t got = ran->output_u32[idx];
+                        KX_CHECK(got == expected, std::format("2D Workgroup mismatch at ({},{}): got {}, expected {}", gx_t, gy_t, got, expected));
+                    }
+                }
+            }
+        }
+
+        if (ref_output.empty()) {
+            ref_output = ran->output_u32;
+        } else {
+            KX_CHECK(ref_output == ran->output_u32, "Cross-GPU bit-exact 2D workgroup parity");
+        }
+        std::cout << std::format("    -> Hardware [{}] {} PASS (2D Workgroup 16x16 Tiling bit-exact across 256 threads)\n",
+                                 ad.index, ad.name);
+        ++tested;
+    }
+    KX_CHECK(tested >= 1, "Expected at least 1 hardware GPU tested for 2D Workgroup Tiling");
+}
+
+inline void save_bmp_rgba(const fs::path& path, uint32_t w, uint32_t h, const uint8_t* rgba) {
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) return;
+    const uint32_t row_bytes = w * 3;
+    const uint32_t pad = (4 - (row_bytes % 4)) % 4;
+    const uint32_t img_size = (row_bytes + pad) * h;
+    const uint32_t file_size = 54 + img_size;
+
+    uint8_t h54[54] = {
+        'B', 'M',
+        static_cast<uint8_t>(file_size), static_cast<uint8_t>(file_size >> 8), static_cast<uint8_t>(file_size >> 16), static_cast<uint8_t>(file_size >> 24),
+        0, 0, 0, 0,
+        54, 0, 0, 0,
+        40, 0, 0, 0,
+        static_cast<uint8_t>(w), static_cast<uint8_t>(w >> 8), static_cast<uint8_t>(w >> 16), static_cast<uint8_t>(w >> 24),
+        static_cast<uint8_t>(h), static_cast<uint8_t>(h >> 8), static_cast<uint8_t>(h >> 16), static_cast<uint8_t>(h >> 24),
+        1, 0,
+        24, 0,
+        0, 0, 0, 0,
+        static_cast<uint8_t>(img_size), static_cast<uint8_t>(img_size >> 8), static_cast<uint8_t>(img_size >> 16), static_cast<uint8_t>(img_size >> 24),
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0
+    };
+    ofs.write(reinterpret_cast<const char*>(h54), 54);
+    std::vector<uint8_t> row(row_bytes + pad, 0);
+    for (int32_t y = static_cast<int32_t>(h) - 1; y >= 0; --y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const size_t si = (static_cast<size_t>(y) * w + x) * 4;
+            row[x * 3 + 0] = rgba[si + 2];
+            row[x * 3 + 1] = rgba[si + 1];
+            row[x * 3 + 2] = rgba[si + 0];
+        }
+        ofs.write(reinterpret_cast<const char*>(row.data()), row.size());
+    }
+}
+
+void test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu() {
+    using namespace gpu::encode;
+
+    // 1. VS: 4 vertices (pos.xy, uv.xy)
+    std::vector<uint32_t> vs_words;
+    vs_words.push_back(vop2(26, 1, 128 + 4, 0));     // v1 = sv_vid * 16
+    mubuf(vs_words, 14, 2, 1, 0, 128, 0);            // buffer_load_dwordx4 v[2:5], v1, s[0:3]
+    vs_words.push_back(vop1(1, 6, 128));             // v6 = 0.0f
+    vs_words.push_back(vop1(1, 7, 242));             // v7 = 1.0f
+    exp(vs_words, 12, 0xFu, 2, 3, 6, 7, false);      // exp pos0
+    exp(vs_words, 32, 0xFu, 4, 5, 6, 7, true);       // exp param0 done
+    vs_words.push_back(sopp(1));
+
+    // 2. PS: MRT0 (Albedo), MRT1 (Normal), MRT2 (Metallic-Roughness-AO)
+    std::vector<uint32_t> ps_words;
+    auto mov_lit = [&](uint32_t vreg, float fval) {
+        ps_words.push_back(vop1(1, vreg, 255));
+        ps_words.push_back(std::bit_cast<uint32_t>(fval));
+    };
+    // MRT0: Albedo (0.85f, 0.25f, 0.15f, 1.0f)
+    mov_lit(4, 0.85f);
+    mov_lit(5, 0.25f);
+    mov_lit(6, 0.15f);
+    mov_lit(7, 1.0f);
+    exp(ps_words, 0, 0xFu, 4, 5, 6, 7, false);
+
+    // MRT1: Encoded Normal (0.0f, 0.0f, 1.0f, 0.0f)
+    mov_lit(8, 0.0f);
+    mov_lit(9, 0.0f);
+    mov_lit(10, 1.0f);
+    mov_lit(11, 0.0f);
+    exp(ps_words, 1, 0xFu, 8, 9, 10, 11, false);
+
+    // MRT2: PBR Mask (Metalness=0.9f, Roughness=0.2f, AO=1.0f, 0.0f)
+    mov_lit(12, 0.9f);
+    mov_lit(13, 0.2f);
+    mov_lit(14, 1.0f);
+    mov_lit(15, 0.0f);
+    exp(ps_words, 2, 0xFu, 12, 13, 14, 15, true);
+    ps_words.push_back(sopp(1));
+
+    auto vs_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(vs_words.data(), vs_words.size()));
+    auto ps_ir = gpu::lift_rdna2_to_ir(gpu::decode_rdna2(ps_words.data(), ps_words.size()));
+    KX_CHECK(ps_ir.mrt_mask == 7u, "PS MRT mask must have bits 0, 1, 2 set (mrt_mask == 7)");
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto vs_hlsl = gpu::emit_hlsl_from_ir(vs_ir, {.stage = gpu::ShaderStage::Vertex});
+    auto ps_hlsl = gpu::emit_hlsl_from_ir(ps_ir, {.stage = gpu::ShaderStage::Pixel});
+
+    KX_CHECK(ps_hlsl.hlsl.find("struct KxPsOut") != std::string::npos, "HLSL KxPsOut struct emission");
+    KX_CHECK(ps_hlsl.hlsl.find("float4 mrt0 : SV_Target0;") != std::string::npos, "HLSL SV_Target0 emission");
+    KX_CHECK(ps_hlsl.hlsl.find("float4 mrt1 : SV_Target1;") != std::string::npos, "HLSL SV_Target1 emission");
+    KX_CHECK(ps_hlsl.hlsl.find("float4 mrt2 : SV_Target2;") != std::string::npos, "HLSL SV_Target2 emission");
+
+    auto vs_dxil = dxc.compile_hlsl(vs_hlsl.hlsl, "main", "vs_6_6");
+    auto ps_dxil = dxc.compile_hlsl(ps_hlsl.hlsl, "main", "ps_6_6");
+    KX_CHECK(vs_dxil.has_value(), vs_dxil.error().message);
+    KX_CHECK(ps_dxil.has_value(), ps_dxil.error().message);
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "Adapters available");
+
+    constexpr uint32_t kW = 256, kH = 256;
+    float quad_verts[16] = {
+        -1.0f, -1.0f,  0.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+        -1.0f,  1.0f,  0.0f, 1.0f,
+         1.0f,  1.0f,  1.0f, 1.0f,
+    };
+
+    IDXGIFactory6* factory = nullptr;
+    KX_CHECK(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))), "CreateDXGIFactory1");
+
+    int verified = 0;
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        IDXGIAdapter1* dxgi_ad = nullptr;
+        if (FAILED(factory->EnumAdapters1(ad.index, &dxgi_ad))) continue;
+        ID3D12Device* dev = nullptr;
+        HRESULT hr = D3D12CreateDevice(dxgi_ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev));
+        dxgi_ad->Release();
+        if (FAILED(hr) || !dev) continue;
+
+        D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+        dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+        dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd));
+
+        // Root signature with SRV t0
+        D3D12_ROOT_PARAMETER rp{};
+        rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rp.Descriptor.ShaderRegister = 1;
+        rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 1;
+        rsd.pParameters = &rp;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ID3DBlob* rs_blob = nullptr;
+        D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, nullptr);
+        ID3D12RootSignature* rs = nullptr;
+        dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&rs));
+        rs_blob->Release();
+
+        // PSO with 3 Render Targets
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+        pso_desc.pRootSignature = rs;
+        pso_desc.VS = {vs_dxil->dxil.data(), vs_dxil->dxil.size()};
+        pso_desc.PS = {ps_dxil->dxil.data(), ps_dxil->dxil.size()};
+        pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso_desc.NumRenderTargets = 3;
+        for (int i = 0; i < 3; ++i) {
+            pso_desc.RTVFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            pso_desc.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        pso_desc.SampleMask = UINT_MAX;
+        pso_desc.SampleDesc.Count = 1;
+        ID3D12PipelineState* pso = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso))), "CreateGraphicsPipelineState 3-MRT");
+
+        // RTV Heap with 3 descriptors
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 3;
+        ID3D12DescriptorHeap* rtv_heap = nullptr;
+        dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap));
+        const UINT rtv_step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+        // 3 RTV textures + 3 readback buffers
+        ID3D12Resource* rts[3]{};
+        ID3D12Resource* rbs[3]{};
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handles[3]{};
+
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = kW; td.Height = kH; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        D3D12_HEAP_PROPERTIES hp_def{}; hp_def.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_HEAP_PROPERTIES hp_read{}; hp_read.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = kW * kH * 4; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        for (int i = 0; i < 3; ++i) {
+            dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rts[i]));
+            dev->CreateCommittedResource(&hp_read, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rbs[i]));
+            rtv_handles[i] = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+            rtv_handles[i].ptr += static_cast<SIZE_T>(i) * rtv_step;
+            dev->CreateRenderTargetView(rts[i], nullptr, rtv_handles[i]);
+        }
+
+        // Vertex buffer
+        D3D12_HEAP_PROPERTIES hp_up{}; hp_up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC vbd{};
+        vbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        vbd.Width = sizeof(quad_verts); vbd.Height = 1; vbd.DepthOrArraySize = 1; vbd.MipLevels = 1;
+        vbd.SampleDesc.Count = 1; vbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* vb = nullptr;
+        dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &vbd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vb));
+        void* mapped = nullptr;
+        vb->Map(0, nullptr, &mapped);
+        std::memcpy(mapped, quad_verts, sizeof(quad_verts));
+        vb->Unmap(0, nullptr);
+
+        // Record draw
+        cmd->SetGraphicsRootSignature(rs);
+        cmd->SetPipelineState(pso);
+        cmd->SetGraphicsRootShaderResourceView(0, vb->GetGPUVirtualAddress());
+
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kW), static_cast<float>(kH), 0.0f, 1.0f};
+        D3D12_RECT sr{0, 0, static_cast<LONG>(kW), static_cast<LONG>(kH)};
+        cmd->RSSetViewports(1, &vp);
+        cmd->RSSetScissorRects(1, &sr);
+
+        cmd->OMSetRenderTargets(3, rtv_handles, FALSE, nullptr);
+        float clear_black[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < 3; ++i) {
+            cmd->ClearRenderTargetView(rtv_handles[i], clear_black, 0, nullptr);
+        }
+
+        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        cmd->DrawInstanced(4, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER barriers[3]{};
+        for (int i = 0; i < 3; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.pResource = rts[i];
+            barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmd->ResourceBarrier(3, barriers);
+
+        for (int i = 0; i < 3; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+            dst_loc.pResource = rbs[i];
+            dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            dst_loc.PlacedFootprint.Footprint.Width = kW;
+            dst_loc.PlacedFootprint.Footprint.Height = kH;
+            dst_loc.PlacedFootprint.Footprint.Depth = 1;
+            dst_loc.PlacedFootprint.Footprint.RowPitch = kW * 4;
+
+            D3D12_TEXTURE_COPY_LOCATION src_loc{};
+            src_loc.pResource = rts[i];
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src_loc.SubresourceIndex = 0;
+            cmd->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        }
+
+        cmd->Close();
+        ID3D12CommandList* cls[] = {cmd};
+        queue->ExecuteCommandLists(1, cls);
+
+        ID3D12Fence* fence = nullptr;
+        dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        queue->Signal(fence, 1);
+        HANDLE hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        fence->SetEventOnCompletion(1, hEvent);
+        WaitForSingleObject(hEvent, 3000);
+        CloseHandle(hEvent);
+
+        // Readback and verify GBuffer channels
+        uint8_t* pAlbedo = nullptr; rbs[0]->Map(0, nullptr, reinterpret_cast<void**>(&pAlbedo));
+        uint8_t* pNormal = nullptr; rbs[1]->Map(0, nullptr, reinterpret_cast<void**>(&pNormal));
+        uint8_t* pMaterial = nullptr; rbs[2]->Map(0, nullptr, reinterpret_cast<void**>(&pMaterial));
+
+        const size_t center = (128 * kW + 128) * 4;
+        // MRT0 (Albedo): (0.85, 0.25, 0.15, 1.0) -> R~217, G~64, B~38, A~255
+        KX_CHECK(std::abs(static_cast<int>(pAlbedo[center + 0]) - 217) <= 1, "Albedo R channel ~217");
+        KX_CHECK(std::abs(static_cast<int>(pAlbedo[center + 1]) - 64) <= 1, "Albedo G channel ~64");
+        KX_CHECK(std::abs(static_cast<int>(pAlbedo[center + 2]) - 38) <= 1, "Albedo B channel ~38");
+        KX_CHECK(pAlbedo[center + 3] == 255, "Albedo A channel 255");
+
+        // MRT1 (Normal): (0.0, 0.0, 1.0, 0.0) -> R=0, G=0, B=255, A=0
+        KX_CHECK(pNormal[center + 0] == 0, "Normal X channel 0");
+        KX_CHECK(pNormal[center + 1] == 0, "Normal Y channel 0");
+        KX_CHECK(pNormal[center + 2] == 255, "Normal Z channel 255");
+
+        // MRT2 (Material): (0.9, 0.2, 1.0, 0.0) -> Metallic~230, Roughness~51, AO~255
+        KX_CHECK(std::abs(static_cast<int>(pMaterial[center + 0]) - 230) <= 1, "Metallic channel ~230");
+        KX_CHECK(std::abs(static_cast<int>(pMaterial[center + 1]) - 51) <= 1, "Roughness channel ~51");
+        KX_CHECK(pMaterial[center + 2] == 255, "AO channel 255");
+
+        // Export PBR GBuffer composite image to docs/pbr_mrt.bmp
+        if (verified == 0) {
+            std::vector<uint8_t> composite(kW * 3 * kH * 4);
+            for (uint32_t y = 0; y < kH; ++y) {
+                for (uint32_t x = 0; x < kW; ++x) {
+                    const size_t src_idx = (y * kW + x) * 4;
+                    // Slot 0: Albedo (x in 0..255)
+                    const size_t d0 = (y * (kW * 3) + x) * 4;
+                    composite[d0 + 0] = pAlbedo[src_idx + 0];
+                    composite[d0 + 1] = pAlbedo[src_idx + 1];
+                    composite[d0 + 2] = pAlbedo[src_idx + 2];
+                    composite[d0 + 3] = 255;
+                    // Slot 1: Normal (x in 256..511)
+                    const size_t d1 = (y * (kW * 3) + (x + kW)) * 4;
+                    composite[d1 + 0] = pNormal[src_idx + 0];
+                    composite[d1 + 1] = pNormal[src_idx + 1];
+                    composite[d1 + 2] = pNormal[src_idx + 2];
+                    composite[d1 + 3] = 255;
+                    // Slot 2: Material (x in 512..767)
+                    const size_t d2 = (y * (kW * 3) + (x + kW * 2)) * 4;
+                    composite[d2 + 0] = pMaterial[src_idx + 0];
+                    composite[d2 + 1] = pMaterial[src_idx + 1];
+                    composite[d2 + 2] = pMaterial[src_idx + 2];
+                    composite[d2 + 3] = 255;
+                }
+            }
+            save_bmp_rgba("docs/pbr_mrt.bmp", kW * 3, kH, composite.data());
+        }
+
+        rbs[0]->Unmap(0, nullptr);
+        rbs[1]->Unmap(0, nullptr);
+        rbs[2]->Unmap(0, nullptr);
+
+        std::cout << std::format("    -> Hardware [{}] {} PASS (PBR Deferred GBuffer 3-MRT bit-exact)\n",
+                                 ad.index, ad.name);
+        ++verified;
+
+        fence->Release();
+        for (int i = 0; i < 3; ++i) {
+            rts[i]->Release();
+            rbs[i]->Release();
+        }
+        rtv_heap->Release();
+        vb->Release();
+        pso->Release();
+        rs->Release();
+        cmd->Release();
+        alloc->Release();
+        queue->Release();
+        dev->Release();
+    }
+    factory->Release();
+    KX_CHECK(verified >= 1, "Expected at least 1 hardware GPU verified for PBR Deferred MRT");
+}
+
+void test_d3d12x_async_compute_queue_fence_sync() {
+    hle::reset_d3d12x_stats();
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "Adapters available");
+    IDXGIFactory6* factory = nullptr;
+    CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    IDXGIAdapter1* ad = nullptr;
+    factory->EnumAdapters1((*adapters)[0].index, &ad);
+    ID3D12Device* raw_dev = nullptr;
+    D3D12CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&raw_dev));
+    ad->Release();
+    factory->Release();
+    KX_CHECK(raw_dev != nullptr, "D3D12CreateDevice");
+
+    hle::KxDeviceProxy dev_proxy(raw_dev);
+    ID3D12Device* dev = &dev_proxy;
+
+    D3D12_COMMAND_QUEUE_DESC direct_desc{};
+    direct_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* direct_q = nullptr;
+    KX_CHECK(SUCCEEDED(dev->CreateCommandQueue(&direct_desc, IID_PPV_ARGS(&direct_q))) && direct_q, "Create DIRECT queue");
+
+    D3D12_COMMAND_QUEUE_DESC compute_desc{};
+    compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    ID3D12CommandQueue* compute_q = nullptr;
+    KX_CHECK(SUCCEEDED(dev->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute_q))) && compute_q, "Create COMPUTE queue");
+
+    const auto stats1 = hle::d3d12x_stats();
+    KX_CHECK(stats1.compute_queues_created >= 1, "d3d12x compute_queues_created stat");
+
+    ID3D12Fence* fence = nullptr;
+    KX_CHECK(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) && fence, "CreateFence");
+
+    // Async Compute signals 100 -> Direct queue waits for 100 -> Direct queue signals 200
+    KX_CHECK(SUCCEEDED(compute_q->Signal(fence, 100)), "compute_q->Signal(100)");
+    KX_CHECK(SUCCEEDED(direct_q->Wait(fence, 100)), "direct_q->Wait(100)");
+    KX_CHECK(SUCCEEDED(direct_q->Signal(fence, 200)), "direct_q->Signal(200)");
+
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    fence->SetEventOnCompletion(200, event);
+    DWORD wait_res = WaitForSingleObject(event, 3000);
+    CloseHandle(event);
+    KX_CHECK(wait_res == WAIT_OBJECT_0, "Fence wait completed");
+    KX_CHECK(fence->GetCompletedValue() == 200, "Fence value 200");
+
+    const auto stats2 = hle::d3d12x_stats();
+    KX_CHECK(stats2.inter_queue_fences >= 3, "d3d12x inter_queue_fences stat");
+
+    fence->Release();
+    compute_q->Release();
+    direct_q->Release();
+    raw_dev->Release();
+}
+
+void test_gameinput_force_feedback_rumble() {
+    hle::reset_gameinput_stats();
+    hle::Registry reg;
+    hle::register_gameinput(reg);
+
+    auto* create_fn = reinterpret_cast<HRESULT(__stdcall*)(hle::IKxGameInput**)>(
+        reg.resolve_name("gameinput.dll", "GameInputCreate"));
+    KX_CHECK(create_fn != nullptr, "GameInputCreate export");
+
+    hle::IKxGameInput* gi = nullptr;
+    KX_CHECK(SUCCEEDED(create_fn(&gi)) && gi != nullptr, "GameInputCreate S_OK");
+
+    hle::IKxGameInputDevice* device = nullptr;
+    KX_CHECK(SUCCEEDED(gi->GetDefaultDevice(&device)) && device != nullptr, "GetDefaultDevice S_OK");
+
+    hle::KxGameInputRumbleParams params{0.85f, 0.35f, 0.65f, 0.45f};
+    device->SetRumbleState(&params);
+
+    hle::KxGameInputRumbleParams got{};
+    device->GetRumbleState(&got);
+
+    KX_CHECK(std::abs(got.low_frequency - 0.85f) < 1e-4f, "Low-frequency rumble motor intensity");
+    KX_CHECK(std::abs(got.high_frequency - 0.35f) < 1e-4f, "High-frequency rumble motor intensity");
+    KX_CHECK(std::abs(got.left_trigger - 0.65f) < 1e-4f, "Left trigger impulse haptic intensity");
+    KX_CHECK(std::abs(got.right_trigger - 0.45f) < 1e-4f, "Right trigger impulse haptic intensity");
+
+    const auto stats = hle::gameinput_stats();
+    KX_CHECK(stats.rumble_commands_sent >= 1, "Rumble commands telemetry stat");
+
+    // Clear rumble state
+    hle::KxGameInputRumbleParams zero{};
+    device->SetRumbleState(&zero);
+    device->GetRumbleState(&got);
+    KX_CHECK(got.low_frequency == 0.0f && got.high_frequency == 0.0f, "Rumble cleared");
+
+    device->Release();
+    gi->Release();
+}
+
 }  // namespace
 
 int main() {
@@ -1985,6 +2530,10 @@ int main() {
     run_test("RDNA2 Multi-Texture & Multi-Buffer Dynamic Descriptor Remapping", test_rdna2_multi_texture_multi_buffer_descriptor_remapping);
     run_test("RDNA2 Depth-Buffered 3D Lit & Textured Perspective Cube on Dual-GPU Hardware", test_rdna2_depth_buffered_3d_cube_dual_gpu);
     run_test("GDK XUser/XStore/XPackage & DirectStorage VFS Async Bridge", test_gdk_runtime_and_directstorage_bridge);
+    run_test("RDNA2 2D/3D Compute Workgroup Tiling & LDS Spatial Exchange on Dual-GPU Hardware", test_rdna2_compute_2d_workgroup_tiling_dual_gpu);
+    run_test("RDNA2 PBR Material Deferred GBuffer (Albedo, Normal, Material) MRT Pipeline on Dual-GPU Hardware", test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu);
+    run_test("D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization", test_d3d12x_async_compute_queue_fence_sync);
+    run_test("GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge", test_gameinput_force_feedback_rumble);
 
     std::cout << std::format("\nSummary: {} passed, {} failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

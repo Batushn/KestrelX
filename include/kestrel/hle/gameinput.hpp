@@ -49,15 +49,29 @@ struct IKxGameInputReading : public IUnknown {
     virtual bool STDMETHODCALLTYPE GetGamepadState(KxGameInputGamepadState* state) = 0;
 };
 
+struct KxGameInputRumbleParams {
+    float low_frequency = 0.0f;   // 0.0 .. 1.0 (left large motor)
+    float high_frequency = 0.0f;  // 0.0 .. 1.0 (right small motor)
+    float left_trigger = 0.0f;    // 0.0 .. 1.0 (left impulse trigger)
+    float right_trigger = 0.0f;   // 0.0 .. 1.0 (right impulse trigger)
+};
+
+struct IKxGameInputDevice : public IUnknown {
+    virtual void STDMETHODCALLTYPE SetRumbleState(const KxGameInputRumbleParams* params) = 0;
+    virtual void STDMETHODCALLTYPE GetRumbleState(KxGameInputRumbleParams* out_params) = 0;
+};
+
 struct IKxGameInput : public IUnknown {
     virtual uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetCurrentReading(
         uint32_t input_kind, void* device, IKxGameInputReading** reading) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDefaultDevice(IKxGameInputDevice** out_device) = 0;
 };
 
 struct GameInputStats {
     uint64_t instances_created = 0;
     uint64_t readings_polled = 0;
+    uint64_t rumble_commands_sent = 0;
 };
 
 // Pure helper for deterministic XInput word/axis -> GameInput state conversion.

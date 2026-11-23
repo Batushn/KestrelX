@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(KestrelX VERSION 0.5.0 LANGUAGES CXX)
+project(KestrelX VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

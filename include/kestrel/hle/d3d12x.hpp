@@ -27,6 +27,8 @@ struct D3D12XStats {
     uint64_t dispatch_calls = 0;
     uint64_t barrier_calls = 0;
     uint64_t pso_binds = 0;
+    uint64_t compute_queues_created = 0;
+    uint64_t inter_queue_fences = 0;
 };
 
 // Pure COM wrapper around ID3D12GraphicsCommandList for draw/dispatch/barrier telemetry.

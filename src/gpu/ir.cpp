@@ -453,6 +453,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 ir.op = IrOp::Exp;
                 ir.subop = "exp";
                 ir.exp_target = static_cast<uint8_t>(d.opcode);
+                if (d.opcode <= 7) fn.mrt_mask |= (1u << d.opcode);
                 ir.exp_en = d.exp_en;
                 ir.exp_done = d.exp_done;
                 ir.src0 = make_vgpr(d.src0);

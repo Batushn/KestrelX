@@ -29,8 +29,29 @@ struct RawXInputState {
 
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD dwUserIndex, RawXInputState* pState);
 
+struct RawXInputVibration {
+    WORD wLeftMotorSpeed;
+    WORD wRightMotorSpeed;
+};
+using XInputSetStateFn = DWORD(WINAPI*)(DWORD dwUserIndex, RawXInputVibration* pVibration);
+
+XInputSetStateFn resolve_xinput_set_state() {
+    static XInputSetStateFn fn = []() -> XInputSetStateFn {
+        for (const wchar_t* dll : {L"xinput1_4.dll", L"xinput9_1_0.dll"}) {
+            if (HMODULE mod = LoadLibraryW(dll)) {
+                if (auto p = reinterpret_cast<XInputSetStateFn>(GetProcAddress(mod, "XInputSetState"))) {
+                    return p;
+                }
+            }
+        }
+        return nullptr;
+    }();
+    return fn;
+}
+
 std::atomic<uint64_t> g_instances{0};
 std::atomic<uint64_t> g_readings{0};
+std::atomic<uint64_t> g_rumble_commands{0};
 
 std::mutex g_mock_mtx;
 bool g_mock_enabled = false;
@@ -98,6 +119,52 @@ private:
     std::atomic<ULONG> ref_{1};
     uint64_t ts_ = 0;
     KxGameInputGamepadState state_{};
+};
+
+class KxGameInputDevice final : public IKxGameInputDevice {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown)) {
+            *ppv = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ref_.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = ref_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (n == 0) delete this;
+        return n;
+    }
+
+    void STDMETHODCALLTYPE SetRumbleState(const KxGameInputRumbleParams* params) override {
+        if (!params) return;
+        g_rumble_commands.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(mtx_);
+            current_rumble_ = *params;
+        }
+        if (auto sfn = resolve_xinput_set_state()) {
+            RawXInputVibration vib{};
+            vib.wLeftMotorSpeed = static_cast<WORD>(std::clamp(params->low_frequency, 0.0f, 1.0f) * 65535.0f);
+            vib.wRightMotorSpeed = static_cast<WORD>(std::clamp(params->high_frequency, 0.0f, 1.0f) * 65535.0f);
+            sfn(0, &vib);
+        }
+    }
+
+    void STDMETHODCALLTYPE GetRumbleState(KxGameInputRumbleParams* out_params) override {
+        if (!out_params) return;
+        std::lock_guard lock(mtx_);
+        *out_params = current_rumble_;
+    }
+
+private:
+    std::atomic<ULONG> ref_{1};
+    std::mutex mtx_;
+    KxGameInputRumbleParams current_rumble_{};
 };
 
 class KxGameInput final : public IKxGameInput {
@@ -169,6 +236,12 @@ public:
         return S_OK;
     }
 
+    HRESULT STDMETHODCALLTYPE GetDefaultDevice(IKxGameInputDevice** out_dev) override {
+        if (!out_dev) return E_POINTER;
+        *out_dev = new KxGameInputDevice();
+        return S_OK;
+    }
+
 private:
     std::atomic<ULONG> ref_{1};
 };
@@ -230,11 +303,12 @@ void register_gameinput(Registry& reg) {
     reg.register_export("xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&kx_GameInputCreate));
 }
 
-GameInputStats gameinput_stats() { return {g_instances.load(), g_readings.load()}; }
+GameInputStats gameinput_stats() { return {g_instances.load(), g_readings.load(), g_rumble_commands.load()}; }
 
 void reset_gameinput_stats() {
     g_instances = 0;
     g_readings = 0;
+    g_rumble_commands = 0;
     clear_gameinput_mock_state();
 }
 

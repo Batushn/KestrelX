@@ -90,7 +90,9 @@ Result<ComputeDispatchResult> run_compute_dxil_on_gpu(
     const std::vector<uint8_t>& dxil,
     const std::vector<uint32_t>& initial_buffer_u32,
     const uint32_t root_constants[8],
-    uint32_t groups_x) {
+    uint32_t groups_x,
+    uint32_t groups_y,
+    uint32_t groups_z) {
     if (dxil.empty() || initial_buffer_u32.empty()) {
         return fail("DXIL or buffer is empty");
     }
@@ -206,7 +208,7 @@ Result<ComputeDispatchResult> run_compute_dxil_on_gpu(
     cmd->SetComputeRootSignature(root_sig.Get());
     cmd->SetComputeRoot32BitConstants(0, 8, root_constants, 0);
     cmd->SetComputeRootUnorderedAccessView(1, gpu_buf->GetGPUVirtualAddress());
-    cmd->Dispatch(groups_x, 1, 1);
+    cmd->Dispatch(groups_x, groups_y, groups_z);
 
     D3D12_RESOURCE_BARRIER uav_bar{};
     uav_bar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

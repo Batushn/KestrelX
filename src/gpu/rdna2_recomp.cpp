@@ -38,7 +38,7 @@ std::string wrap_clamp(const std::string& expr, bool clamp) {
     return clamp ? std::format("saturate({})", expr) : expr;
 }
 
-void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, ShaderStage stage) {
+void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, ShaderStage stage, bool is_mrt = false) {
     switch (i.op) {
         case IrOp::Nop:
             break;
@@ -337,7 +337,13 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
                     out << ind << std::format("#error Unsupported Vertex EXP target: {}\n", i.exp_target);
                 }
             } else if (stage == ShaderStage::Pixel) {
-                if (i.exp_target == 0) {
+                if (is_mrt) {
+                    for (int c = 0; c < 4; ++c) {
+                        if (i.exp_en & (1u << c)) {
+                            out << ind << std::format("kx_mrt.mrt{}.{} = {};\n", i.exp_target, comps[c], emit_f32(*srcs[c]));
+                        }
+                    }
+                } else if (i.exp_target == 0) {
                     for (int c = 0; c < 4; ++c) {
                         if (i.exp_en & (1u << c)) {
                             out << ind << std::format("kx_mrt0.{} = {};\n", comps[c], emit_f32(*srcs[c]));
@@ -353,7 +359,7 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, Shader
         }
         case IrOp::EndPgm:
             if (stage == ShaderStage::Vertex) out << ind << "return kx_out;\n";
-            else if (stage == ShaderStage::Pixel) out << ind << "return kx_mrt0;\n";
+            else if (stage == ShaderStage::Pixel) out << ind << (is_mrt ? "return kx_mrt;\n" : "return kx_mrt0;\n");
             else out << ind << "return;\n";
             break;
         default:
@@ -427,16 +433,18 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
     RecompResult res{};
     res.wave_mode = opt.wave_mode;
     res.vgpr_count = std::max<uint32_t>(fn.max_vgpr, 4u);
-    res.sgpr_count = std::max<uint32_t>(fn.max_sgpr, 4u);
+    res.sgpr_count = std::max<uint32_t>(fn.max_sgpr, (opt.stage == ShaderStage::Compute) ? 10u : 4u);
     res.blocks_emitted = static_cast<uint32_t>(fn.blocks.size());
     res.uses_cbuf = fn.uses_cbuf;
     res.uses_wave_ops = fn.uses_wave_ops;
     res.tex_bindings = fn.tex_bindings;
     res.samp_bindings = fn.samp_bindings;
     res.buf_srv_bindings = fn.buf_srv_bindings;
+    res.mrt_mask = fn.mrt_mask;
 
+    const bool is_mrt = (opt.stage == ShaderStage::Pixel) && ((fn.mrt_mask & ~1u) != 0u);
     const char* ret_stmt = (opt.stage == ShaderStage::Vertex) ? "return kx_out;"
-                         : (opt.stage == ShaderStage::Pixel)  ? "return kx_mrt0;"
+                         : (opt.stage == ShaderStage::Pixel)  ? (is_mrt ? "return kx_mrt;" : "return kx_mrt0;")
                                                               : "return;";
 
     std::ostringstream out;
@@ -481,8 +489,20 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
         }
         emit_dynamic_descriptors(out, fn, opt.stage);
         out << "struct KxPsIn { float4 pos : SV_Position; float4 param0 : TEXCOORD0; };\n\n";
-        out << std::format("float4 {}(KxPsIn kx_in) : SV_Target0 {{\n", opt.entry_point);
-        out << "    float4 kx_mrt0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+        if (is_mrt) {
+            out << "struct KxPsOut {\n";
+            for (int m = 0; m < 8; ++m) {
+                if (fn.mrt_mask & (1u << m)) {
+                    out << std::format("    float4 mrt{} : SV_Target{};\n", m, m);
+                }
+            }
+            out << "};\n\n";
+            out << std::format("KxPsOut {}(KxPsIn kx_in) {{\n", opt.entry_point);
+            out << "    KxPsOut kx_mrt = (KxPsOut)0;\n";
+        } else {
+            out << std::format("float4 {}(KxPsIn kx_in) : SV_Target0 {{\n", opt.entry_point);
+            out << "    float4 kx_mrt0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+        }
     }
 
     out << std::format("    uint v[{}] = (uint[{}])0;\n", res.vgpr_count, res.vgpr_count);
@@ -491,7 +511,12 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
     out << "    bool vcc = false;\n";
     if (opt.stage == ShaderStage::Compute) {
         out << "    v[0] = tid.x;\n";
-        out << "    s[0] = kx_root0.x; s[1] = kx_root0.y; s[2] = kx_root0.z; s[3] = kx_root0.w;\n\n";
+        out << "    v[1] = tid.y;\n";
+        out << "    v[2] = gtid.x;\n";
+        out << "    v[3] = gtid.y;\n";
+        out << "    s[0] = kx_root0.x; s[1] = kx_root0.y; s[2] = kx_root0.z; s[3] = kx_root0.w;\n";
+        out << "    s[4] = gid.x; s[5] = gid.y; s[6] = gid.z;\n";
+        out << "    s[8] = tid.x; s[9] = tid.y;\n\n";
     } else if (opt.stage == ShaderStage::Vertex) {
         out << "    v[0] = sv_vid;\n";
         if (fn.uses_mem && !fn.uses_cbuf) {
@@ -508,7 +533,7 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
     if (fn.blocks.size() <= 1) {
         if (!fn.blocks.empty()) {
             for (const auto& inst : fn.blocks[0].insts) {
-                emit_inst(out, inst, "    ", opt.stage);
+                emit_inst(out, inst, "    ", opt.stage, is_mrt);
             }
         }
         if (opt.stage != ShaderStage::Compute) {
@@ -536,7 +561,7 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn, const RecompOptions& opt) {
                     out << std::format("            {}\n", ret_stmt);
                     terminated = true;
                 } else {
-                    emit_inst(out, inst, "            ", opt.stage);
+                    emit_inst(out, inst, "            ", opt.stage, is_mrt);
                 }
             }
             if (!terminated) {

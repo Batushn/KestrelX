@@ -35,6 +35,7 @@ struct RecompResult {
     WaveMode wave_mode = WaveMode::Wave32;
     bool uses_cbuf = false;
     bool uses_wave_ops = false;
+    uint32_t mrt_mask = 0;
     std::vector<DescriptorSlot> tex_bindings;
     std::vector<DescriptorSlot> samp_bindings;
     std::vector<DescriptorSlot> buf_srv_bindings;

@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <unknwn.h>
+#include <cstddef>
 #include <cstdint>
 
 namespace kestrel::hle {
@@ -23,10 +24,44 @@ struct KxAudioBuffer {
     const uint8_t* audio_data = nullptr;
 };
 
+struct KxSendDescriptor {
+    uint32_t flags = 0;
+    void* output_voice = nullptr;  // IKxSubmixVoice* or IKxMasteringVoice*
+};
+
+struct KxVoiceSends {
+    uint32_t send_count = 0;
+    const KxSendDescriptor* sends = nullptr;
+};
+
+struct KxVoiceState {
+    void* current_buffer_context = nullptr;
+    uint32_t buffers_queued = 0;
+    uint64_t samples_played = 0;
+};
+
 struct IKxMasteringVoice {
     virtual ~IKxMasteringVoice() = default;
     virtual HRESULT STDMETHODCALLTYPE SetVolume(float volume) = 0;
     virtual void STDMETHODCALLTYPE GetVolume(float* volume) = 0;
+    virtual void STDMETHODCALLTYPE DestroyVoice() = 0;
+    // Appended vtable slots (preserving guest ABI slots 0..3)
+    virtual HRESULT STDMETHODCALLTYPE SetChannelVolumes(uint32_t channels, const float* volumes) = 0;
+    virtual void STDMETHODCALLTYPE GetChannelVolumes(uint32_t channels, float* volumes) = 0;
+};
+
+struct IKxSubmixVoice {
+    virtual ~IKxSubmixVoice() = default;
+    virtual HRESULT STDMETHODCALLTYPE SetVolume(float volume) = 0;
+    virtual void STDMETHODCALLTYPE GetVolume(float* volume) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetChannelVolumes(uint32_t channels, const float* volumes) = 0;
+    virtual void STDMETHODCALLTYPE GetChannelVolumes(uint32_t channels, float* volumes) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetOutputMatrix(
+        void* dst_voice, uint32_t src_channels, uint32_t dst_channels, const float* level_matrix) = 0;
+    virtual void STDMETHODCALLTYPE GetOutputMatrix(
+        void* dst_voice, uint32_t src_channels, uint32_t dst_channels, float* level_matrix) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetOutputVoices(const KxVoiceSends* send_list) = 0;
+    virtual uint32_t STDMETHODCALLTYPE GetProcessingStage() const = 0;
     virtual void STDMETHODCALLTYPE DestroyVoice() = 0;
 };
 
@@ -38,6 +73,19 @@ struct IKxSourceVoice {
     virtual HRESULT STDMETHODCALLTYPE SetVolume(float volume) = 0;
     virtual uint32_t STDMETHODCALLTYPE GetBuffersQueued() = 0;
     virtual void STDMETHODCALLTYPE DestroyVoice() = 0;
+    // Appended vtable slots (preserving guest ABI slots 0..6)
+    virtual void STDMETHODCALLTYPE GetVolume(float* volume) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FlushSourceBuffers() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetFrequencyRatio(float ratio) = 0;
+    virtual void STDMETHODCALLTYPE GetFrequencyRatio(float* ratio) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetChannelVolumes(uint32_t channels, const float* volumes) = 0;
+    virtual void STDMETHODCALLTYPE GetChannelVolumes(uint32_t channels, float* volumes) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetOutputMatrix(
+        void* dst_voice, uint32_t src_channels, uint32_t dst_channels, const float* level_matrix) = 0;
+    virtual void STDMETHODCALLTYPE GetOutputMatrix(
+        void* dst_voice, uint32_t src_channels, uint32_t dst_channels, float* level_matrix) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetOutputVoices(const KxVoiceSends* send_list) = 0;
+    virtual void STDMETHODCALLTYPE GetState(KxVoiceState* state) = 0;
 };
 
 struct IKxXAudio2 : public IUnknown {
@@ -47,7 +95,81 @@ struct IKxXAudio2 : public IUnknown {
         IKxSourceVoice** out_voice, const KxWaveFormat* fmt) = 0;
     virtual HRESULT STDMETHODCALLTYPE StartEngine() = 0;
     virtual void STDMETHODCALLTYPE StopEngine() = 0;
+    // Appended vtable slots (preserving guest ABI slots 0..6)
+    virtual HRESULT STDMETHODCALLTYPE CreateSubmixVoice(
+        IKxSubmixVoice** out_voice,
+        uint32_t input_channels = 2,
+        uint32_t input_sample_rate = 48000,
+        uint32_t flags = 0,
+        uint32_t processing_stage = 0,
+        const KxVoiceSends* send_list = nullptr) = 0;
 };
+
+// Clean-room X3DAudio foundation types & functions
+struct KxVec3 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct KxX3DAudioHandle {
+    uint8_t bytes[20]{};
+};
+
+constexpr uint32_t KxX3DAudioCalculateMatrix       = 0x00000001u;
+constexpr uint32_t KxX3DAudioCalculateDelay        = 0x00000002u;
+constexpr uint32_t KxX3DAudioCalculateLpfDirect    = 0x00000004u;
+constexpr uint32_t KxX3DAudioCalculateLpfReverb    = 0x00000008u;
+constexpr uint32_t KxX3DAudioCalculateReverb       = 0x00000010u;
+constexpr uint32_t KxX3DAudioCalculateDoppler      = 0x00000020u;
+constexpr uint32_t KxX3DAudioCalculateEmitterAngle = 0x00000040u;
+
+constexpr uint32_t KxSpeakerFrontLeft  = 0x00000001u;
+constexpr uint32_t KxSpeakerFrontRight = 0x00000002u;
+constexpr uint32_t KxSpeakerStereo     = KxSpeakerFrontLeft | KxSpeakerFrontRight;
+
+struct KxX3DAudioListener {
+    KxVec3 orient_front{0.0f, 0.0f, 1.0f};
+    KxVec3 orient_top{0.0f, 1.0f, 0.0f};
+    KxVec3 position{0.0f, 0.0f, 0.0f};
+    KxVec3 velocity{0.0f, 0.0f, 0.0f};
+};
+
+struct KxX3DAudioEmitter {
+    KxVec3 orient_front{0.0f, 0.0f, 1.0f};
+    KxVec3 orient_top{0.0f, 1.0f, 0.0f};
+    KxVec3 position{0.0f, 0.0f, 0.0f};
+    KxVec3 velocity{0.0f, 0.0f, 0.0f};
+    uint32_t channel_count = 1;
+    float curve_distance_scaler = 1.0f;
+    float doppler_scaler = 1.0f;
+    float inner_radius = 0.0f;
+    float inner_radius_angle = 0.0f;
+};
+
+struct KxX3DAudioDspSettings {
+    float* matrix_coefficients = nullptr;
+    float* delay_times = nullptr;
+    uint32_t src_channel_count = 1;
+    uint32_t dst_channel_count = 2;
+    float lpf_direct_coefficient = 1.0f;
+    float lpf_reverb_coefficient = 1.0f;
+    float reverb_level = 0.0f;
+    float doppler_factor = 1.0f;
+    float emitter_to_listener_angle = 0.0f;
+    float emitter_to_listener_distance = 0.0f;
+    float emitter_velocity_component = 0.0f;
+    float listener_velocity_component = 0.0f;
+};
+
+HRESULT __stdcall kx_X3DAudioInitialize(
+    uint32_t speaker_channel_mask, float speed_of_sound, KxX3DAudioHandle* out_instance);
+void __stdcall kx_X3DAudioCalculate(
+    const KxX3DAudioHandle* instance,
+    const KxX3DAudioListener* listener,
+    const KxX3DAudioEmitter* emitter,
+    uint32_t flags,
+    KxX3DAudioDspSettings* dsp_settings);
 
 struct XAudio2Stats {
     uint64_t engines_created = 0;
@@ -59,9 +181,11 @@ struct XAudio2Stats {
     uint64_t wasapi_packets = 0;
     bool wasapi_active = false;
     double last_rms = 0.0;
+    uint64_t submix_voices_created = 0;
+    uint64_t x3daudio_calls = 0;
 };
 
-// Drain stereo float32 PCM frames from the internal ring buffer (for WASAPI sink or headless verification).
+// Pull stereo float32 PCM frames from the software mixer (for WASAPI sink or headless verification).
 size_t xaudio2_drain_stereo_f32(float* out_interleaved_stereo, size_t max_frames);
 void set_xaudio2_wasapi_enabled(bool enabled);
 void shutdown_xaudio2_wasapi();

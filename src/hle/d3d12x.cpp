@@ -32,7 +32,8 @@ std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0},
     g_compute_queues{0}, g_inter_queue_fences{0},
     g_vrs_rate_sets{0}, g_vrs_image_binds{0},
     g_work_graphs_created{0}, g_work_graph_dispatches{0},
-    g_dispatch_mesh_calls{0}, g_enhanced_barrier_calls{0}, g_enhanced_barrier_groups{0};
+    g_dispatch_mesh_calls{0}, g_enhanced_barrier_calls{0}, g_enhanced_barrier_groups{0},
+    g_reserved_resources{0}, g_tile_mapping_updates{0}, g_tiles_mapped{0}, g_tiles_unmapped{0}, g_copy_tiles_calls{0};
 
 std::mutex g_present_mtx;
 bool g_windowed = false;
@@ -416,7 +417,10 @@ void STDMETHODCALLTYPE KxGraphicsCommandListProxy::Dispatch(UINT x, UINT y, UINT
 void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyBufferRegion(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT64 nb) { inner_->CopyBufferRegion(d, dof, s, sof, nb); }
 void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT dx, UINT dy, UINT dz, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* sb) { inner_->CopyTextureRegion(d, dx, dy, dz, s, sb); }
 void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyResource(ID3D12Resource* d, ID3D12Resource* s) { inner_->CopyResource(d, s); }
-void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyTiles(ID3D12Resource* tr, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 off, D3D12_TILE_COPY_FLAGS f) { inner_->CopyTiles(tr, c, sz, b, off, f); }
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::CopyTiles(ID3D12Resource* tr, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 off, D3D12_TILE_COPY_FLAGS f) {
+    g_copy_tiles_calls.fetch_add(1, std::memory_order_relaxed);
+    inner_->CopyTiles(tr, c, sz, b, off, f);
+}
 void STDMETHODCALLTYPE KxGraphicsCommandListProxy::ResolveSubresource(ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT fmt) { inner_->ResolveSubresource(d, ds, s, ss, fmt); }
 void STDMETHODCALLTYPE KxGraphicsCommandListProxy::IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) { inner_->IASetPrimitiveTopology(t); }
 void STDMETHODCALLTYPE KxGraphicsCommandListProxy::RSSetViewports(UINT n, const D3D12_VIEWPORT* v) { inner_->RSSetViewports(n, v); }
@@ -592,8 +596,29 @@ HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::SetPrivateData(REFGUID g, UINT s,
 HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::SetPrivateDataInterface(REFGUID g, const IUnknown* d) { return inner_->SetPrivateDataInterface(g, d); }
 HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::SetName(LPCWSTR n) { return inner_->SetName(n); }
 HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::GetDevice(REFIID r, void** o) { return inner_->GetDevice(r, o); }
-void STDMETHODCALLTYPE KxCommandQueueProxy::UpdateTileMappings(ID3D12Resource* res, UINT n, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Heap* h, UINT nr, const D3D12_TILE_RANGE_FLAGS* f, const UINT* ho, const UINT* tc, D3D12_TILE_MAPPING_FLAGS fl) { inner_->UpdateTileMappings(res, n, c, sz, h, nr, f, ho, tc, fl); }
-void STDMETHODCALLTYPE KxCommandQueueProxy::CopyTileMappings(ID3D12Resource* dr, const D3D12_TILED_RESOURCE_COORDINATE* dc, ID3D12Resource* sr, const D3D12_TILED_RESOURCE_COORDINATE* sc, const D3D12_TILE_REGION_SIZE* sz, D3D12_TILE_MAPPING_FLAGS fl) { inner_->CopyTileMappings(dr, dc, sr, sc, sz, fl); }
+void STDMETHODCALLTYPE KxCommandQueueProxy::UpdateTileMappings(ID3D12Resource* res, UINT n, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Heap* h, UINT nr, const D3D12_TILE_RANGE_FLAGS* f, const UINT* ho, const UINT* tc, D3D12_TILE_MAPPING_FLAGS fl) {
+    g_tile_mapping_updates.fetch_add(1, std::memory_order_relaxed);
+    if (nr > 0 && f) {
+        for (UINT i = 0; i < nr; ++i) {
+            const UINT cnt = tc ? tc[i] : 1u;
+            if (f[i] & D3D12_TILE_RANGE_FLAG_NULL) {
+                g_tiles_unmapped.fetch_add(cnt, std::memory_order_relaxed);
+            } else {
+                g_tiles_mapped.fetch_add(cnt, std::memory_order_relaxed);
+            }
+        }
+    } else if (n > 0 && sz) {
+        for (UINT i = 0; i < n; ++i) {
+            g_tiles_mapped.fetch_add(sz[i].NumTiles, std::memory_order_relaxed);
+        }
+    }
+    inner_->UpdateTileMappings(res, n, c, sz, h, nr, f, ho, tc, fl);
+}
+void STDMETHODCALLTYPE KxCommandQueueProxy::CopyTileMappings(ID3D12Resource* dr, const D3D12_TILED_RESOURCE_COORDINATE* dc, ID3D12Resource* sr, const D3D12_TILED_RESOURCE_COORDINATE* sc, const D3D12_TILE_REGION_SIZE* sz, D3D12_TILE_MAPPING_FLAGS fl) {
+    g_tile_mapping_updates.fetch_add(1, std::memory_order_relaxed);
+    if (sz) g_tiles_mapped.fetch_add(sz->NumTiles, std::memory_order_relaxed);
+    inner_->CopyTileMappings(dr, dc, sr, sc, sz, fl);
+}
 void STDMETHODCALLTYPE KxCommandQueueProxy::ExecuteCommandLists(UINT n, ID3D12CommandList* const* ls) {
     if (n == 0 || !ls) {
         inner_->ExecuteCommandLists(n, ls);
@@ -788,7 +813,11 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePlacedResource(ID3D12Heap* h, UIN
     if (SUCCEEDED(hr)) g_resources.fetch_add(1, std::memory_order_relaxed);
     return hr;
 }
-HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateReservedResource(const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID r, void** o) { return inner_->CreateReservedResource(d, st, cv, r, o); }
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateReservedResource(const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID r, void** o) {
+    HRESULT hr = inner_->CreateReservedResource(d, st, cv, r, o);
+    if (SUCCEEDED(hr)) g_reserved_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateSharedHandle(ID3D12DeviceChild* obj, const SECURITY_ATTRIBUTES* a, DWORD acc, LPCWSTR n, HANDLE* h) { return inner_->CreateSharedHandle(obj, a, acc, n, h); }
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::OpenSharedHandle(HANDLE h, REFIID r, void** o) { return inner_->OpenSharedHandle(h, r, o); }
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::OpenSharedHandleByName(LPCWSTR n, DWORD acc, HANDLE* h) { return inner_->OpenSharedHandleByName(n, acc, h); }
@@ -960,7 +989,8 @@ D3D12XStats d3d12x_stats() {
             g_compute_queues.load(), g_inter_queue_fences.load(),
             g_vrs_rate_sets.load(), g_vrs_image_binds.load(),
             g_work_graphs_created.load(), g_work_graph_dispatches.load(),
-            g_dispatch_mesh_calls.load(), g_enhanced_barrier_calls.load(), g_enhanced_barrier_groups.load()};
+            g_dispatch_mesh_calls.load(), g_enhanced_barrier_calls.load(), g_enhanced_barrier_groups.load(),
+            g_reserved_resources.load(), g_tile_mapping_updates.load(), g_tiles_mapped.load(), g_tiles_unmapped.load(), g_copy_tiles_calls.load()};
 }
 
 void reset_d3d12x_stats() {
@@ -969,7 +999,8 @@ void reset_d3d12x_stats() {
         g_stream_pso_recomp = g_disk_cache_hits = g_disk_cache_misses = g_device_qi_upgrades =
         g_draw_calls = g_dispatch_calls = g_barrier_calls = g_pso_binds = g_compute_queues =
         g_inter_queue_fences = g_vrs_rate_sets = g_vrs_image_binds =
-        g_work_graphs_created = g_work_graph_dispatches = g_dispatch_mesh_calls = g_enhanced_barrier_calls = g_enhanced_barrier_groups = 0;
+        g_work_graphs_created = g_work_graph_dispatches = g_dispatch_mesh_calls = g_enhanced_barrier_calls = g_enhanced_barrier_groups =
+        g_reserved_resources = g_tile_mapping_updates = g_tiles_mapped = g_tiles_unmapped = g_copy_tiles_calls = 0;
     {
         std::lock_guard lock(g_shader_cache_mtx);
         g_dxil_cache.clear();

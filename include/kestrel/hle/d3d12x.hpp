@@ -36,6 +36,11 @@ struct D3D12XStats {
     uint64_t dispatch_mesh_calls = 0;
     uint64_t enhanced_barrier_calls = 0;
     uint64_t enhanced_barrier_groups = 0;
+    uint64_t reserved_resources = 0;
+    uint64_t tile_mapping_updates = 0;
+    uint64_t tiles_mapped = 0;
+    uint64_t tiles_unmapped = 0;
+    uint64_t copy_tiles_calls = 0;
 };
 
 // Pure COM wrapper around ID3D12GraphicsCommandList..ID3D12GraphicsCommandList5

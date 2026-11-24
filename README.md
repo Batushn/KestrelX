@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0-2ea44f?style=for-the-badge" alt="Release: v0.7.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-61%2F61_PASS-brightgreen?style=for-the-badge" alt="Tests: 61/61 PASS" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-63%2F63_PASS-brightgreen?style=for-the-badge" alt="Tests: 63/63 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
     <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
@@ -125,15 +125,15 @@ flowchart LR
 | **PE32+ Loader & System Libs** | `██████████ 100%` | ✅ Ready | `MicrosoftGame.config` XML, PE32+ relocs (DIR64/HIGHLOW), delay-load imports (RVA/legacy VA), export forwarders (DLL.Symbol, DLL.#Ordinal), multi-page thunk leak cleanup, `.pdata` SEH, TLS callbacks, dynamic GDK Agility SDK query (`D3D12SDKVersion`, `D3D12SDKPath`), dynamic DLL redirection & search directories | Side-by-side title updates & patch mounts |
 | **CPU VEH Zen 2 Shim** | `██████████ 100%` | ✅ Ready | In-process VEH emulator for AMD Zen 2 `CLZERO`, `MONITORX`, `MWAITX`, `MCOMMIT`, `RDPRU`, `PREFETCHW`, and SSE4a `EXTRQ`/`INSERTQ` for crash-free Intel processor compatibility | Dynamic TSC virtualization & CPU core topology pinning |
 | **Copy-on-Write Overlay VFS** | `██████████ 100%` | ✅ Ready | Case-insensitive per-layer path lookup cache, merged `list_directory` across base and overlay, whiteout suppression, non-throwing `std::error_code` safety, multi-user save partition isolation (`set_active_user_xuid`, `active_save_root`), Xbox drive prefixes (`GAME:\`, `G:\`, `D:\`, `C:\`, `S:\`, `T:\`) | Encrypted container archive streaming mounts |
-| **RDNA2 -> IR -> SM 6.6 DXIL** | `██████████ 98%` | ✅ Ready | Complete 30-predicate VCmp/SCmp, 64-bit scalar ALU, Mesh Shaders (`ms_6_6`), Amplification Shaders (`as_6_6`), VRS Tier 2 decoders & combiners, Hardware Raytracing BVH traversal (`image_bvh_intersect_ray` / `image_bvh64_intersect_ray` -> inline SM 6.6 `RayQuery`), PBR 3-MRT GBuffer, 2D compute tiling, Wave intrinsics | Inline procedural primitive intersection shims |
+| **RDNA2 -> IR -> SM 6.6 DXIL** | `██████████ 98%` | ✅ Ready | Complete 30-predicate VCmp/SCmp, 64-bit scalar ALU, Mesh Shaders (`ms_6_6`), Amplification Shaders (`as_6_6`), VRS Tier 2 decoders & combiners, Hardware Raytracing BVH traversal (`image_bvh_intersect_ray` / `image_bvh64_intersect_ray` -> inline SM 6.6 `RayQuery`), PBR 3-MRT GBuffer, 2D compute tiling, Wave intrinsics, RDNA2 `MIMG` `TFE` PRT residency (`CheckAccessFullyMapped`) | Inline procedural primitive intersection shims |
 | **RDNA2 IR Optimization Passes** | `██████████ 100%` | ✅ Ready | Unreachable basic-block pruning, intra-block copy propagation, constant folding (integer & float operations), backward liveness DCE & unused flag pruning, bit-exact dual-GPU parity | Inter-block global value numbering (GVN) |
 | **Persistent DXIL Shader Cache** | `██████████ 100%` | ✅ Ready | Mutex-protected thread-safe `DiskShaderCache`, LRU size quotas (`max_entries`, `max_bytes`), multi-dimensional dispatch keys (`group_y`, `group_z`, `mrt_mask`), corruption eviction | Background async shader pre-compilation pool |
-| **D3D12.X COM Proxy (`d3d12_xs`)** | `██████████ 100%` | ✅ Ready | Pure COM `KxDeviceProxy` (`ID3D12Device`-`Device10` QI), stream PSO auto-recomp, dedicated Async Compute queues with timeline fence sync, Work Graph DAG validation & 2-node `ExecuteIndirect` producer->consumer, `ID3D12GraphicsCommandList6/7` Enhanced Barriers & `DispatchMesh`, `d3d12.dll`/`d3d12core.dll` proxying & `D3D12GetInterface` export shim | DirectSR super-resolution bridge |
+| **D3D12.X COM Proxy (`d3d12_xs`)** | `██████████ 100%` | ✅ Ready | Pure COM `KxDeviceProxy` (`ID3D12Device`-`Device10` QI), stream PSO auto-recomp, dedicated Async Compute queues with timeline fence sync, Work Graph DAG validation & 2-node `ExecuteIndirect` producer->consumer, `ID3D12GraphicsCommandList6/7` Enhanced Barriers & `DispatchMesh`, `d3d12.dll`/`d3d12core.dll` proxying & `D3D12GetInterface` export shim, Sparse Virtual Texturing (`CreateReservedResource`, `UpdateTileMappings`, `CopyTiles`, 64KB page table & feedback streaming) | DirectSR super-resolution bridge |
 | **WindowHost & PresentX** | `████████░░ 85%` | ✅ Ready | Win32 `WindowHost` + `IDXGISwapChain3` flip-model (`--windowed`), headless GPU readback BMP capture (`--capture`), `D3D12PresentX` | Fullscreen borderless toggle & frame-pacing telemetry HUD |
 | **Input (`gameinput.dll`)** | `█████████░ 95%` | ✅ Ready | COM `GameInputCreate`, multi-controller slot management (0..3), dynamic hotplugging callbacks & telemetry, impulse trigger force-feedback + dual-motor rumble bridging | Virtual gamepad remapping & deadzone calibration |
 | **Audio (`xaudio2_9.dll`)** | `██████████ 98%` | ✅ Ready | COM `XAudio2Create`, multi-voice software mixer, submix bus routing, non-48kHz pitch resampling, X3DAudio 3D spatial positioning, ITU-R BS.775 5.1 & 7.1 surround downmixing matrix, WASAPI thread lifecycle | WASAPI exclusive mode stream sync |
 | **KernelX & GDK HLE** | `█████████░ 95%` | ✅ Ready | `XMemAlloc`/`Free`/`Size`, `TitleMemoryStatus`, `CreateFileA/W/2`, `ReadFileEx`, `XTaskQueue*`, DirectStorage 1.2 GDeflate GPU streaming, multi-user identity profiles (`kx_XUserAddAsync`, `kx_XUserFindControllerUser`, `kx_XUserSetActive`), controller binding, isolated `S:\` save partitions | Cloud save sync stubbing |
-| **GFX10 Texture Tiling** | `█████████░ 90%` | ✅ Ready | Clean-room 2D swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block tiling, 256B-aligned multi-level mip-chains, SGD5 archive decompression | 3D/Array volume tiling & live upload staging |
+| **GFX10 Texture Tiling** | `█████████░ 90%` | ✅ Ready | Clean-room 2D swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block tiling, 256B-aligned multi-level mip-chains, SGD5 archive decompression, 64KB SVT virtual texture layout & LRU physical tile pool | 3D/Array volume tiling & live upload staging |
 
 ---
 
@@ -149,7 +149,8 @@ KestrelX v0.7.0 delivers major architectural expansions across the graphics, com
 * **Expanded RDNA2 Instruction Set**: Full 30-predicate VCmp/SCmp coverage, 64-bit scalar moves/inversions, bitfield manipulation (`v_bfe_u32`, `v_bfi_b32`), and global 4-dword memory transactions.
 * **Audio & Input Hardening**: Multi-voice XAudio2 mixer with submix routing, pitch resampling, X3DAudio spatialization, and 4-slot GameInput multi-controller hotplugging.
 * **GDK Agility SDK Query & Dynamic DLL Redirection**: Discovers guest exports `D3D12SDKVersion` and `D3D12SDKPath`, automatically mounts packaged SDK directories to search paths, and transparently redirects guest imports for `d3d12.dll` and `d3d12core.dll` to KestrelX HLE shims (`kx_D3D12GetInterface`, `D3D12CreateDevice`).
-* **Dual-GPU Verification Expanded to 61/61 PASS**: Every feature tested bit-exact across physical NVIDIA RTX 4060 and AMD Radeon 780M hardware, plus `--unit-only` mode (48 passed, 13 skipped) and GitHub Actions CI.
+* **Sparse Virtual Texturing (SVT) & Feedback Maps**: 64KB physical page table (`VirtualTexturePageTable`) with LRU eviction, `SvtFeedbackAnalyzer` (RGBA8 residency & min-mip feedback maps), RDNA2 `MIMG` `TFE=1` (`CheckAccessFullyMapped`) lifting, and real D3D12 `CreateReservedResource` + `UpdateTileMappings` + `CopyTiles` telemetry.
+* **Dual-GPU Verification Expanded to 63/63 PASS**: Every feature tested bit-exact across physical NVIDIA RTX 4060 and AMD Radeon 780M hardware, plus `--unit-only` mode (49 passed, 14 skipped) and GitHub Actions CI.
 
 ---
 
@@ -292,7 +293,9 @@ KestrelX Verification Suite
   [PASS] RDNA2 Hardware Raytracing BVH (IMAGE_BVH_INTERSECT_RAY) Decode, IR Lift & SM 6.6 RayQuery DXIL
 
   [PASS] GDK Agility SDK Query, Dynamic DLL Redirection & Modern D3D12/D3D12Core HLE Export Shims
-Summary: 61 passed, 0 failed
+  [PASS] Sparse Virtual Texturing (SVT) 64KB Page Table, LRU Eviction, Feedback & RDNA2 TFE
+  [PASS] Sparse Virtual Texturing (SVT) Reserved Resource, TFE Feedback & LRU Remap on Dual-GPU Hardware
+Summary: 63 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

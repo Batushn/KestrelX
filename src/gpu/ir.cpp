@@ -578,18 +578,20 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
 
             case Encoding::MIMG: {
                 ir.dmask = d.dmask;
+                ir.tfe = d.tfe;
                 uint32_t out_regs = 0;
                 for (int c = 0; c < 4; ++c) {
                     if (d.dmask & (1u << c)) ++out_regs;
                 }
                 if (out_regs == 0) out_regs = 1;
+                const uint32_t total_out_regs = out_regs + (d.tfe ? 1u : 0u);
                 if (d.mnemonic == "image_sample" || d.mnemonic == "image_sample_l") {
                     ir.op = IrOp::ImageSample;
                     ir.dst = make_vgpr(d.dst);
                     ir.src0 = make_vgpr(d.src0);
                     ir.rsrc_slot = alloc_tex_slot(d.src2);
                     ir.samp_slot = alloc_samp_slot(d.src3);
-                    if (d.dst + out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + out_regs;
+                    if (d.dst + total_out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + total_out_regs;
                     if (d.src0 + 2 > fn.max_vgpr) fn.max_vgpr = d.src0 + 2;
                     fn.uses_tex = true;
                 } else if (d.mnemonic == "image_load") {
@@ -597,7 +599,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                     ir.dst = make_vgpr(d.dst);
                     ir.src0 = make_vgpr(d.src0);
                     ir.rsrc_slot = alloc_tex_slot(d.src2);
-                    if (d.dst + out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + out_regs;
+                    if (d.dst + total_out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + total_out_regs;
                     if (d.src0 + 2 > fn.max_vgpr) fn.max_vgpr = d.src0 + 2;
                     fn.uses_tex = true;
                 } else if (d.mnemonic == "image_get_resinfo") {

@@ -586,7 +586,8 @@ void propagate_and_fold_block(IrBlock& blk, IrOptStats& stats) {
         if (inst.op == IrOp::ImageSample ||
             inst.op == IrOp::ImageLoad ||
             inst.op == IrOp::ImageGetResInfo) {
-            invalidate_span(true, inst.dst.reg, image_out_reg_count(inst.dmask));
+            const uint32_t span = image_out_reg_count(inst.dmask) + (inst.tfe ? 1u : 0u);
+            invalidate_span(true, inst.dst.reg, span);
             continue;
         }
         if (inst.op == IrOp::ImageBvhIntersectRay) {
@@ -769,7 +770,7 @@ void transfer_inst_backward(const IrInst& inst, LiveSet& live) {
         case IrOp::ImageSample:
         case IrOp::ImageLoad:
         case IrOp::ImageGetResInfo:
-            for (uint32_t k = 0; k < image_out_reg_count(inst.dmask); ++k) {
+            for (uint32_t k = 0; k < image_out_reg_count(inst.dmask) + (inst.tfe ? 1u : 0u); ++k) {
                 live.set_reg(true, inst.dst.reg + k, false);
             }
             break;

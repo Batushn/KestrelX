@@ -45,6 +45,7 @@ add_library(kestrel_core STATIC
     src/gpu/dxc_compiler.cpp
     src/gpu/gpu_runner.cpp
     src/gpu/gfx10_tiling.cpp
+    src/gpu/svt.cpp
     src/gpu/vrs.cpp
     src/gpu/work_graph.cpp
     src/formats/sgd5.cpp

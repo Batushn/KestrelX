@@ -6,6 +6,7 @@
 #include "kestrel/gpu/ir.hpp"
 #include "kestrel/gpu/rdna2_isa.hpp"
 #include "kestrel/gpu/rdna2_recomp.hpp"
+#include "kestrel/gpu/svt.hpp"
 #include "kestrel/gpu/shader_cache.hpp"
 #include "kestrel/gpu/shader_container.hpp"
 #include "kestrel/gpu/vrs.hpp"
@@ -6963,6 +6964,581 @@ void test_pe_loader_agility_sdk_and_dll_redirection() {
 
 }  // namespace
 
+
+void test_svt_page_table_lru_and_feedback() {
+    // 1. Validate 64KB standard tile shapes & packed mip-tail layout
+    const auto shape_rgba = gpu::standard_tile_shape_for_format(DXGI_FORMAT_R8G8B8A8_UNORM);
+    KX_CHECK(shape_rgba.texels_w == 128 && shape_rgba.texels_h == 128 && shape_rgba.bytes_per_element == 4,
+             "RGBA8 64KB tile shape is 128x128");
+    const auto shape_bc7 = gpu::standard_tile_shape_for_format(DXGI_FORMAT_BC7_UNORM);
+    KX_CHECK(shape_bc7.texels_w == 256 && shape_bc7.texels_h == 256 && shape_bc7.bytes_per_element == 16 && shape_bc7.block_dim == 4,
+             "BC7 64KB tile shape is 256x256");
+
+    const gpu::SvtVirtualTextureDesc desc{1024, 1024, 5, DXGI_FORMAT_R8G8B8A8_UNORM};
+    const auto layout = gpu::compute_virtual_texture_layout(desc);
+    KX_CHECK(layout.num_standard_mips == 4, "1024x1024 RGBA8 5-mip has 4 standard mips (1024,512,256,128)");
+    KX_CHECK(layout.num_packed_mips == 1 && layout.num_tiles_for_packed_mips == 1, "64x64 mip enters packed tail");
+    KX_CHECK(layout.total_tiles == 86, "Total virtual tiles = 64+16+4+1+1 = 86");
+
+    // 2. Validate 64KB physical page table & LRU eviction with constrained 4-tile physical pool
+    gpu::VirtualTexturePageTable pt(desc, 4, /*heap_id=*/0);
+    pt.begin_frame(1);
+    const std::vector<gpu::VirtualTileCoord> f1 = {{0, 0, 0}, {0, 1, 0}, {0, 2, 0}, {0, 3, 0}};
+    auto ops1 = pt.stream_tiles(f1);
+    KX_CHECK(ops1.has_value() && ops1->size() == 4, "Frame 1 maps 4 virtual tiles");
+    KX_CHECK(pt.stats().free_physical_tiles == 0 && pt.stats().resident_tiles == 4, "Physical pool full");
+
+    // Frame 2: touch (0,0) and (1,0), then request (0,1) and (1,1) -> LRU evicts (2,0) & (3,0)
+    pt.begin_frame(2);
+    pt.touch_tile({0, 0, 0});
+    pt.touch_tile({0, 1, 0});
+    const std::vector<gpu::VirtualTileCoord> f2 = {{0, 0, 0}, {0, 0, 1}, {0, 1, 1}};
+    auto ops2 = pt.stream_tiles(f2);
+    KX_CHECK(ops2.has_value(), "Frame 2 stream_tiles succeeded");
+    KX_CHECK(!pt.is_resident({0, 2, 0}) && !pt.is_resident({0, 3, 0}), "Coldest LRU tiles (2,0) & (3,0) evicted");
+    KX_CHECK(pt.is_resident({0, 0, 0}) && pt.is_resident({0, 1, 0}) &&
+             pt.is_resident({0, 0, 1}) && pt.is_resident({0, 1, 1}),
+             "Hot + newly streamed tiles resident");
+    KX_CHECK(pt.stats().evict_count == 2 && pt.stats().cache_hits == 1, "LRU evict & hit counters");
+
+    // 3. Validate RGBA8 & Min-Mip GPU feedback analyzers
+    const gpu::SvtVirtualTextureDesc fb_desc{512, 512, 3, DXGI_FORMAT_R8G8B8A8_UNORM};
+    const auto fb_layout = gpu::compute_virtual_texture_layout(fb_desc);
+    // 4x4 grid of feedback pixels representing sample hits & TFE faults
+    std::vector<uint8_t> fb_rgba(4 * 4 * 4, 0);
+    auto set_fb = [&](uint32_t x, uint32_t y, uint8_t fault, uint8_t u, uint8_t v) {
+        const size_t i = (static_cast<size_t>(y) * 4 + x) * 4;
+        fb_rgba[i + 0] = fault; fb_rgba[i + 1] = u; fb_rgba[i + 2] = v; fb_rgba[i + 3] = 255;
+    };
+    set_fb(0, 0, 0, 32, 32);     // (0,0) resident
+    set_fb(1, 0, 255, 160, 96);  // (2,1) fault
+    set_fb(2, 0, 255, 160, 96);  // (2,1) fault x2
+    set_fb(3, 0, 255, 224, 224); // (3,3) fault x1
+    const auto rep = gpu::SvtFeedbackAnalyzer::analyze_rgba8_feedback(fb_rgba.data(), 4, 4, 16, fb_layout, 0);
+    KX_CHECK(rep.total_samples == 4 && rep.resident_samples == 1 && rep.fault_samples == 3, "RGBA8 feedback counts");
+    KX_CHECK(rep.faulted_tiles.size() == 2 &&
+             rep.faulted_tiles[0] == (gpu::VirtualTileCoord{0, 2, 1}) &&
+             rep.faulted_tiles[1] == (gpu::VirtualTileCoord{0, 3, 3}),
+             "Feedback faults prioritized by hit frequency");
+
+    const uint8_t min_mip[4] = {0, 1, 0xFF, 0};
+    const auto mm_req = gpu::SvtFeedbackAnalyzer::analyze_min_mip_feedback(min_mip, 2, 2, fb_layout);
+    KX_CHECK(!mm_req.empty() && mm_req.front().mip == 1, "Min-mip analyzer orders coarser mips first");
+
+    // 4. Validate RDNA2 MIMG TFE=1 decode, disasm, IR lift, IR optimizer & SM 6.6 DXC compile
+    using namespace gpu::encode;
+    std::vector<uint32_t> ps_words;
+    mimg(ps_words, 0x20, 4, 0, 0, 0, 0xFu, 1, /*tfe=*/true);  // image_sample v[4:7], v[0:1], s[0:7], s[0:3] dmask:0xf tfe (v8=status)
+    ps_words.push_back(vopc(0xC2, 128, 8));                   // v_cmp_eq_u32 vcc, 0, v8
+    ps_words.push_back(vop1(1, 10, 242));                     // v_mov_b32 v10, 1.0
+    ps_words.push_back(vop2(1, 4, 242, 4));                   // v_cndmask_b32 v4, 1.0, v4
+    ps_words.push_back(vop2(1, 5, 128, 5));                   // v_cndmask_b32 v5, 0.0, v5
+    ps_words.push_back(vop2(1, 6, 242, 6));                   // v_cndmask_b32 v6, 1.0, v6
+    ps_words.push_back(vop1(6, 9, 256 + 8));                        // v_cvt_f32_u32 v9, v8
+    exp(ps_words, 0, 0xFu, 4, 5, 6, 10, false);               // exp mrt0
+    exp(ps_words, 1, 0xFu, 9, 0, 1, 10, true);                // exp mrt1 done
+    ps_words.push_back(sopp(1));                              // s_endpgm
+
+    auto dec = gpu::decode_rdna2(ps_words.data(), ps_words.size());
+    KX_CHECK(dec.size() == 10 && dec[0].tfe &&
+             gpu::disassemble_inst(dec[0]).find("tfe") != std::string::npos,
+             "RDNA2 MIMG TFE decode & disasm");
+
+    auto ir = gpu::lift_rdna2_to_ir(dec);
+    KX_CHECK(ir.unknown_count == 0 && ir.uses_tex && ir.mrt_mask == 0x3u && ir.max_vgpr >= 11,
+             "RDNA2 PRT TFE IR lift");
+    auto opt_stats = gpu::optimize_ir(ir);
+    (void)opt_stats;
+
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto ps_hlsl = gpu::emit_hlsl_from_ir(ir, {.stage = gpu::ShaderStage::Pixel, .wave_mode = gpu::WaveMode::Wave32});
+    KX_CHECK(ps_hlsl.hlsl.find("CheckAccessFullyMapped") != std::string::npos,
+             "HLSL emits CheckAccessFullyMapped for TFE");
+    auto ps_dxil = dxc.compile_hlsl(ps_hlsl.hlsl, "main", "ps_6_6");
+    KX_CHECK(ps_dxil.has_value(), ps_dxil.error().message);
+}
+
+void test_svt_reserved_resource_tfe_feedback_dual_gpu() {
+    using namespace gpu::encode;
+    hle::reset_d3d12x_stats();
+
+    // 1. Build RDNA2 VS (MUBUF quad vertices) + RDNA2 PRT PS (MIMG TFE=1 + Dual-MRT Feedback)
+    std::vector<uint32_t> vs_words;
+    vs_words.push_back(vop2(26, 1, 128 + 4, 0));     // v_lshlrev_b32 v1, 4, v0
+    mubuf(vs_words, 14, 2, 1, 0, 128, 0);            // buffer_load_dwordx4 v[2:5], v1, s[0:3], 0
+    vs_words.push_back(vop1(1, 6, 128));             // v_mov_b32 v6, 0.0
+    vs_words.push_back(vop1(1, 7, 242));             // v_mov_b32 v7, 1.0
+    exp(vs_words, 12, 0xFu, 2, 3, 6, 7, false);      // exp pos0
+    exp(vs_words, 32, 0xFu, 4, 5, 6, 7, true);       // exp param0 done
+    vs_words.push_back(sopp(1));
+
+    std::vector<uint32_t> ps_words;
+    mimg(ps_words, 0x20, 4, 0, 0, 0, 0xFu, 1, /*tfe=*/true);  // image_sample v[4:7], v[0:1] ... tfe (v8=status)
+    ps_words.push_back(vopc(0xC2, 128, 8));                   // v_cmp_eq_u32 vcc, 0, v8
+    ps_words.push_back(vop1(1, 10, 242));                     // v_mov_b32 v10, 1.0
+    ps_words.push_back(vop2(1, 4, 242, 4));                   // v_cndmask_b32 v4, 1.0, v4
+    ps_words.push_back(vop2(1, 5, 128, 5));                   // v_cndmask_b32 v5, 0.0, v5
+    ps_words.push_back(vop2(1, 6, 242, 6));                   // v_cndmask_b32 v6, 1.0, v6
+    ps_words.push_back(vop1(6, 9, 256 + 8));                        // v_cvt_f32_u32 v9, v8
+    exp(ps_words, 0, 0xFu, 4, 5, 6, 10, false);               // exp mrt0 (color or Magenta fallback)
+    exp(ps_words, 1, 0xFu, 9, 0, 1, 10, true);                // exp mrt1 (R=fault, G=u, B=v, A=1)
+    ps_words.push_back(sopp(1));
+
+    auto make_kx_blob = [](const char magic[4], uint32_t tag, const std::vector<uint32_t>& words) {
+        std::vector<uint8_t> out(8 + words.size() * 4);
+        std::memcpy(out.data(), magic, 4);
+        std::memcpy(out.data() + 4, &tag, 4);
+        std::memcpy(out.data() + 8, words.data(), words.size() * 4);
+        return out;
+    };
+    const auto vs_blob = make_kx_blob("KXRV", 0, vs_words);
+    const auto ps_blob = make_kx_blob("KXRP", 0, ps_words);
+
+    hle::Registry reg;
+    hle::register_d3d12x(reg);
+    using CreateDevFn = HRESULT(__stdcall*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    auto create_dev = reinterpret_cast<CreateDevFn>(reg.resolve_name("d3d12_xs.dll", "D3D12CreateDevice"));
+    KX_CHECK(create_dev != nullptr, "resolve D3D12CreateDevice");
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value(), adapters.error().message);
+
+    int hw_verified = 0;
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        hle::set_d3d12x_preferred_adapter(static_cast<int>(ad.index));
+
+        ID3D12Device* dev = nullptr;
+        if (FAILED(create_dev(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev))) || !dev) {
+            continue;
+        }
+
+        D3D12_FEATURE_DATA_D3D12_OPTIONS opts{};
+        KX_CHECK(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts))),
+                 "CheckFeatureSupport D3D12_OPTIONS");
+        if (opts.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) {
+            dev->Release();
+            continue;
+        }
+
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        ID3D12Fence* fence = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))), "CreateCommandQueue");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))), "CreateCommandAllocator");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd))), "CreateCommandList");
+        KX_CHECK(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "CreateFence");
+        HANDLE fence_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        uint64_t fence_val = 0;
+
+        // Root signature: [0]=DescriptorTable(SRV t0), [1]=RootSRV(t1), StaticSampler(s0, Point)
+        D3D12_DESCRIPTOR_RANGE srv_range{};
+        srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range.NumDescriptors = 1;
+        srv_range.BaseShaderRegister = 0;
+        srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER rparams[2]{};
+        rparams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rparams[0].DescriptorTable = {1, &srv_range};
+        rparams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rparams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rparams[1].Descriptor = {1, 0};
+        rparams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+        D3D12_STATIC_SAMPLER_DESC samp{};
+        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.ShaderRegister = 0;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{2, rparams, 1, &samp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ID3DBlob* rs_blob = nullptr;
+        ID3DBlob* rs_err = nullptr;
+        ID3D12RootSignature* rs = nullptr;
+        KX_CHECK(SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err)), "SerializeRS");
+        KX_CHECK(SUCCEEDED(dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&rs))), "CreateRS");
+        rs_blob->Release();
+        if (rs_err) rs_err->Release();
+
+        // Graphics PSO with KXRV + KXRP auto-recompilation & 2 MRTs (Color + Feedback)
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psd{};
+        psd.pRootSignature = rs;
+        psd.VS = {vs_blob.data(), vs_blob.size()};
+        psd.PS = {ps_blob.data(), ps_blob.size()};
+        psd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psd.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psd.SampleMask = UINT_MAX;
+        psd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psd.NumRenderTargets = 2;
+        psd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psd.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psd.SampleDesc.Count = 1;
+        ID3D12PipelineState* pso = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateGraphicsPipelineState(&psd, IID_PPV_ARGS(&pso))), "CreateSvtPSO");
+
+        // 2. Virtual 512x512 RGBA8 Reserved Resource (4x4 = 16 virtual 64KB tiles = 1 MiB)
+        //    backed by a 4-tile (256 KiB) physical ID3D12Heap!
+        constexpr uint32_t kVirtW = 512, kVirtH = 512, kPoolTiles = 4;
+        D3D12_RESOURCE_DESC vtex_desc{};
+        vtex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        vtex_desc.Width = kVirtW;
+        vtex_desc.Height = kVirtH;
+        vtex_desc.DepthOrArraySize = 1;
+        vtex_desc.MipLevels = 1;
+        vtex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        vtex_desc.SampleDesc.Count = 1;
+        vtex_desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        ID3D12Resource* vtex = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateReservedResource(&vtex_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&vtex))),
+                 "CreateReservedResource 512x512");
+
+        UINT total_tiles = 0;
+        D3D12_PACKED_MIP_INFO packed_info{};
+        D3D12_TILE_SHAPE tile_shape{};
+        UINT num_sub_tilings = 1;
+        D3D12_SUBRESOURCE_TILING sub_tiling{};
+        dev->GetResourceTiling(vtex, &total_tiles, &packed_info, &tile_shape, &num_sub_tilings, 0, &sub_tiling);
+        KX_CHECK(total_tiles == 16 && tile_shape.WidthInTexels == 128 && tile_shape.HeightInTexels == 128,
+                 "Hardware GetResourceTiling matches 4x4 128x128 64KB tiles");
+
+        // Explicitly initialize all 16 virtual tiles to NULL
+        {
+            D3D12_TILED_RESOURCE_COORDINATE c0{0, 0, 0, 0};
+            D3D12_TILE_REGION_SIZE r0{16, TRUE, 4, 4, 1};
+            D3D12_TILE_RANGE_FLAGS f0 = D3D12_TILE_RANGE_FLAG_NULL;
+            UINT cnt0 = 16;
+            queue->UpdateTileMappings(vtex, 1, &c0, &r0, nullptr, 1, &f0, nullptr, &cnt0, D3D12_TILE_MAPPING_FLAG_NONE);
+        }
+
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = static_cast<UINT64>(kPoolTiles) * gpu::kSvtTileSizeBytes;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        ID3D12Heap* tile_heap = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateHeap(&hd, IID_PPV_ARGS(&tile_heap))), "CreateHeap 4x64KB");
+
+        // 3. Render Targets (128x128 Color + Feedback) & Upload/Readback Buffers
+        constexpr uint32_t kW = 128, kH = 128;
+        D3D12_HEAP_PROPERTIES hp_def{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        D3D12_HEAP_PROPERTIES hp_up{D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        D3D12_HEAP_PROPERTIES hp_rb{D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+
+        D3D12_RESOURCE_DESC rt_desc{};
+        rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rt_desc.Width = kW; rt_desc.Height = kH; rt_desc.DepthOrArraySize = 1; rt_desc.MipLevels = 1;
+        rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rt_desc.SampleDesc.Count = 1;
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ID3D12Resource* rt_color = nullptr;
+        ID3D12Resource* rt_fb = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &rt_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt_color))), "CreateRTColor");
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &rt_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt_fb))), "CreateRTFeedback");
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT rt_fp{};
+        UINT64 rb_bytes = 0;
+        dev->GetCopyableFootprints(&rt_desc, 0, 1, 0, &rt_fp, nullptr, nullptr, &rb_bytes);
+
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Height = 1; buf_desc.DepthOrArraySize = 1; buf_desc.MipLevels = 1;
+        buf_desc.SampleDesc.Count = 1; buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        buf_desc.Width = rb_bytes;
+        ID3D12Resource* rb_color = nullptr;
+        ID3D12Resource* rb_fb = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_rb, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb_color))), "CreateRBColor");
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_rb, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb_fb))), "CreateRBFeedback");
+
+        // 5-tile upload buffer (64KB each: Red, Green, Blue, Yellow, Cyan)
+        buf_desc.Width = 5ull * gpu::kSvtTileSizeBytes;
+        ID3D12Resource* tile_upload = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&tile_upload))), "CreateTileUpload");
+        {
+            uint8_t* mapped = nullptr;
+            KX_CHECK(SUCCEEDED(tile_upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))), "MapTileUpload");
+            const uint8_t colors[5][4] = {
+                {240, 30, 30, 255},   // 0: Red    -> tile (0,0)
+                {30, 220, 60, 255},   // 1: Green  -> tile (2,1)
+                {40, 110, 245, 255},  // 2: Blue   -> tile (1,0)
+                {245, 210, 40, 255},  // 3: Yellow -> tile (3,3)
+                {40, 225, 235, 255},  // 4: Cyan   -> tile (0,3)
+            };
+            for (uint32_t t = 0; t < 5; ++t) {
+                uint8_t* dst = mapped + static_cast<size_t>(t) * gpu::kSvtTileSizeBytes;
+                for (uint32_t px = 0; px < 128u * 128u; ++px) {
+                    std::memcpy(dst + px * 4, colors[t], 4);
+                }
+            }
+            tile_upload->Unmap(0, nullptr);
+        }
+
+        // Vertex buffer with 5 quads (6 verts each = 30 verts) mapping screen quadrants/cells to virtual tile centers:
+        //   Quad 0 (Top-Left     [0..64, 0..64])   -> tile (0,0) center UV (0.125, 0.125)
+        //   Quad 1 (Top-Right    [64..128, 0..64]) -> tile (1,0) center UV (0.375, 0.125)
+        //   Quad 2 (Bottom-Left  [0..64, 64..128]) -> tile (2,1) center UV (0.625, 0.375)
+        //   Quad 3 (Bottom-Right [64..128, 64..128]) -> tile (3,3) center UV (0.875, 0.875)
+        //   Quad 4 (replaces Quad 0 in Pass 3!)    -> tile (0,3) center UV (0.125, 0.875)
+        struct QuadVert { float x, y, u, v; };
+        std::vector<QuadVert> verts;
+        auto push_quad = [&](float x0, float y0, float x1, float y1, float u, float v) {
+            verts.push_back({x0, y0, u, v});
+            verts.push_back({x1, y0, u, v});
+            verts.push_back({x1, y1, u, v});
+            verts.push_back({x0, y0, u, v});
+            verts.push_back({x1, y1, u, v});
+            verts.push_back({x0, y1, u, v});
+        };
+        push_quad(-0.95f,  0.95f, -0.05f,  0.05f, 0.125f, 0.125f);  // idx 0: (0,0)
+        push_quad( 0.05f,  0.95f,  0.95f,  0.05f, 0.375f, 0.125f);  // idx 6: (1,0)
+        push_quad(-0.95f, -0.05f, -0.05f, -0.95f, 0.625f, 0.375f);  // idx 12: (2,1)
+        push_quad( 0.05f, -0.05f,  0.95f, -0.95f, 0.875f, 0.875f);  // idx 18: (3,3)
+        push_quad(-0.95f,  0.95f, -0.05f,  0.05f, 0.125f, 0.875f);  // idx 24: (0,3) on Top-Left
+
+        buf_desc.Width = 1024;
+        ID3D12Resource* vb_srv = nullptr;
+        ID3D12Resource* vb_srv_p3 = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vb_srv))), "CreateVBSrv");
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&hp_up, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vb_srv_p3))), "CreateVBSrvP3");
+        {
+            void* mapped = nullptr;
+            KX_CHECK(SUCCEEDED(vb_srv->Map(0, nullptr, &mapped)), "MapVB");
+            std::memcpy(mapped, verts.data(), 24 * sizeof(QuadVert));
+            vb_srv->Unmap(0, nullptr);
+            KX_CHECK(SUCCEEDED(vb_srv_p3->Map(0, nullptr, &mapped)), "MapVBP3");
+            std::memcpy(mapped, verts.data() + 6, 24 * sizeof(QuadVert));
+            vb_srv_p3->Unmap(0, nullptr);
+        }
+
+        D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC srv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        ID3D12DescriptorHeap* rtv_heap = nullptr;
+        ID3D12DescriptorHeap* srv_heap = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap))), "CreateRTVHeap");
+        KX_CHECK(SUCCEEDED(dev->CreateDescriptorHeap(&srv_hd, IID_PPV_ARGS(&srv_heap))), "CreateSRVHeap");
+
+        const UINT rtv_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv0 = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv1{rtv0.ptr + rtv_inc};
+        dev->CreateRenderTargetView(rt_color, nullptr, rtv0);
+        dev->CreateRenderTargetView(rt_fb, nullptr, rtv1);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Texture2D.MipLevels = 1;
+        dev->CreateShaderResourceView(vtex, &srv_desc, srv_heap->GetCPUDescriptorHandleForHeapStart());
+
+        auto upload_tile_data = [&](gpu::VirtualTileCoord vt, uint32_t upload_slot) {
+            D3D12_RESOURCE_BARRIER b0{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                                      {vtex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST}};
+            cmd->ResourceBarrier(1, &b0);
+            D3D12_TILED_RESOURCE_COORDINATE coord{vt.x, vt.y, 0, vt.mip};
+            D3D12_TILE_REGION_SIZE reg{1, FALSE, 1, 1, 1};
+            cmd->CopyTiles(vtex, &coord, &reg, tile_upload,
+                           static_cast<UINT64>(upload_slot) * gpu::kSvtTileSizeBytes,
+                           D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+            D3D12_RESOURCE_BARRIER b1{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                                      {vtex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE}};
+            cmd->ResourceBarrier(1, &b1);
+        };
+
+        auto render_and_readback = [&](ID3D12Resource* active_vb, UINT vert_count,
+                                       std::vector<uint8_t>& out_color, std::vector<uint8_t>& out_fb) {
+            const float clr_col[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            const float clr_fb[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
+            cmd->ClearRenderTargetView(rtv0, clr_col, 0, nullptr);
+            cmd->ClearRenderTargetView(rtv1, clr_fb, 0, nullptr);
+
+            D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kW), static_cast<float>(kH), 0.0f, 1.0f};
+            D3D12_RECT sc{0, 0, static_cast<LONG>(kW), static_cast<LONG>(kH)};
+            cmd->RSSetViewports(1, &vp);
+            cmd->RSSetScissorRects(1, &sc);
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {rtv0, rtv1};
+            cmd->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+            cmd->SetPipelineState(pso);
+            cmd->SetGraphicsRootSignature(rs);
+            ID3D12DescriptorHeap* heaps[1] = {srv_heap};
+            cmd->SetDescriptorHeaps(1, heaps);
+            cmd->SetGraphicsRootDescriptorTable(0, srv_heap->GetGPUDescriptorHandleForHeapStart());
+            cmd->SetGraphicsRootShaderResourceView(1, active_vb->GetGPUVirtualAddress());
+            cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd->DrawInstanced(vert_count, 1, 0, 0);
+
+            D3D12_RESOURCE_BARRIER post_b[2]{};
+            post_b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            post_b[0].Transition = {rt_color, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            post_b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            post_b[1].Transition = {rt_fb, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            cmd->ResourceBarrier(2, post_b);
+
+            D3D12_TEXTURE_COPY_LOCATION d_col{rb_color, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}}; d_col.PlacedFootprint = rt_fp;
+            D3D12_TEXTURE_COPY_LOCATION s_col{rt_color, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+            cmd->CopyTextureRegion(&d_col, 0, 0, 0, &s_col, nullptr);
+
+            D3D12_TEXTURE_COPY_LOCATION d_fb{rb_fb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}}; d_fb.PlacedFootprint = rt_fp;
+            D3D12_TEXTURE_COPY_LOCATION s_fb{rt_fb, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+            cmd->CopyTextureRegion(&d_fb, 0, 0, 0, &s_fb, nullptr);
+
+            post_b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            post_b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            post_b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            post_b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            cmd->ResourceBarrier(2, post_b);
+
+            KX_CHECK(SUCCEEDED(cmd->Close()), "CloseCmd");
+            ID3D12CommandList* lists[] = {cmd};
+            queue->ExecuteCommandLists(1, lists);
+            ++fence_val;
+            queue->Signal(fence, fence_val);
+            if (fence->GetCompletedValue() < fence_val) {
+                fence->SetEventOnCompletion(fence_val, fence_ev);
+                WaitForSingleObject(fence_ev, 5000);
+            }
+            KX_CHECK(SUCCEEDED(alloc->Reset()), "ResetAlloc");
+            KX_CHECK(SUCCEEDED(cmd->Reset(alloc, nullptr)), "ResetCmd");
+
+            auto read_rt = [&](ID3D12Resource* rb_res, std::vector<uint8_t>& dst) {
+                void* p = nullptr;
+                D3D12_RANGE rng{0, static_cast<SIZE_T>(rb_bytes)};
+                KX_CHECK(SUCCEEDED(rb_res->Map(0, &rng, &p)), "MapRB");
+                dst.resize(kW * kH * 4);
+                for (uint32_t y = 0; y < kH; ++y) {
+                    std::memcpy(dst.data() + static_cast<size_t>(y) * kW * 4,
+                                static_cast<const uint8_t*>(p) + static_cast<size_t>(y) * rt_fp.Footprint.RowPitch,
+                                kW * 4);
+                }
+                D3D12_RANGE empty{0, 0};
+                rb_res->Unmap(0, &empty);
+            };
+            read_rt(rb_color, out_color);
+            read_rt(rb_fb, out_fb);
+        };
+
+        auto px_rgb = [&](const std::vector<uint8_t>& img, uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b) {
+            const size_t i = (static_cast<size_t>(y) * kW + x) * 4;
+            return std::abs(int(img[i + 0]) - int(r)) <= 2 &&
+                   std::abs(int(img[i + 1]) - int(g)) <= 2 &&
+                   std::abs(int(img[i + 2]) - int(b)) <= 2;
+        };
+
+        // Transition vtex COMMON -> PIXEL_SHADER_RESOURCE
+        {
+            D3D12_RESOURCE_BARRIER init_b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                                          {vtex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE}};
+            cmd->ResourceBarrier(1, &init_b);
+        }
+
+        // ---- Pass 1: Map only (0,0)=Red and (2,1)=Green; leave (1,0) & (3,3) NULL ----
+        gpu::VirtualTexturePageTable pt({kVirtW, kVirtH, 1, DXGI_FORMAT_R8G8B8A8_UNORM}, kPoolTiles);
+        pt.begin_frame(1);
+        auto ops_p1 = pt.stream_tiles(std::vector<gpu::VirtualTileCoord>{{0, 0, 0}, {0, 2, 1}});
+        KX_CHECK(ops_p1.has_value() && ops_p1->size() == 2, "Pass 1 page table ops");
+        KX_CHECK(gpu::apply_svt_mappings_d3d12(queue, vtex, tile_heap, *ops_p1).has_value(), "Pass 1 UpdateTileMappings");
+        upload_tile_data({0, 0, 0}, 0);
+        upload_tile_data({0, 2, 1}, 1);
+
+        std::vector<uint8_t> col1, fb1;
+        render_and_readback(vb_srv, 24, col1, fb1);
+        KX_CHECK(px_rgb(col1, 32, 32, 240, 30, 30), "Pass 1 TL (0,0) = Red (resident)");
+        KX_CHECK(px_rgb(col1, 96, 32, 255, 0, 255), "Pass 1 TR (1,0) = Magenta (TFE fault fallback)");
+        KX_CHECK(px_rgb(col1, 32, 96, 30, 220, 60), "Pass 1 BL (2,1) = Green (resident)");
+        KX_CHECK(px_rgb(col1, 96, 96, 255, 0, 255), "Pass 1 BR (3,3) = Magenta (TFE fault fallback)");
+
+        // Analyze GPU Feedback Map from Pass 1
+        auto fb_rep1 = gpu::SvtFeedbackAnalyzer::analyze_rgba8_feedback(fb1.data(), kW, kH, kW * 4, pt.layout(), 0);
+        KX_CHECK(fb_rep1.faulted_tiles.size() == 2 && fb_rep1.resident_samples > 0 && fb_rep1.fault_samples > 0,
+                 "Pass 1 GPU Feedback detects exact 2 faulted tiles");
+
+        // ---- Pass 2: Feedback-driven streaming of (1,0)=Blue & (3,3)=Yellow ----
+        pt.begin_frame(2);
+        pt.touch_tile({0, 0, 0});
+        pt.touch_tile({0, 2, 1});
+        auto ops_p2 = pt.stream_tiles(fb_rep1.faulted_tiles);
+        KX_CHECK(ops_p2.has_value() && ops_p2->size() == 2, "Pass 2 maps remaining 2 physical tiles");
+        KX_CHECK(gpu::apply_svt_mappings_d3d12(queue, vtex, tile_heap, *ops_p2).has_value(), "Pass 2 UpdateTileMappings");
+        upload_tile_data({0, 1, 0}, 2);
+        upload_tile_data({0, 3, 3}, 3);
+
+        std::vector<uint8_t> col2, fb2;
+        render_and_readback(vb_srv, 24, col2, fb2);
+        KX_CHECK(px_rgb(col2, 32, 32, 240, 30, 30), "Pass 2 TL (0,0) = Red");
+        KX_CHECK(px_rgb(col2, 96, 32, 40, 110, 245), "Pass 2 TR (1,0) = Blue (streamed!)");
+        KX_CHECK(px_rgb(col2, 32, 96, 30, 220, 60), "Pass 2 BL (2,1) = Green");
+        KX_CHECK(px_rgb(col2, 96, 96, 245, 210, 40), "Pass 2 BR (3,3) = Yellow (streamed!)");
+        auto fb_rep2 = gpu::SvtFeedbackAnalyzer::analyze_rgba8_feedback(fb2.data(), kW, kH, kW * 4, pt.layout(), 0);
+        KX_CHECK(fb_rep2.fault_samples == 0 && fb_rep2.faulted_tiles.empty(),
+                 "Pass 2 GPU Feedback confirms 100% tile residency");
+
+        // ---- Pass 3: LRU Eviction & 64KB Page Remapping ((0,0) evicted -> remapped to (0,3) Cyan) ----
+        pt.begin_frame(3);
+        pt.touch_tile({0, 1, 0});
+        pt.touch_tile({0, 2, 1});
+        pt.touch_tile({0, 3, 3});
+        auto ops_p3 = pt.stream_tiles(std::vector<gpu::VirtualTileCoord>{{0, 0, 3}});
+        KX_CHECK(ops_p3.has_value() && ops_p3->size() == 2 &&
+                 (*ops_p3)[0].kind == gpu::SvtTileMappingOp::Kind::Evict &&
+                 (*ops_p3)[0].vtile == (gpu::VirtualTileCoord{0, 0, 0}) &&
+                 (*ops_p3)[1].kind == gpu::SvtTileMappingOp::Kind::Map &&
+                 (*ops_p3)[1].vtile == (gpu::VirtualTileCoord{0, 0, 3}),
+                 "Pass 3 LRU evicts coldest tile (0,0) and remaps physical 64KB tile to (0,3)");
+        KX_CHECK(gpu::apply_svt_mappings_d3d12(queue, vtex, tile_heap, *ops_p3).has_value(), "Pass 3 UpdateTileMappings");
+        upload_tile_data({0, 0, 3}, 4);
+
+        // Render quads 1..4 (TR=(1,0), BL=(2,1), BR=(3,3), TL=(0,3))
+        std::vector<uint8_t> col3, fb3;
+        render_and_readback(vb_srv_p3, 24, col3, fb3);
+        KX_CHECK(px_rgb(col3, 32, 32, 40, 225, 235), "Pass 3 TL remapped (0,3) = Cyan (resident)");
+        KX_CHECK(px_rgb(col3, 96, 32, 40, 110, 245), "Pass 3 TR (1,0) = Blue");
+        KX_CHECK(px_rgb(col3, 32, 96, 30, 220, 60), "Pass 3 BL (2,1) = Green");
+        KX_CHECK(px_rgb(col3, 96, 96, 245, 210, 40), "Pass 3 BR (3,3) = Yellow");
+        auto fb_rep3 = gpu::SvtFeedbackAnalyzer::analyze_rgba8_feedback(fb3.data(), kW, kH, kW * 4, pt.layout(), 0);
+        KX_CHECK(fb_rep3.fault_samples == 0, "Pass 3 GPU Feedback confirms 0 faults after LRU remap");
+
+        std::cout << std::format(
+            "    -> Hardware [{}] {} PASS (SVT 512x512 16-tile ReservedResource -> 4-tile 256KB Heap | TFE Feedback + LRU Remap verified)\n",
+            ad.index, ad.name);
+        ++hw_verified;
+
+        CloseHandle(fence_ev);
+        fence->Release();
+        srv_heap->Release();
+        rtv_heap->Release();
+        vb_srv_p3->Release();
+        vb_srv->Release();
+        tile_upload->Release();
+        rb_fb->Release();
+        rb_color->Release();
+        rt_fb->Release();
+        rt_color->Release();
+        tile_heap->Release();
+        vtex->Release();
+        pso->Release();
+        rs->Release();
+        cmd->Release();
+        alloc->Release();
+        queue->Release();
+        dev->Release();
+    }
+
+    const auto st = hle::d3d12x_stats();
+    KX_CHECK(hw_verified >= 1, "At least one physical Tier2+ GPU verified SVT");
+    KX_CHECK(st.reserved_resources >= static_cast<uint64_t>(hw_verified) &&
+             st.tile_mapping_updates >= static_cast<uint64_t>(hw_verified) * 4 &&
+             st.tiles_mapped >= static_cast<uint64_t>(hw_verified) * 5 &&
+             st.tiles_unmapped >= static_cast<uint64_t>(hw_verified) * 17 &&
+             st.copy_tiles_calls >= static_cast<uint64_t>(hw_verified) * 5,
+             "D3D12.X proxy SVT telemetry recorded");
+    hle::set_d3d12x_preferred_adapter(-1);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -7038,6 +7614,8 @@ int main(int argc, char** argv) {
     run_test("GDK Multi-User Profile Identity, Controller Binding & Isolated S:\\ Saves", test_gdk_multi_user_profile_save_isolation);
         run_test("RDNA2 Hardware Raytracing BVH (IMAGE_BVH_INTERSECT_RAY) Decode, IR Lift & SM 6.6 RayQuery DXIL", test_rdna2_raytracing_bvh_intersect_ray_decode_ir_dxc);
     run_test("GDK Agility SDK Query, Dynamic DLL Redirection & Modern D3D12/D3D12Core HLE Export Shims", test_pe_loader_agility_sdk_and_dll_redirection);
+    run_test("Sparse Virtual Texturing (SVT) 64KB Page Table, LRU Eviction, Feedback & RDNA2 TFE", test_svt_page_table_lru_and_feedback);
+    run_hw_test("Sparse Virtual Texturing (SVT) Reserved Resource, TFE Feedback & LRU Remap on Dual-GPU Hardware", test_svt_reserved_resource_tfe_feedback_dual_gpu);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

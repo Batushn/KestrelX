@@ -51,6 +51,7 @@ struct DecodedInst {
     uint8_t mtbuf_format = 0;  // MTBUF data/number format
     bool exp_done = false;
     bool clamp = false;
+    bool tfe = false;
     bool is_branch = false;
     bool is_terminator = false;
     uint32_t branch_target = 0;
@@ -148,8 +149,10 @@ inline void mtbuf(std::vector<uint32_t>& out, uint32_t op, uint32_t vdata, uint3
 // GFX10.3 MIMG encoding prefix: 0x3C (111100)
 // op: 0x00=image_load, 0x0E=image_get_resinfo, 0x20=image_sample, 0x24=image_sample_l
 inline void mimg(std::vector<uint32_t>& out, uint32_t op, uint32_t vdata, uint32_t vaddr,
-                 uint32_t srsrc = 0, uint32_t ssamp = 0, uint8_t dmask = 0xFu, uint8_t dim = 1) {
+                 uint32_t srsrc = 0, uint32_t ssamp = 0, uint8_t dmask = 0xFu, uint8_t dim = 1,
+                 bool tfe = false) {
     const uint32_t w0 = (0x3Cu << 26) | ((op & 0x7Fu) << 18) |
+                        (tfe ? (1u << 16) : 0u) |
                         ((static_cast<uint32_t>(dmask) & 0xFu) << 8) |
                         ((static_cast<uint32_t>(dim) & 0x7u) << 3);
     const uint32_t w1 = (((ssamp >> 2) & 0x1Fu) << 21) | (((srsrc >> 2) & 0x1Fu) << 16) |

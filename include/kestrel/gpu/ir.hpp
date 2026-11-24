@@ -152,6 +152,7 @@ struct IrInst {
     uint8_t dmask = 0xFu;
     bool exp_done = false;
     bool clamp = false;
+    bool tfe = false;
     uint32_t target_block = 0;
     bool branch_on_true = true;
 };

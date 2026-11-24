@@ -363,6 +363,7 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.size = 8;
             d.enc = Encoding::MIMG;
             d.opcode = (w0 >> 18) & 0x7Fu;
+            d.tfe = ((w0 >> 16) & 1u) != 0;
             d.dmask = static_cast<uint8_t>((w0 >> 8) & 0xFu);
             d.img_dim = static_cast<uint8_t>((w0 >> 3) & 0x7u);
             d.src0 = w1 & 0xFFu;                  // vaddr (UV / coords)
@@ -487,8 +488,9 @@ std::string disassemble_inst(const DecodedInst& d) {
             return std::format("{} v{}, v{}, s[{}:{}], off:{:#x}",
                                d.mnemonic, d.dst, d.src0, d.src2, d.src2 + 3, d.offset);
         case Encoding::MIMG:
-            return std::format("{} v{}, v{}, s[{}:{}], s[{}:{}] dmask:{:#x}",
-                               d.mnemonic, d.dst, d.src0, d.src2, d.src2 + 7, d.src3, d.src3 + 3, d.dmask);
+            return std::format("{} v{}, v{}, s[{}:{}], s[{}:{}] dmask:{:#x}{}",
+                               d.mnemonic, d.dst, d.src0, d.src2, d.src2 + 7, d.src3, d.src3 + 3, d.dmask,
+                               d.tfe ? " tfe" : "");
         case Encoding::EXP: {
             std::string tgt = (d.opcode <= 7) ? std::format("mrt{}", d.opcode)
                               : (d.opcode >= 12 && d.opcode <= 15) ? std::format("pos{}", d.opcode - 12)

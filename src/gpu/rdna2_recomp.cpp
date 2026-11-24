@@ -417,7 +417,16 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
         case IrOp::ImageSample: {
             const char* comps[4] = {"x", "y", "z", "w"};
             out << ind << "{ ";
-            if (stage == ShaderStage::Pixel) {
+            if (i.tfe) {
+                out << "uint kx_tfe_st = 0u; ";
+                if (stage == ShaderStage::Pixel) {
+                    out << std::format("float4 kx_tx = g_tex{}.Sample(g_samp{}, float2(asfloat(v[{}]), asfloat(v[{}])), int2(0, 0), 0.0f, kx_tfe_st); ",
+                                       i.rsrc_slot, i.samp_slot, i.src0.reg, i.src0.reg + 1);
+                } else {
+                    out << std::format("float4 kx_tx = g_tex{}.SampleLevel(g_samp{}, float2(asfloat(v[{}]), asfloat(v[{}])), 0.0, int2(0, 0), kx_tfe_st); ",
+                                       i.rsrc_slot, i.samp_slot, i.src0.reg, i.src0.reg + 1);
+                }
+            } else if (stage == ShaderStage::Pixel) {
                 out << std::format("float4 kx_tx = g_tex{}.Sample(g_samp{}, float2(asfloat(v[{}]), asfloat(v[{}]))); ",
                                    i.rsrc_slot, i.samp_slot, i.src0.reg, i.src0.reg + 1);
             } else {
@@ -430,18 +439,30 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
                     out << std::format("v[{}] = asuint(kx_tx.{}); ", out_idx++, comps[c]);
                 }
             }
+            if (i.tfe) {
+                out << std::format("v[{}] = CheckAccessFullyMapped(kx_tfe_st) ? 0u : 1u; ", out_idx);
+            }
             out << "}\n";
             break;
         }
         case IrOp::ImageLoad: {
             const char* comps[4] = {"x", "y", "z", "w"};
-            out << ind << std::format("{{ float4 kx_tx = g_tex{}.Load(int3(int(v[{}]), int(v[{}]), 0)); ",
-                                      i.rsrc_slot, i.src0.reg, i.src0.reg + 1);
+            out << ind << "{ ";
+            if (i.tfe) {
+                out << std::format("uint kx_tfe_st = 0u; float4 kx_tx = g_tex{}.Load(int3(int(v[{}]), int(v[{}]), 0), int2(0, 0), kx_tfe_st); ",
+                                   i.rsrc_slot, i.src0.reg, i.src0.reg + 1);
+            } else {
+                out << std::format("float4 kx_tx = g_tex{}.Load(int3(int(v[{}]), int(v[{}]), 0)); ",
+                                   i.rsrc_slot, i.src0.reg, i.src0.reg + 1);
+            }
             uint32_t out_idx = i.dst.reg;
             for (int c = 0; c < 4; ++c) {
                 if (i.dmask & (1u << c)) {
                     out << std::format("v[{}] = asuint(kx_tx.{}); ", out_idx++, comps[c]);
                 }
+            }
+            if (i.tfe) {
+                out << std::format("v[{}] = CheckAccessFullyMapped(kx_tfe_st) ? 0u : 1u; ", out_idx);
             }
             out << "}\n";
             break;

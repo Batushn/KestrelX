@@ -8804,6 +8804,98 @@ void test_full_crt_d3d12_swapchain_proxy_max_frames_and_capture_dual_gpu() {
     std::filesystem::remove_all(tmp_dir, ec);
 }
 
+
+static bool g_t73_error_cb_fired = false;
+static HRESULT g_t73_error_hr = S_OK;
+static std::string g_t73_error_msg;
+
+static bool __stdcall t73_xerror_cb(HRESULT hr, const char* msg, void* ctx) {
+    if (ctx != reinterpret_cast<void*>(0x12345678ull)) return false;
+    g_t73_error_cb_fired = true;
+    g_t73_error_hr = hr;
+    g_t73_error_msg = msg ? msg : "";
+    return true;
+}
+
+void test_gdk_xgameruntime_thunk_abi() {
+    hle::reset_xgameruntime_stats();
+
+    hle::Registry reg;
+    hle::register_xgameruntime(reg);
+    loader::register_guest_process_overlays(reg);
+
+    // 1. Verify all official GDK xgameruntime.lib dynamic thunk exports are registered
+    const char* required_syms[] = {
+        "InitializeApiImpl",
+        "InitializeApiImplEx",
+        "InitializeApiImplEx2",
+        "UninitializeApiImpl",
+        "QueryApiImpl",
+        "XErrorReport",
+        "XErrorSetCallback",
+        "XErrorSetOptions",
+        "XGameRuntimeInitializeWithOptions",
+        "XGameRuntimeIsFeatureAvailable",
+    };
+    for (const char* sym : required_syms) {
+        KX_CHECK(reg.resolve_name("xgameruntime.dll", sym) != nullptr,
+                 std::format("xgameruntime.dll must export {}", sym));
+    }
+
+    // 2. Verify host overlay resolution for GetFileAttributesW / LoadLibraryExW / GetProcAddress
+    auto* gfa_w = reinterpret_cast<DWORD(WINAPI*)(LPCWSTR)>(
+        reg.resolve_host_overlay("kernel32.dll", "GetFileAttributesW"));
+    auto* ll_ex_w = reinterpret_cast<HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD)>(
+        reg.resolve_host_overlay("kernel32.dll", "LoadLibraryExW"));
+    auto* gpa = reinterpret_cast<FARPROC(WINAPI*)(HMODULE, LPCSTR)>(
+        reg.resolve_host_overlay("kernel32.dll", "GetProcAddress"));
+    auto* free_lib = reinterpret_cast<BOOL(WINAPI*)(HMODULE)>(
+        reg.resolve_host_overlay("kernel32.dll", "FreeLibrary"));
+    KX_CHECK(gfa_w != nullptr && ll_ex_w != nullptr && gpa != nullptr && free_lib != nullptr,
+             "kernel32 dynamic loader and file-attribute overlays must resolve");
+
+    // 3. Drive the exact xgameruntime.lib dynamic thunk sequence through PeLoader overlays
+    //    (requires an active loader context via an in-process minimal guest invocation, OR direct
+    //     export invocation for ABI parity). First verify direct ABI semantics:
+    using InitEx2Fn = HRESULT(__stdcall*)(uint64_t, const void*);
+    using UninitFn = void(__stdcall*)();
+    using QueryFn = HRESULT(__stdcall*)(const void*, void**);
+    using SetErrCbFn = void(__stdcall*)(bool(__stdcall*)(HRESULT, const char*, void*), void*);
+    using SetErrOptFn = void(__stdcall*)(uint32_t, uint32_t);
+    using ErrReportFn = bool(__stdcall*)(HRESULT, const char*);
+    using IsFeatFn = bool(__stdcall*)(uint32_t);
+
+    auto init_ex2 = reinterpret_cast<InitEx2Fn>(reg.resolve_name("xgameruntime.dll", "InitializeApiImplEx2"));
+    auto uninit = reinterpret_cast<UninitFn>(reg.resolve_name("xgameruntime.dll", "UninitializeApiImpl"));
+    auto query = reinterpret_cast<QueryFn>(reg.resolve_name("xgameruntime.dll", "QueryApiImpl"));
+    auto set_err_cb = reinterpret_cast<SetErrCbFn>(reg.resolve_name("xgameruntime.dll", "XErrorSetCallback"));
+    auto set_err_opt = reinterpret_cast<SetErrOptFn>(reg.resolve_name("xgameruntime.dll", "XErrorSetOptions"));
+    auto err_report = reinterpret_cast<ErrReportFn>(reg.resolve_name("xgameruntime.dll", "XErrorReport"));
+    auto is_feat = reinterpret_cast<IsFeatFn>(reg.resolve_name("xgameruntime.dll", "XGameRuntimeIsFeatureAvailable"));
+
+    KX_CHECK(SUCCEEDED(init_ex2(0x00010000ull, nullptr)), "InitializeApiImplEx2 must return S_OK");
+    KX_CHECK(hle::xgameruntime_stats().runtime_inits >= 1u, "InitializeApiImplEx2 must increment runtime_inits");
+    KX_CHECK(is_feat(0u), "XGameRuntimeIsFeatureAvailable must return true");
+
+    void* dummy_iface = reinterpret_cast<void*>(0xDEADull);
+    const GUID dummy_iid{0x11111111u, 0x2222u, 0x3333u, {1, 2, 3, 4, 5, 6, 7, 8}};
+    KX_CHECK(query(&dummy_iid, &dummy_iface) == E_NOINTERFACE, "QueryApiImpl must return E_NOINTERFACE for unknown IID");
+    KX_CHECK(dummy_iface == nullptr, "QueryApiImpl must null out_impl on E_NOINTERFACE");
+
+    g_t73_error_cb_fired = false;
+    g_t73_error_hr = S_OK;
+    g_t73_error_msg.clear();
+    set_err_opt(0u, 0u);
+    set_err_cb(&t73_xerror_cb, reinterpret_cast<void*>(0x12345678ull));
+    KX_CHECK(err_report(E_FAIL, "kestrel_gdk_probe"), "XErrorReport must invoke callback and return true");
+    KX_CHECK(g_t73_error_cb_fired && g_t73_error_hr == E_FAIL && g_t73_error_msg == "kestrel_gdk_probe",
+             "XErrorCallback must receive exact HRESULT and message");
+    set_err_cb(nullptr, nullptr);
+
+    uninit();
+    hle::reset_xgameruntime_stats();
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -8890,6 +8982,7 @@ int main(int argc, char** argv) {
     run_hw_test("External AMD RGA gfx1030 ELF64 Kernels (12 Real Kernels) on Dual-GPU Hardware", test_external_amd_rga_gfx1030_dual_gpu);
     run_test("Full-CRT Win32 EXE Runtime (Static TLS, Worker Thread TLS, Process Identity, Dynamic LoadLibrary & ExitProcess Isolation)", test_full_crt_win32_exe_static_tls_identity_and_exit_isolation);
     run_hw_test("Full-CRT Win32 + D3D12 + KxDxgiFactoryProxy/KxSwapChainProxy Render, --max-frames & BMP Capture", test_full_crt_d3d12_swapchain_proxy_max_frames_and_capture_dual_gpu);
+    run_test("GDK xgameruntime.lib Dynamic Thunk ABI (InitializeApiImplEx2, QueryApiImpl, XErrorReport & HLE Probe)", test_gdk_xgameruntime_thunk_abi);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

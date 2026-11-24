@@ -5,8 +5,8 @@
   <p><strong>Clean-Room Xbox Series X|S Native Compatibility &amp; Dynamic RDNA2 (GFX10.3) &rarr; SM 6.6 DXIL Shader Recompilation Runtime</strong></p>
 
   <p>
-    <a href="#milestone-timeline"><img src="https://img.shields.io/badge/Release-v0.10.0-2ea44f?style=for-the-badge" alt="Release: v0.10.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-70%2F70_PASS-brightgreen?style=for-the-badge" alt="Tests: 70/70 PASS" /></a>
+    <a href="#milestone-timeline"><img src="https://img.shields.io/badge/Release-v0.11.0-2ea44f?style=for-the-badge" alt="Release: v0.11.0" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-73%2F73_PASS-brightgreen?style=for-the-badge" alt="Tests: 73/73 PASS" /></a>
     <a href="#external-amd-rga-gfx1030-validation"><img src="https://img.shields.io/badge/AMD_RGA_gfx1030-12%2F12_ELF64_PASS-107C10?style=for-the-badge" alt="External AMD RGA gfx1030: 12/12 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
@@ -89,10 +89,11 @@ flowchart LR
     M7["✅ v0.7.0<br/>Mesh Shaders, VRS Tier 2,<br/>Work Graphs, IR Optimizer"]
     M8["✅ v0.8.0<br/>GPU DirectStorage 1.2,<br/>DXR 1.1 / BVH, 7.1 Audio, Saves"]
     M9["✅ v0.9.0<br/>KXVC AES-128-CTR + XStore,<br/>Agility SDK, SVT 64KB, PresentX HUD"]
-    M10["✅ v0.10.0 (Current)<br/>External AMD RGA gfx1030<br/>ELF64 + GFX10.3 Spec Audit"]
-    M11["🚀 v1.0.0 (Horizon)<br/>Commercial Title Bring-Up<br/>& Live GPU Profiler"]
+    M10["✅ v0.10.0<br/>External AMD RGA gfx1030<br/>ELF64 + GFX10.3 Spec Audit"]
+    M11["✅ v0.11.0 (Current)<br/>Unmodified DirectX 12 &amp;<br/>Xbox GDK EXE Execution"]
+    M12["🚀 v1.0.0 (Horizon)<br/>Commercial Title Bring-Up<br/>& Live GPU Profiler"]
 
-    M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10 --> M11
+    M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10 --> M11 --> M12
 
     style M1 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M2 fill:#1f6f3b,stroke:#2ea44f,color:#fff
@@ -103,8 +104,9 @@ flowchart LR
     style M7 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M8 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M9 fill:#1f6f3b,stroke:#2ea44f,color:#fff
-    style M10 fill:#107c10,stroke:#56d364,stroke-width:3px,color:#fff
-    style M11 fill:#1f3a5f,stroke:#58a6ff,color:#fff
+    style M10 fill:#1f6f3b,stroke:#2ea44f,color:#fff
+    style M11 fill:#107c10,stroke:#56d364,stroke-width:3px,color:#fff
+    style M12 fill:#1f3a5f,stroke:#58a6ff,color:#fff
 ```
 
 ### RDNA2 IR Multi-Pass Optimization Pipeline
@@ -133,7 +135,7 @@ flowchart LR
 
 ### Subsystem Verification Matrix
 
-| Subsystem | Status | Implemented & Verified (`v0.10.0`) | Next Horizon (`v1.0.0`) |
+| Subsystem | Status | Implemented & Verified (`v0.11.0`) | Next Horizon (`v1.0.0`) |
 | :--- | :---: | :--- | :--- |
 | **PE32+ Loader & System Libs** | ✅ Verified | `MicrosoftGame.config` XML, PE32+ relocs (DIR64/HIGHLOW), delay-load imports (RVA/legacy VA), export forwarders (DLL.Symbol, DLL.#Ordinal), multi-page thunk cleanup, `.pdata` SEH, TLS callbacks, GDK Agility SDK query (`D3D12SDKVersion`, `D3D12SDKPath`), dynamic DLL redirection, `pe-probe` import auditor | Side-by-side title updates & patch mounts |
 | **CPU VEH Zen 2 Shim** | ✅ Verified | In-process VEH emulator for AMD Zen 2 `CLZERO`, `MONITORX`, `MWAITX`, `MCOMMIT`, `RDPRU`, `PREFETCHW`, and SSE4a `EXTRQ`/`INSERTQ` for Intel CPU compatibility | Dynamic TSC virtualization & CPU core topology pinning |
@@ -149,6 +151,18 @@ flowchart LR
 | **GFX10 Texture Tiling** | ✅ Verified | Clean-room 2D swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block tiling, 256B-aligned multi-level mip-chains, SGD5 archive decompression, 64KB SVT virtual texture layout & LRU physical tile pool | 3D/Array volume tiling & live upload staging |
 
 ---
+
+### What's New in v0.11.0
+
+KestrelX v0.11.0 brings up **unmodified, full-CRT (`/MD`, `wWinMainCRTStartup`) third-party Win32, DirectX 12, and Microsoft Xbox GDK `.exe` binaries** end-to-end on real GPU hardware:
+* **Authentic `ntdll`-Managed Static TLS Slot (`src/loader/tls_slot_dll.cpp`, `src/loader/pe_loader.cpp`)**: Provisions a genuine 64 KB static TLS slot via `kestrel_tls_slot.dll` without mutating `TEB->ThreadLocalStoragePointer` (`gs:[0x58]`), preserving host GPU driver TLS safety and propagating guest TLS automatically to worker threads created via `CreateThread`.
+* **Guest Process Identity, Exit Isolation & SEH Crash Diagnostics (`src/loader/pe_loader.cpp`)**: Dedicated 4 MB guest execution thread with `kernel32.dll` / `ucrtbase.dll` host overlays (`GetModuleHandle*`, `GetModuleFileName*`, `GetCommandLine*`, `LoadLibrary*`, `GetProcAddress`, `GetFileAttributes*`, `ExitProcess`/`exit`/`_crt_atexit`, console drive `CreateFile*`), plus C-style SEH crash telemetry (exception code, `module+RVA`, register dump, RIP bytes, called stubs) and env-gated `KESTREL_TRACE_HLE=1` loader tracing.
+* **DXGI / SwapChain Proxy & Standard D3D12/DXGI Ordinal Exports (`src/hle/d3d12x.cpp`)**: `KxDxgiFactoryProxy` (`IDXGIFactory6`) + `KxSwapChainProxy` (`IDXGISwapChain4`) count `Present()` calls, capture live GPU backbuffers to BMP (`--capture`), cleanly close guest windows at `--max-frames <N>`, and resolve standard Windows D3D12/DXGI ordinal imports (`d3d12.dll` `#101`/`#110`/`#115`, `dxgi.dll` `#10`/`#11`/`#12`).
+* **Official Microsoft GDK `xgameruntime.lib` Dynamic Thunk ABI (`src/hle/xgameruntime.cpp`)**: Exports `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`, `UninitializeApiImpl`, `QueryApiImpl`, `XErrorReport`, `XErrorSetCallback`, `XErrorSetOptions`, `XGameRuntimeInitializeWithOptions`, and `XGameRuntimeIsFeatureAvailable` alongside virtual HLE DLL `GetFileAttributesW` probing — enabling unmodified Microsoft Xbox GDK titles to initialize and run cleanly without Microsoft Gaming Services or host `xgameruntime.dll` installed.
+* **Verified Unmodified Third-Party MIT Binaries (Compiled Locally Outside Repo)**:
+  * **`microsoft/DirectX-Graphics-Samples` (`D3D12HelloTriangle.exe`, MIT)**: `pe-probe` `85/85` imports (`100.0%`), executed unmodified via `kestrel run --max-frames 5 --capture`, exit code `0`, `present=5`, `draws=5`, 1280×720 RGB backbuffer captured.
+  * **`microsoft/Xbox-GDK-Samples` (`SimpleTriangleDesktop.exe`, MIT, linked against public Microsoft GDK `v2610.0.9661` `xgameruntime.lib` + `DirectXTK12`)**: `pe-probe` `180/180` imports (`100.0%`), dynamically loaded KestrelX's clean-room `xgameruntime.dll` thunk (`InitializeApiImplEx2` / `XErrorReport` / `UninitializeApiImpl`), rendered `5` frames (`draws=5`, `present=5`), exited with code `0`, 1280×720 RGB backbuffer captured.
+* **New Regression Tests (`Tests 71–73`)**: Full-CRT static TLS + worker TLS + `ExitProcess` isolation (`Test 71`), full-CRT Win32 + D3D12 `KxSwapChainProxy` `--max-frames 3` + 256×256 BMP pixel verification (`Test 72`), and official GDK `xgameruntime.lib` dynamic thunk ABI verification (`Test 73`).
 
 ### What's New in v0.10.0
 
@@ -345,7 +359,28 @@ KestrelX Verification Suite
   [PASS] AMD GFX10.3 (RDNA2) ISA Spec Decoder Audit & Strict Refusal
     -> External AMD RGA gfx1030 ELF64 Suite: 12/12 kernels verified across 3 hardware GPU(s) (36 dispatches, 10/12 bit-exact u32)
   [PASS] External AMD RGA gfx1030 ELF64 Kernels (12 Real Kernels) on Dual-GPU Hardware
-Summary: 70 passed, 0 failed
+  [PASS] Full-CRT Win32 EXE Runtime (Static TLS, Worker Thread TLS, Process Identity, Dynamic LoadLibrary & ExitProcess Isolation)
+    -> Full-CRT D3D12 EXE PASS: presents=3, BMP=256x256, center RGB=(25,204,76)
+  [PASS] Full-CRT Win32 + D3D12 + KxDxgiFactoryProxy/KxSwapChainProxy Render, --max-frames & BMP Capture
+  [PASS] GDK xgameruntime.lib Dynamic Thunk ABI (InitializeApiImplEx2, QueryApiImpl, XErrorReport & HLE Probe)
+Summary: 73 passed, 0 failed
+```
+
+Unmodified third-party MIT `.exe` execution receipts (compiled locally from official Microsoft sources outside the repository; zero proprietary assets committed):
+```text
+# 1. microsoft/DirectX-Graphics-Samples (MIT) — D3D12HelloTriangle.exe (unmodified)
+$ .\build\Release\kestrel.exe pe-probe D3D12HelloTriangle.exe
+  Import Audit  : 85 / 85 resolved (100.0% | HLE=3, Guest=0, Host=82, Missing/Stub=0)
+$ .\build\Release\kestrel.exe run D3D12HelloTriangle.exe --max-frames 5 --capture ms_hello_triangle.bmp
+Loaded D3D12HelloTriangle.exe @ 0x0000000140000000 (relocs=0, hle_imports=13, guest_imports=0, host_imports=72, stubs=0)
+Guest exited with code 0 | D3D12.X(dev=1, q=1, cmd=1, res=1, draws=5, barriers=10, cs_pso=0, gfx_pso=0, cache_hit=0, disk_hit=0, present=5)
+
+# 2. microsoft/Xbox-GDK-Samples (MIT) — SimpleTriangleDesktop.exe (unmodified, public GDK v2610.0.9661 xgameruntime.lib + DirectXTK12, no host xgameruntime.dll)
+$ .\build\Release\kestrel.exe pe-probe SimpleTriangleDesktop.exe
+  Import Audit  : 180 / 180 resolved (100.0% | HLE=3, Guest=0, Host=177, Missing/Stub=0)
+$ .\build\Release\kestrel.exe run SimpleTriangleDesktop.exe --max-frames 5 --capture gdk_triangle.bmp
+Loaded SimpleTriangleDesktop.exe @ 0x0000000140000000 (relocs=0, hle_imports=17, guest_imports=0, host_imports=163, stubs=0)
+Guest exited with code 0 | D3D12.X(dev=1, q=1, cmd=1, res=2, draws=5, barriers=10, cs_pso=0, gfx_pso=0, cache_hit=0, disk_hit=0, present=5)
 ```
 
 CLI cold vs warm persistent disk-cache verification:
@@ -415,7 +450,7 @@ include/kestrel/
   hle/       # HLE registry + stub thunks, kernelx (async I/O), xgameruntime, d3d12x (Dev1..10 + CmdListProxy), WindowHost, GameInput, XAudio2 (WASAPI)
   gpu/       # RDNA2 ISA decoder (SOP/VOP/FLAT/SMEM/DS/MUBUF/MTBUF/MIMG/EXP), AMDGPU ELF64 parser, DXBC parser, CFG IR, multi-stage HLSL recompiler, ShaderCensus, DiskShaderCache, DXC, GPU runner, GFX10 tiling
 src/         # Corresponding C++23 implementations + CLI (src/cli/main.cpp)
-tests/       # 70-test unit/dual-GPU verification runner + 12 external AMD RGA gfx1030 ELF64 kernels + clean-room Xbox-ABI guest test title & fixtures
+tests/       # 73-test unit/dual-GPU verification runner + 12 external AMD RGA gfx1030 ELF64 kernels + full-CRT D3D12 & Xbox-ABI clean-room test titles
 docs/        # Architecture documentation & hardware-captured renders (first_light.png, textured_quad.png)
 ```
 

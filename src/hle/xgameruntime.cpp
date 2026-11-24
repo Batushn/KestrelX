@@ -228,6 +228,71 @@ void __stdcall kx_XGameRuntimeUninitialize() {
     g_runtime_initialized.store(false, std::memory_order_relaxed);
 }
 
+HRESULT __stdcall kx_XGameRuntimeInitializeWithOptions(const void* /*options*/) {
+    return kx_XGameRuntimeInitialize();
+}
+
+bool __stdcall kx_XGameRuntimeIsFeatureAvailable(uint32_t /*feature*/) {
+    return true;
+}
+
+// Official Microsoft GDK xgameruntime.lib dynamic thunk ABI entrypoints.
+// Real GDK titles statically link xgameruntime.lib, which loads xgameruntime.dll
+// and resolves InitializeApiImpl[Ex|Ex2], UninitializeApiImpl, and QueryApiImpl.
+HRESULT __stdcall kx_InitializeApiImpl(uint64_t /*version*/) {
+    return kx_XGameRuntimeInitialize();
+}
+
+HRESULT __stdcall kx_InitializeApiImplEx(uint64_t /*version*/, const void* /*options*/) {
+    return kx_XGameRuntimeInitialize();
+}
+
+HRESULT __stdcall kx_InitializeApiImplEx2(uint64_t /*version*/, const void* /*options*/) {
+    return kx_XGameRuntimeInitialize();
+}
+
+void __stdcall kx_UninitializeApiImpl() {
+    kx_XGameRuntimeUninitialize();
+}
+
+HRESULT __stdcall kx_QueryApiImpl(const void* /*iid*/, void** out_impl) {
+    if (out_impl) *out_impl = nullptr;
+    return E_NOINTERFACE;
+}
+
+using KxXErrorCallback = bool(__stdcall*)(HRESULT hr, const char* msg, void* context);
+std::mutex g_xerror_mtx;
+KxXErrorCallback g_xerror_cb = nullptr;
+void* g_xerror_ctx = nullptr;
+uint32_t g_xerror_opts_dbg = 0;
+uint32_t g_xerror_opts_nodbg = 0;
+
+void __stdcall kx_XErrorSetCallback(KxXErrorCallback cb, void* ctx) {
+    std::lock_guard lock(g_xerror_mtx);
+    g_xerror_cb = cb;
+    g_xerror_ctx = ctx;
+}
+
+void __stdcall kx_XErrorSetOptions(uint32_t opts_dbg, uint32_t opts_nodbg) {
+    std::lock_guard lock(g_xerror_mtx);
+    g_xerror_opts_dbg = opts_dbg;
+    g_xerror_opts_nodbg = opts_nodbg;
+}
+
+bool __stdcall kx_XErrorReport(HRESULT hr, const char* msg) {
+    KxXErrorCallback cb = nullptr;
+    void* ctx = nullptr;
+    {
+        std::lock_guard lock(g_xerror_mtx);
+        cb = g_xerror_cb;
+        ctx = g_xerror_ctx;
+    }
+    if (cb) {
+        return cb(hr, msg ? msg : "", ctx);
+    }
+    return true;
+}
+
 HRESULT __stdcall kx_XGameGetXboxTitleId(uint32_t* out_id) {
     if (!out_id) return E_INVALIDARG;
     *out_id = g_title_id;
@@ -648,6 +713,16 @@ void register_xgameruntime(Registry& reg) {
     reg.register_module("xgameruntime.dll");
     reg.register_export("xgameruntime.dll", "XGameRuntimeInitialize", reinterpret_cast<void*>(&kx_XGameRuntimeInitialize));
     reg.register_export("xgameruntime.dll", "XGameRuntimeUninitialize", reinterpret_cast<void*>(&kx_XGameRuntimeUninitialize));
+    reg.register_export("xgameruntime.dll", "XGameRuntimeInitializeWithOptions", reinterpret_cast<void*>(&kx_XGameRuntimeInitializeWithOptions));
+    reg.register_export("xgameruntime.dll", "XGameRuntimeIsFeatureAvailable", reinterpret_cast<void*>(&kx_XGameRuntimeIsFeatureAvailable));
+    reg.register_export("xgameruntime.dll", "InitializeApiImpl", reinterpret_cast<void*>(&kx_InitializeApiImpl));
+    reg.register_export("xgameruntime.dll", "InitializeApiImplEx", reinterpret_cast<void*>(&kx_InitializeApiImplEx));
+    reg.register_export("xgameruntime.dll", "InitializeApiImplEx2", reinterpret_cast<void*>(&kx_InitializeApiImplEx2));
+    reg.register_export("xgameruntime.dll", "UninitializeApiImpl", reinterpret_cast<void*>(&kx_UninitializeApiImpl));
+    reg.register_export("xgameruntime.dll", "QueryApiImpl", reinterpret_cast<void*>(&kx_QueryApiImpl));
+    reg.register_export("xgameruntime.dll", "XErrorReport", reinterpret_cast<void*>(&kx_XErrorReport));
+    reg.register_export("xgameruntime.dll", "XErrorSetCallback", reinterpret_cast<void*>(&kx_XErrorSetCallback));
+    reg.register_export("xgameruntime.dll", "XErrorSetOptions", reinterpret_cast<void*>(&kx_XErrorSetOptions));
     reg.register_export("xgameruntime.dll", "XGameGetXboxTitleId", reinterpret_cast<void*>(&kx_XGameGetXboxTitleId));
     reg.register_export("xgameruntime.dll", "XSystemGetDeviceType", reinterpret_cast<void*>(&kx_XSystemGetDeviceType));
     reg.register_export("xgameruntime.dll", "XTaskQueueCreate", reinterpret_cast<void*>(&kx_XTaskQueueCreate));

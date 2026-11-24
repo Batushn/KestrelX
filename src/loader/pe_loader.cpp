@@ -409,7 +409,19 @@ wchar_t* __cdecl kx_get_wide_winmain_command_line() {
     return empty;
 }
 
+bool kestrel_trace_hle_enabled() {
+    static const bool enabled = []() {
+        char buf[8]{};
+        return GetEnvironmentVariableA("KESTREL_TRACE_HLE", buf, sizeof(buf)) > 0 && buf[0] != '0';
+    }();
+    return enabled;
+}
+
 HMODULE load_library_common(std::string_view utf8_name, DWORD flags, bool wide_fallback, LPCWSTR orig_w, LPCSTR orig_a) {
+    if (kestrel_trace_hle_enabled()) {
+        std::fprintf(stderr, "[KestrelHLE] LoadLibrary(%s, flags=0x%lX)\n", std::string(utf8_name).c_str(), flags);
+        std::fflush(stderr);
+    }
     PeLoader* loader = g_active_loader.load(std::memory_order_acquire);
     if (loader && !utf8_name.empty()) {
         const std::string base = basename_lower(utf8_name);
@@ -469,6 +481,11 @@ FARPROC WINAPI kx_GetProcAddress(HMODULE hmod, LPCSTR proc) {
         // 1. HLE pseudo-handle (e.g., LoadLibraryW(L"xgameruntime.dll") or L"d3d12.dll")
         std::string hle_dll;
         if (loader->lookup_hle_handle(hmod, hle_dll)) {
+            if (kestrel_trace_hle_enabled()) {
+                if (by_ord) std::fprintf(stderr, "[KestrelHLE] GetProcAddress(%s, #%u)\n", hle_dll.c_str(), ord);
+                else std::fprintf(stderr, "[KestrelHLE] GetProcAddress(%s, %s)\n", hle_dll.c_str(), proc);
+                std::fflush(stderr);
+            }
             void* p = by_ord ? loader->hle_registry().resolve_ordinal(hle_dll, ord)
                              : loader->hle_registry().resolve_name(hle_dll, proc);
             if (p) return reinterpret_cast<FARPROC>(p);
@@ -659,6 +676,61 @@ BOOL WINAPI kx_host_DeleteFileW(LPCWSTR filename) {
     return DeleteFileW(filename);
 }
 
+bool is_virtual_hle_dll_probe(std::string_view utf8_path) {
+    if (utf8_path.empty()) return false;
+    PeLoader* loader = g_active_loader.load(std::memory_order_acquire);
+    if (!loader) return false;
+    const std::string base = basename_lower(utf8_path);
+    if (base.size() < 5 || base.substr(base.size() - 4) != ".dll") return false;
+    const std::string redir = to_lower_ascii(loader->get_redirected_dll(base));
+    return loader->hle_registry().has_module(redir);
+}
+
+DWORD WINAPI kx_host_GetFileAttributesW(LPCWSTR filename) {
+    if (filename) {
+        const std::string utf8 = wide_to_utf8(filename);
+        if (is_console_vfs_drive_path(utf8)) {
+            PeLoader* loader = g_active_loader.load(std::memory_order_acquire);
+            if (loader) {
+                if (auto* fn = reinterpret_cast<decltype(&GetFileAttributesW)>(
+                        loader->hle_registry().resolve_name("kernelx.dll", "GetFileAttributesW"))) {
+                    return fn(filename);
+                }
+            }
+        }
+        const DWORD host_attr = GetFileAttributesW(filename);
+        if (kestrel_trace_hle_enabled() && utf8.find(".dll") != std::string::npos) {
+            std::fprintf(stderr, "[KestrelHLE] GetFileAttributesW(%s) -> host=0x%lX, hle_probe=%d\n", utf8.c_str(), host_attr, is_virtual_hle_dll_probe(utf8) ? 1 : 0);
+            std::fflush(stderr);
+        }
+        if (host_attr == INVALID_FILE_ATTRIBUTES && is_virtual_hle_dll_probe(utf8)) {
+            return FILE_ATTRIBUTE_NORMAL;
+        }
+        return host_attr;
+    }
+    return GetFileAttributesW(filename);
+}
+
+DWORD WINAPI kx_host_GetFileAttributesA(LPCSTR filename) {
+    if (filename) {
+        if (is_console_vfs_drive_path(filename)) {
+            PeLoader* loader = g_active_loader.load(std::memory_order_acquire);
+            if (loader) {
+                if (auto* fn = reinterpret_cast<decltype(&GetFileAttributesA)>(
+                        loader->hle_registry().resolve_name("kernelx.dll", "GetFileAttributesA"))) {
+                    return fn(filename);
+                }
+            }
+        }
+        const DWORD host_attr = GetFileAttributesA(filename);
+        if (host_attr == INVALID_FILE_ATTRIBUTES && is_virtual_hle_dll_probe(filename)) {
+            return FILE_ATTRIBUTE_NORMAL;
+        }
+        return host_attr;
+    }
+    return GetFileAttributesA(filename);
+}
+
 BOOL WINAPI kx_host_GetFileAttributesExW(LPCWSTR filename, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
     if (filename) {
         const std::string utf8 = wide_to_utf8(filename);
@@ -703,6 +775,8 @@ void register_guest_process_overlays(hle::Registry& reg) {
     reg.register_host_overlay("kernel32.dll", "DeleteFileA", reinterpret_cast<void*>(&kx_host_DeleteFileA));
     reg.register_host_overlay("kernel32.dll", "DeleteFileW", reinterpret_cast<void*>(&kx_host_DeleteFileW));
     reg.register_host_overlay("kernel32.dll", "GetFileAttributesExW", reinterpret_cast<void*>(&kx_host_GetFileAttributesExW));
+    reg.register_host_overlay("kernel32.dll", "GetFileAttributesA", reinterpret_cast<void*>(&kx_host_GetFileAttributesA));
+    reg.register_host_overlay("kernel32.dll", "GetFileAttributesW", reinterpret_cast<void*>(&kx_host_GetFileAttributesW));
 
     // ucrtbase.dll overlays (automatically matched for api-ms-win-crt-*)
     reg.register_host_overlay("ucrtbase.dll", "exit", reinterpret_cast<void*>(&kx_crt_exit));

@@ -921,16 +921,25 @@ void shutdown_d3d12x_window() {
     g_window_host.reset();
 }
 
+HRESULT __stdcall kx_D3D12GetInterface(REFCLSID, REFIID, void** ppv) {
+    if (!ppv) return E_INVALIDARG;
+    *ppv = nullptr;
+    return S_OK;
+}
+
 void register_d3d12x(Registry& reg) {
     reg.register_module("d3d12_xs.dll");
     reg.register_module("d3d12_x.dll");
-    for (const char* mod : {"d3d12_xs.dll", "d3d12_x.dll"}) {
+    reg.register_module("d3d12.dll");
+    reg.register_module("d3d12core.dll");
+    for (const char* mod : {"d3d12_xs.dll", "d3d12_x.dll", "d3d12.dll", "d3d12core.dll"}) {
         reg.register_export(mod, "D3D12CreateDevice", reinterpret_cast<void*>(&kx_D3D12CreateDevice));
         reg.register_export(mod, "D3D12XboxCreateDevice", reinterpret_cast<void*>(&kx_D3D12XboxCreateDevice));
         reg.register_export(mod, "D3D12ZeroMemoryX", reinterpret_cast<void*>(&kx_D3D12ZeroMemoryX));
         reg.register_export(mod, "D3D12SerializeRootSignature", reinterpret_cast<void*>(&kx_D3D12SerializeRootSignature));
         reg.register_export(mod, "D3D12PresentX", reinterpret_cast<void*>(&kx_D3D12PresentX));
         reg.register_export(mod, "D3D12WaitFrameEventX", reinterpret_cast<void*>(&kx_D3D12WaitFrameEventX));
+        reg.register_export(mod, "D3D12GetInterface", reinterpret_cast<void*>(&kx_D3D12GetInterface));
     }
 }
 

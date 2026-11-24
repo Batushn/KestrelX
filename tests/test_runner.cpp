@@ -6799,6 +6799,168 @@ void test_rdna2_raytracing_bvh_intersect_ray_decode_ir_dxc() {
     }
 }
 
+void test_pe_loader_agility_sdk_and_dll_redirection() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestAgilitySdk";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp);
+
+    auto add_empty_reloc = [](SynthPeBuilder& pe) {
+        const uint32_t r = pe.alloc_data(sizeof(IMAGE_BASE_RELOCATION), 4);
+        IMAGE_BASE_RELOCATION blk{SynthPeBuilder::kDataRva, sizeof(IMAGE_BASE_RELOCATION)};
+        pe.write_at_data_rva(r, blk);
+        pe.set_data_dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, r, sizeof(IMAGE_BASE_RELOCATION));
+    };
+
+    // 1. Synthesize packaged_guest.dll inside tmp/D3D12/
+    {
+        fs::create_directories(tmp / "D3D12");
+        SynthPeBuilder pkg_dll(true);
+        const uint8_t fn_ret[] = {0xB8, 0x99, 0x00, 0x00, 0x00, 0xC3};  // mov eax, 0x99; ret
+        pkg_dll.write_text(0, fn_ret, sizeof(fn_ret));
+        const uint32_t exp_s = pkg_dll.alloc_data(sizeof(IMAGE_EXPORT_DIRECTORY), 4);
+        const uint32_t f_rva = pkg_dll.alloc_data(4, 4);
+        const uint32_t n_rva = pkg_dll.alloc_data(4, 4);
+        const uint32_t o_rva = pkg_dll.alloc_data(2, 2);
+        const uint32_t mod_name = pkg_dll.write_cstring("packaged_guest.dll");
+        const uint32_t sym_name = pkg_dll.write_cstring("PackagedFunc");
+        pkg_dll.write_at_data_rva<uint32_t>(f_rva, SynthPeBuilder::kTextRva);
+        pkg_dll.write_at_data_rva<uint32_t>(n_rva, sym_name);
+        pkg_dll.write_at_data_rva<uint16_t>(o_rva, 0);
+
+        IMAGE_EXPORT_DIRECTORY ped{};
+        ped.Name = mod_name;
+        ped.Base = 1;
+        ped.NumberOfFunctions = 1;
+        ped.NumberOfNames = 1;
+        ped.AddressOfFunctions = f_rva;
+        ped.AddressOfNames = n_rva;
+        ped.AddressOfNameOrdinals = o_rva;
+        pkg_dll.write_at_data_rva(exp_s, ped);
+        const uint32_t psize = (SynthPeBuilder::kDataRva + pkg_dll.data_cursor) - exp_s;
+        pkg_dll.set_data_dir(IMAGE_DIRECTORY_ENTRY_EXPORT, exp_s, psize);
+        add_empty_reloc(pkg_dll);
+        pkg_dll.write_file(tmp / "D3D12" / "packaged_guest.dll");
+    }
+
+    // 2. Synthesize game_title.exe exporting D3D12SDKVersion & D3D12SDKPath, importing d3d12.dll
+    uint32_t client_iat_rva = 0;
+    {
+        SynthPeBuilder exe(false);
+
+        const uint32_t ver_rva = exe.alloc_data(4, 4);
+        exe.write_at_data_rva<uint32_t>(ver_rva, 614u);
+
+        const uint32_t str_rva = exe.write_cstring(".\\D3D12\\");
+        const uint32_t ptr_rva = exe.alloc_data(8, 8);
+        exe.write_at_data_rva<uint64_t>(ptr_rva, 0x0000000140000000ull + str_rva);
+
+        const uint32_t exp_start = exe.alloc_data(sizeof(IMAGE_EXPORT_DIRECTORY), 4);
+        const uint32_t funcs_rva = exe.alloc_data(2 * 4, 4);
+        const uint32_t names_rva = exe.alloc_data(2 * 4, 4);
+        const uint32_t ords_rva = exe.alloc_data(2 * 2, 2);
+        const uint32_t dll_name_rva = exe.write_cstring("game_title.exe");
+
+        const uint32_t s0_rva = exe.write_cstring("D3D12SDKPath");
+        const uint32_t s1_rva = exe.write_cstring("D3D12SDKVersion");
+
+        exe.write_at_data_rva<uint32_t>(funcs_rva + 0 * 4, ptr_rva);
+        exe.write_at_data_rva<uint32_t>(funcs_rva + 1 * 4, ver_rva);
+        exe.write_at_data_rva<uint32_t>(names_rva + 0 * 4, s0_rva);
+        exe.write_at_data_rva<uint32_t>(names_rva + 1 * 4, s1_rva);
+        exe.write_at_data_rva<uint16_t>(ords_rva + 0 * 2, 0);
+        exe.write_at_data_rva<uint16_t>(ords_rva + 1 * 2, 1);
+
+        IMAGE_EXPORT_DIRECTORY ed{};
+        ed.Name = dll_name_rva;
+        ed.Base = 1;
+        ed.NumberOfFunctions = 2;
+        ed.NumberOfNames = 2;
+        ed.AddressOfFunctions = funcs_rva;
+        ed.AddressOfNames = names_rva;
+        ed.AddressOfNameOrdinals = ords_rva;
+        exe.write_at_data_rva(exp_start, ed);
+        const uint32_t exp_size = (SynthPeBuilder::kDataRva + exe.data_cursor) - exp_start;
+        exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_EXPORT, exp_start, exp_size);
+
+        const uint32_t hn0 = exe.write_hint_name("D3D12CreateDevice");
+        const uint32_t hn1 = exe.write_hint_name("D3D12GetInterface");
+        const uint32_t dll_str = exe.write_cstring("d3d12.dll");
+
+        const uint32_t ilt_rva = exe.alloc_data(3 * 8, 8);
+        client_iat_rva = exe.alloc_data(3 * 8, 8);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 0, hn0);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 8, hn1);
+        exe.write_at_data_rva<uint64_t>(ilt_rva + 16, 0ull);
+
+        const uint32_t imp_rva = exe.alloc_data(2 * sizeof(IMAGE_IMPORT_DESCRIPTOR), 4);
+        IMAGE_IMPORT_DESCRIPTOR desc{};
+        desc.OriginalFirstThunk = ilt_rva;
+        desc.Name = dll_str;
+        desc.FirstThunk = client_iat_rva;
+        exe.write_at_data_rva(imp_rva, desc);
+        exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_IMPORT, imp_rva, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+
+        add_empty_reloc(exe);
+        exe.write_file(tmp / "game_title.exe");
+    }
+
+    hle::Registry reg;
+    hle::register_d3d12x(reg);
+
+    loader::PeLoader loader(reg, tmp);
+
+    // Test dynamic custom DLL redirection
+    loader.add_dll_redirection("custom_gfx.dll", "d3d12_xs.dll");
+    KX_CHECK(loader.get_redirected_dll("custom_gfx.dll") == "d3d12_xs.dll", "custom redirection lower");
+    KX_CHECK(loader.get_redirected_dll("CUSTOM_GFX.DLL") == "d3d12_xs.dll", "custom redirection upper");
+    KX_CHECK(loader.get_redirected_dll("other.dll") == "other.dll", "non-redirected passthrough");
+
+    // Load executable: automatically triggers apply_agility_sdk_redirection
+    auto mod = loader.load_image(tmp / "game_title.exe");
+    KX_CHECK(mod.has_value(), mod ? "" : mod.error().message);
+
+    // Verify Agility SDK querying
+    auto config = loader.query_agility_sdk(**mod);
+    KX_CHECK(config.found, "Agility SDK symbols detected");
+    KX_CHECK(config.sdk_version == 614u, "Agility SDK version 614");
+    KX_CHECK(config.sdk_path == ".\\D3D12\\", "Agility SDK relative path");
+
+    // Verify d3d12.dll and d3d12core.dll are redirected
+    KX_CHECK(loader.get_redirected_dll("d3d12.dll") == "d3d12_xs.dll", "d3d12 redirected");
+    KX_CHECK(loader.get_redirected_dll("D3D12Core.dll") == "d3d12_xs.dll", "d3d12core redirected");
+
+    // Verify HLE imports were resolved directly to HLE shims
+    KX_CHECK((*mod)->hle_imports == 2, "2 HLE imports resolved from d3d12.dll");
+    KX_CHECK((*mod)->stub_imports == 0, "0 stub imports");
+
+    // Verify resolved IAT pointers and execute kx_D3D12GetInterface
+    uint64_t slots[2]{};
+    std::memcpy(slots, (*mod)->base + client_iat_rva, sizeof(slots));
+    KX_CHECK(slots[0] != 0, "D3D12CreateDevice IAT slot resolved");
+    KX_CHECK(slots[1] != 0, "D3D12GetInterface IAT slot resolved");
+
+    using GetInterfaceFn = HRESULT(__stdcall*)(REFCLSID, REFIID, void**);
+    auto get_iface = reinterpret_cast<GetInterfaceFn>(slots[1]);
+    void* out_iface = reinterpret_cast<void*>(0x1234);
+    HRESULT hr = get_iface(GUID{}, GUID{}, &out_iface);
+    KX_CHECK(hr == S_OK && out_iface == nullptr, "kx_D3D12GetInterface called via redirected IAT");
+    HRESULT hr_err = get_iface(GUID{}, GUID{}, nullptr);
+    KX_CHECK(hr_err == E_INVALIDARG, "kx_D3D12GetInterface E_INVALIDARG check");
+
+    // Verify guest DLL loaded from Agility SDK search directory
+    auto guest_mod = loader.find_or_load_guest_dll("packaged_guest.dll");
+    KX_CHECK(guest_mod.has_value() && *guest_mod != nullptr, "Packaged guest DLL found in Agility SDK extra_search_dirs_");
+    if (guest_mod && *guest_mod) {
+        auto fn_res = loader.resolve_export_by_name(**guest_mod, "PackagedFunc");
+        KX_CHECK(fn_res.has_value() && *fn_res != nullptr, "PackagedFunc resolved");
+        using PkgFn = int(__cdecl*)();
+        KX_CHECK(reinterpret_cast<PkgFn>(*fn_res)() == 0x99, "PackagedFunc returns 0x99");
+    }
+
+    fs::remove_all(tmp, ec);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6874,7 +7036,8 @@ int main(int argc, char** argv) {
     run_test("HLE Registry Multi-Page (>2048 Stubs) Thunk Cleanup", test_registry_multipage_thunk_cleanup);
     run_test("Spatial Audio 5.1 & 7.1 Multi-Channel Surround Downmix Matrix (ITU-R BS.775)", test_xaudio2_surround_5point1_and_7point1_downmix);
     run_test("GDK Multi-User Profile Identity, Controller Binding & Isolated S:\\ Saves", test_gdk_multi_user_profile_save_isolation);
-    run_test("RDNA2 Hardware Raytracing BVH (IMAGE_BVH_INTERSECT_RAY) Decode, IR Lift & SM 6.6 RayQuery DXIL", test_rdna2_raytracing_bvh_intersect_ray_decode_ir_dxc);
+        run_test("RDNA2 Hardware Raytracing BVH (IMAGE_BVH_INTERSECT_RAY) Decode, IR Lift & SM 6.6 RayQuery DXIL", test_rdna2_raytracing_bvh_intersect_ray_decode_ir_dxc);
+    run_test("GDK Agility SDK Query, Dynamic DLL Redirection & Modern D3D12/D3D12Core HLE Export Shims", test_pe_loader_agility_sdk_and_dll_redirection);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

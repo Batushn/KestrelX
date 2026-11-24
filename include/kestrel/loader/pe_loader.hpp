@@ -32,6 +32,12 @@ struct MappedModule {
     void* find_export_by_ordinal(uint16_t ord) const;
 };
 
+struct AgilitySdkConfig {
+    uint32_t sdk_version = 0;
+    std::string sdk_path;
+    bool found = false;
+};
+
 class PeLoader {
 public:
     PeLoader(hle::Registry& hle, std::filesystem::path search_dir);
@@ -40,16 +46,23 @@ public:
     PeLoader& operator=(const PeLoader&) = delete;
 
     Result<MappedModule*> load_image(const std::filesystem::path& path);
+    Result<MappedModule*> find_or_load_guest_dll(std::string_view dll_name);
     Result<int> execute_entry(MappedModule& mod);
     Result<void*> resolve_export_by_name(MappedModule& mod, std::string_view sym);
     Result<void*> resolve_export_by_ordinal(MappedModule& mod, uint16_t ord);
+
+    // Dynamic GDK & Agility SDK DLL redirection
+    void add_dll_redirection(std::string_view from_dll, std::string_view to_dll);
+    std::string get_redirected_dll(std::string_view dll_name) const;
+    void add_search_directory(const std::filesystem::path& dir);
+    AgilitySdkConfig query_agility_sdk(const MappedModule& mod) const;
+    void apply_agility_sdk_redirection(const MappedModule& mod);
 
     const std::vector<std::unique_ptr<MappedModule>>& modules() const { return modules_; }
 
 private:
     static constexpr int kMaxForwarderDepth = 8;
 
-    Result<MappedModule*> find_or_load_guest_dll(std::string_view dll_name);
     Result<void*> resolve_export_symbol(MappedModule& mod, const PeExportSymbol& exp, int depth);
     Result<void*> resolve_guest_export_by_name(MappedModule& mod, std::string_view sym, int depth);
     Result<void*> resolve_guest_export_by_ordinal(MappedModule& mod, uint16_t ord, int depth);
@@ -63,6 +76,8 @@ private:
 
     hle::Registry& hle_;
     std::filesystem::path search_dir_;
+    std::vector<std::filesystem::path> extra_search_dirs_;
+    std::unordered_map<std::string, std::string> dll_redirections_;
     std::vector<std::unique_ptr<MappedModule>> modules_;
     std::unordered_map<std::string, MappedModule*> by_name_;
 };

@@ -61,11 +61,16 @@ void PeLoader::rollback_module(const std::string& key, MappedModule* target) {
 }
 
 Result<MappedModule*> PeLoader::find_or_load_guest_dll(std::string_view dll_name) {
-    const std::string key = to_lower_ascii(dll_name);
+    const std::string redirected = get_redirected_dll(dll_name);
+    const std::string key = to_lower_ascii(redirected);
     if (auto it = by_name_.find(key); it != by_name_.end()) return it->second;
-    const auto candidate = search_dir_ / dll_name;
-    if (!std::filesystem::is_regular_file(candidate)) return nullptr;
-    return load_image(candidate);
+    const auto candidate = search_dir_ / redirected;
+    if (std::filesystem::is_regular_file(candidate)) return load_image(candidate);
+    for (const auto& dir : extra_search_dirs_) {
+        const auto cand = dir / redirected;
+        if (std::filesystem::is_regular_file(cand)) return load_image(cand);
+    }
+    return nullptr;
 }
 
 Result<void*> PeLoader::resolve_export_by_name(MappedModule& mod, std::string_view sym) {
@@ -134,9 +139,10 @@ Result<void*> PeLoader::resolve_forwarder(std::string_view forwarder, int depth)
 
     const std::string sym_str(sym_part);
     const std::string dll_lower_raw = to_lower_ascii(dll_part);
-    const std::string target_dll = dll_lower_raw.ends_with(".dll")
+    const std::string raw_target = dll_lower_raw.ends_with(".dll")
                                        ? std::string(dll_part)
                                        : (std::string(dll_part) + ".dll");
+    const std::string target_dll = get_redirected_dll(raw_target);
     const std::string target_lower = to_lower_ascii(target_dll);
 
     // 1. Check HLE registry first
@@ -239,6 +245,9 @@ Result<MappedModule*> PeLoader::load_image(const std::filesystem::path& path) {
         rollback_module(key, raw_ptr);
         return std::unexpected(r.error());
     }
+    if (!raw_ptr->is_dll) {
+        apply_agility_sdk_redirection(*raw_ptr);
+    }
     if (auto r = resolve_imports(*raw_ptr); !r) {
         rollback_module(key, raw_ptr);
         return std::unexpected(r.error());
@@ -316,15 +325,16 @@ Result<void> PeLoader::apply_relocations(MappedModule& mod) {
 
 Result<void> PeLoader::resolve_imports(MappedModule& mod) {
     for (const auto& imp_mod : mod.image.imports) {
-        const std::string dll_lower = to_lower_ascii(imp_mod.dll_name);
+        const std::string redirected_name = get_redirected_dll(imp_mod.dll_name);
+        const std::string dll_lower = to_lower_ascii(redirected_name);
         MappedModule* guest_dll = nullptr;
         HMODULE host_dll = nullptr;
 
         if (!hle_.has_module(dll_lower)) {
-            auto g = find_or_load_guest_dll(imp_mod.dll_name);
+            auto g = find_or_load_guest_dll(redirected_name);
             if (!g) return std::unexpected(g.error());
             guest_dll = *g;
-            if (!guest_dll) host_dll = LoadLibraryA(imp_mod.dll_name.c_str());
+            if (!guest_dll) host_dll = LoadLibraryA(redirected_name.c_str());
         }
 
         for (const auto& sym : imp_mod.symbols) {
@@ -434,6 +444,73 @@ void PeLoader::run_tls_callbacks(MappedModule& mod) {
         cbs[i](mod.base, DLL_PROCESS_ATTACH, nullptr);
         ++mod.tls_callbacks_run;
     }
+}
+
+void PeLoader::add_dll_redirection(std::string_view from_dll, std::string_view to_dll) {
+    dll_redirections_[to_lower_ascii(from_dll)] = std::string(to_dll);
+}
+
+std::string PeLoader::get_redirected_dll(std::string_view dll_name) const {
+    const std::string lower = to_lower_ascii(dll_name);
+    if (auto it = dll_redirections_.find(lower); it != dll_redirections_.end()) {
+        return it->second;
+    }
+    return std::string(dll_name);
+}
+
+void PeLoader::add_search_directory(const std::filesystem::path& dir) {
+    extra_search_dirs_.push_back(dir);
+}
+
+AgilitySdkConfig PeLoader::query_agility_sdk(const MappedModule& mod) const {
+    AgilitySdkConfig cfg;
+    void* ver_ptr = mod.find_export_by_name("D3D12SDKVersion");
+    if (!ver_ptr) return cfg;
+
+    cfg.sdk_version = *reinterpret_cast<const uint32_t*>(ver_ptr);
+    cfg.found = true;
+
+    void* path_ptr = mod.find_export_by_name("D3D12SDKPath");
+    if (path_ptr) {
+        uint64_t str_va = *reinterpret_cast<const uint64_t*>(path_ptr);
+        const uint64_t base_va = reinterpret_cast<uint64_t>(mod.base);
+        const char* s = nullptr;
+        size_t max_len = 260;
+
+        if (str_va >= base_va && str_va < base_va + mod.size_of_image) {
+            s = reinterpret_cast<const char*>(str_va);
+            max_len = static_cast<size_t>((base_va + mod.size_of_image) - str_va);
+            if (max_len > 260) max_len = 260;
+        } else if (mod.image.image_base != 0 &&
+                   str_va >= mod.image.image_base &&
+                   str_va < mod.image.image_base + mod.size_of_image) {
+            uint64_t rva = str_va - mod.image.image_base;
+            s = reinterpret_cast<const char*>(mod.base + rva);
+            max_len = static_cast<size_t>(mod.size_of_image - rva);
+            if (max_len > 260) max_len = 260;
+        } else {
+            s = reinterpret_cast<const char*>(path_ptr);
+        }
+
+        if (s) {
+            size_t len = 0;
+            while (len < max_len && s[len] != '\0') ++len;
+            cfg.sdk_path = std::string(s, len);
+        }
+    }
+    return cfg;
+}
+
+void PeLoader::apply_agility_sdk_redirection(const MappedModule& mod) {
+    auto cfg = query_agility_sdk(mod);
+    if (!cfg.found) return;
+
+    if (!cfg.sdk_path.empty()) {
+        auto extra_dir = search_dir_ / cfg.sdk_path;
+        add_search_directory(extra_dir);
+    }
+    add_dll_redirection("d3d12.dll", "d3d12_xs.dll");
+    add_dll_redirection("d3d12core.dll", "d3d12_xs.dll");
 }
 
 Result<int> PeLoader::execute_entry(MappedModule& mod) {

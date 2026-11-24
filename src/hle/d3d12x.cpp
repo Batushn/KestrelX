@@ -41,6 +41,10 @@ uint32_t g_win_w = 640;
 uint32_t g_win_h = 640;
 std::filesystem::path g_capture_path;
 std::unique_ptr<WindowHost> g_window_host;
+FramePacingConfig g_pacing_cfg{};
+FramePacer g_headless_pacer;
+FramePacingStats g_last_window_pacing{};
+bool g_has_last_window_pacing = false;
 
 std::mutex g_shader_cache_mtx;
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_dxil_cache;
@@ -251,6 +255,12 @@ HRESULT __stdcall kx_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL min_
     auto* proxy = new KxDeviceProxy(raw);
     raw->Release();
     g_devices.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_present_mtx);
+        if (g_headless_pacer.stats().frame_count == 0) {
+            g_headless_pacer.begin_frame();
+        }
+    }
 
     hr = proxy->QueryInterface(riid, out_dev);
     proxy->Release();
@@ -276,33 +286,56 @@ HRESULT __stdcall kx_D3D12SerializeRootSignature(
 
 HRESULT __stdcall kx_D3D12PresentX(ID3D12CommandQueue* queue, uint32_t, const void* rt_or_planes, const void*) {
     g_presents.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(g_present_mtx);
+    bool handled_window_pacing = false;
     if (queue && rt_or_planes) {
         auto* rt = reinterpret_cast<ID3D12Resource*>(const_cast<void*>(rt_or_planes));
-        std::lock_guard lock(g_present_mtx);
         ID3D12Device* dev = nullptr;
         if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
             if (!g_capture_path.empty()) {
+                if (g_pacing_cfg.hud_enabled) {
+                    if (!g_window_host) {
+                        g_headless_pacer.end_frame_and_pace(0.42);
+                        g_headless_pacer.record_present_kind(false);
+                        handled_window_pacing = true;
+                    }
+                    const FramePacingStats st = g_window_host ? g_window_host->pacing_stats() : g_headless_pacer.stats();
+                    (void)composite_hud_on_d3d12_texture(
+                        dev, queue, rt, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        st, "KestrelX D3D12.X", g_pacing_cfg.sync_mode);
+                }
                 (void)capture_d3d12_texture_bmp(dev, queue, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, g_capture_path);
             }
             if (g_windowed) {
                 if (!g_window_host) {
                     g_window_host = std::make_unique<WindowHost>();
-                    if (!g_window_host->create(dev, queue, g_win_w, g_win_h)) {
+                    if (!g_window_host->create(dev, queue, g_win_w, g_win_h,
+                                               L"KestrelX - Xbox Series X|S Runtime", g_pacing_cfg)) {
                         g_window_host.reset();
                     }
                 }
                 if (g_window_host && g_window_host->is_open()) {
+                    g_window_host->set_frame_pacing(g_pacing_cfg);
                     (void)g_window_host->present_resource(rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
                     g_window_host->pump_messages();
+                    handled_window_pacing = true;
                 }
             }
             dev->Release();
         }
     }
+    if (!handled_window_pacing) {
+        g_headless_pacer.end_frame_and_pace(0.0);
+        g_headless_pacer.record_present_kind(false);
+    }
     return S_OK;
 }
 
-HRESULT __stdcall kx_D3D12WaitFrameEventX(uint64_t, uint32_t, void*) {
+HRESULT __stdcall kx_D3D12WaitFrameEventX(uint64_t, uint32_t timeout_ms, void*) {
+    std::lock_guard lock(g_present_mtx);
+    if (g_window_host && g_window_host->is_open()) {
+        (void)g_window_host->wait_frame_latency(timeout_ms > 0 ? timeout_ms : 100u);
+    }
     return S_OK;
 }
 
@@ -935,6 +968,26 @@ void set_d3d12x_capture_path(const std::filesystem::path& bmp_path) {
     g_capture_path = bmp_path;
 }
 
+void set_d3d12x_frame_pacing(const FramePacingConfig& config) {
+    std::lock_guard lock(g_present_mtx);
+    g_pacing_cfg = config;
+    g_headless_pacer.configure(config);
+    if (g_window_host) {
+        g_window_host->set_frame_pacing(config);
+    }
+}
+
+FramePacingStats d3d12x_frame_pacing_stats() {
+    std::lock_guard lock(g_present_mtx);
+    if (g_window_host && g_window_host->frames_presented() > 0) {
+        return g_window_host->pacing_stats();
+    }
+    if (g_has_last_window_pacing) {
+        return g_last_window_pacing;
+    }
+    return g_headless_pacer.stats();
+}
+
 void set_d3d12x_shader_cache_dir(const std::filesystem::path& cache_dir) {
     std::lock_guard lock(g_shader_cache_mtx);
     g_disk_cache.set_root_dir(cache_dir);
@@ -947,6 +1000,10 @@ void clear_d3d12x_memory_shader_cache() {
 
 void shutdown_d3d12x_window() {
     std::lock_guard lock(g_present_mtx);
+    if (g_window_host && g_window_host->frames_presented() > 0) {
+        g_last_window_pacing = g_window_host->pacing_stats();
+        g_has_last_window_pacing = true;
+    }
     g_window_host.reset();
 }
 
@@ -1011,6 +1068,11 @@ void reset_d3d12x_stats() {
         g_window_host.reset();
         g_windowed = false;
         g_capture_path.clear();
+        g_pacing_cfg = {};
+        g_headless_pacer.reset();
+        g_headless_pacer.configure(g_pacing_cfg);
+        g_last_window_pacing = {};
+        g_has_last_window_pacing = false;
     }
 }
 

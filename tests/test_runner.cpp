@@ -7783,6 +7783,239 @@ void test_gdk_crypto_container_and_xstore_license_decryption() {
     fs::remove_all(temp_dir, ec);
 }
 
+
+void test_frame_pacer_limiter_and_hud_rasterizer() {
+    hle::reset_d3d12x_stats();
+
+    // 1. Validate FramePacer sliding window, P99, and dynamic frame limiter (125 FPS = 8.0 ms/frame)
+    hle::FramePacer pacer;
+    hle::FramePacingConfig cfg{};
+    cfg.target_fps = 125.0;
+    cfg.sync_mode = hle::PresentSyncMode::VariableRefreshTearing;
+    cfg.max_frame_latency = 1;
+    cfg.hud_enabled = true;
+    pacer.configure(cfg);
+
+    for (int i = 0; i < 6; ++i) {
+        pacer.begin_frame();
+        pacer.end_frame_and_pace(0.45 + 0.05 * static_cast<double>(i));
+        pacer.record_present_kind(true);
+    }
+
+    const auto st = pacer.stats();
+    KX_CHECK(st.frame_count == 6, "FramePacer counted 6 frames");
+    KX_CHECK(st.recent_frame_ms.size() == 6, "FramePacer stored 6 frametime samples");
+    KX_CHECK(st.avg_frame_ms >= 6.5 && st.avg_frame_ms <= 40.0, "FramePacer 125 FPS limiter target range");
+    KX_CHECK(st.p99_frame_ms >= st.min_frame_ms && st.p99_frame_ms <= st.max_frame_ms, "P99 within [min, max]");
+    KX_CHECK(st.tearing_presents == 6 && st.vsync_presents == 0, "Tearing present counters tracked");
+
+    // 2. Validate clean-room 5x7 RGBA8 HUD rasterizer deterministically
+    hle::FramePacingStats det_st = st;
+    det_st.current_fps = 120.0;
+    det_st.avg_frame_ms = 8.33;
+    det_st.p99_frame_ms = 9.10;
+    det_st.recent_frame_ms = {8.0f, 8.2f, 8.4f, 18.5f, 26.0f, 8.1f};
+    const auto hud = hle::render_telemetry_hud_rgba8(det_st, "NVIDIA RTX 4060", cfg.sync_mode);
+    KX_CHECK(hud.size() == static_cast<size_t>(hle::kTelemetryHudWidth) * hle::kTelemetryHudHeight * 4u,
+             "HUD buffer size matches 236x76 RGBA8");
+    auto px_eq = [&](uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b) {
+        const size_t i = (static_cast<size_t>(y) * hle::kTelemetryHudWidth + x) * 4u;
+        return hud[i + 0] == r && hud[i + 1] == g && hud[i + 2] == b && hud[i + 3] == 255;
+    };
+    KX_CHECK(px_eq(0, 0, 46, 164, 79), "HUD border pixel (#2EA44F)");
+    KX_CHECK(px_eq(1, 2, 86, 211, 100), "HUD accent bar pixel (#56D364)");
+    KX_CHECK(px_eq(8, 69, 86, 211, 100), "HUD sparkline bar rendered");
+
+    // 3. Validate headless D3D12PresentX & D3D12WaitFrameEventX integration
+    hle::Registry reg;
+    hle::register_d3d12x(reg);
+    auto present_fn = reinterpret_cast<HRESULT(__stdcall*)(ID3D12CommandQueue*, uint32_t, const void*, const void*)>(
+        reg.resolve_name("d3d12_xs.dll", "D3D12PresentX"));
+    auto wait_fn = reinterpret_cast<HRESULT(__stdcall*)(uint64_t, uint32_t, void*)>(
+        reg.resolve_name("d3d12_xs.dll", "D3D12WaitFrameEventX"));
+    KX_CHECK(present_fn != nullptr && wait_fn != nullptr, "Registry resolves PresentX & WaitFrameEventX");
+
+    hle::FramePacingConfig headless_cfg{};
+    headless_cfg.target_fps = 200.0;
+    headless_cfg.hud_enabled = true;
+    hle::set_d3d12x_frame_pacing(headless_cfg);
+    for (int i = 0; i < 4; ++i) {
+        KX_CHECK(SUCCEEDED(wait_fn(0, 16, nullptr)), "WaitFrameEventX succeeds");
+        KX_CHECK(SUCCEEDED(present_fn(nullptr, 0, nullptr, nullptr)), "Headless PresentX succeeds");
+    }
+    const auto d3d_st = hle::d3d12x_stats();
+    const auto pace_st = hle::d3d12x_frame_pacing_stats();
+    KX_CHECK(d3d_st.present_calls == 4 && pace_st.frame_count == 4, "PresentX headless pacing telemetry recorded");
+}
+
+void test_presentx_low_latency_hud_composite_and_capture_dual_gpu() {
+    hle::reset_d3d12x_stats();
+
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "Adapters available");
+
+    int hw_verified = 0;
+    for (const auto& ad : *adapters) {
+        if (ad.is_software) continue;
+        hle::set_d3d12x_preferred_adapter(static_cast<int>(ad.index));
+
+        hle::Registry reg;
+        hle::register_d3d12x(reg);
+        using CreateDevFn = HRESULT(__stdcall*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+        auto create_dev = reinterpret_cast<CreateDevFn>(reg.resolve_name("d3d12_xs.dll", "D3D12CreateDevice"));
+        ID3D12Device* dev = nullptr;
+        KX_CHECK(SUCCEEDED(create_dev(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev))) && dev != nullptr,
+                 "Create KxDeviceProxy");
+
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        ID3D12Fence* fence = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))), "CreateCommandQueue");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))), "CreateCommandAllocator");
+        KX_CHECK(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd))), "CreateCommandList");
+        KX_CHECK(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "CreateFence");
+
+        constexpr uint32_t kW = 512, kH = 256;
+        D3D12_HEAP_PROPERTIES def_hp{};
+        def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rt_desc{};
+        rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rt_desc.Width = kW;
+        rt_desc.Height = kH;
+        rt_desc.DepthOrArraySize = 1;
+        rt_desc.MipLevels = 1;
+        rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt_desc.SampleDesc.Count = 1;
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        ID3D12Resource* rt = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&rt))),
+                 "Create RT");
+
+        D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{};
+        rtv_hd.NumDescriptors = 1;
+        rtv_hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        ID3D12DescriptorHeap* rtv_heap = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap))), "Create RTV heap");
+        dev->CreateRenderTargetView(rt, nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
+
+        const float clear_col[4] = {20.0f / 255.0f, 35.0f / 255.0f, 65.0f / 255.0f, 1.0f};
+        cmd->ClearRenderTargetView(rtv_heap->GetCPUDescriptorHandleForHeapStart(), clear_col, 0, nullptr);
+        cmd->Close();
+        ID3D12CommandList* lists[] = {cmd};
+        queue->ExecuteCommandLists(1, lists);
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        queue->Signal(fence, 1);
+        fence->SetEventOnCompletion(1, ev);
+        WaitForSingleObject(ev, 5000);
+        CloseHandle(ev);
+
+        // Composite telemetry HUD via D3D12PresentX capture hook with HUD enabled
+        hle::FramePacingConfig pcfg{};
+        pcfg.target_fps = 120.0;
+        pcfg.sync_mode = hle::PresentSyncMode::VariableRefreshTearing;
+        pcfg.hud_enabled = true;
+        hle::set_d3d12x_frame_pacing(pcfg);
+
+        hle::FramePacingStats hud_stats{};
+        hud_stats.frame_count = 120;
+        hud_stats.avg_frame_ms = 8.33;
+        hud_stats.p99_frame_ms = 9.10;
+        hud_stats.current_fps = 120.0;
+        hud_stats.present_latency_ms = 0.62;
+        for (int i = 0; i < 40; ++i) {
+            hud_stats.recent_frame_ms.push_back((i % 7 == 0) ? 18.2f : (7.8f + static_cast<float>(i % 4) * 0.4f));
+        }
+
+        KX_CHECK(hle::composite_hud_on_d3d12_texture(
+                     dev, queue, rt, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                     hud_stats, ad.name, pcfg.sync_mode, 8, 8).has_value(),
+                 "Composite HUD on D3D12 RT");
+
+        // Read back RT and verify HUD + untouched background pixels
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT num_rows = 0;
+        UINT64 row_bytes = 0, total_bytes = 0;
+        dev->GetCopyableFootprints(&rt_desc, 0, 1, 0, &fp, &num_rows, &row_bytes, &total_bytes);
+
+        D3D12_HEAP_PROPERTIES rb_hp{};
+        rb_hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rb_desc{};
+        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rb_desc.Width = total_bytes;
+        rb_desc.Height = 1;
+        rb_desc.DepthOrArraySize = 1;
+        rb_desc.MipLevels = 1;
+        rb_desc.SampleDesc.Count = 1;
+        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        ID3D12Resource* rb = nullptr;
+        KX_CHECK(SUCCEEDED(dev->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))),
+                 "Create readback buffer");
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        D3D12_RESOURCE_BARRIER b1{};
+        b1.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b1.Transition = {rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cmd->ResourceBarrier(1, &b1);
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        dst_loc.PlacedFootprint = fp;
+        D3D12_TEXTURE_COPY_LOCATION src_loc{rt, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        cmd->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        D3D12_RESOURCE_BARRIER b2{};
+        b2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b2.Transition = {rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET};
+        cmd->ResourceBarrier(1, &b2);
+        cmd->Close();
+        ID3D12CommandList* rb_lists[] = {cmd};
+        queue->ExecuteCommandLists(1, rb_lists);
+        HANDLE ev2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        queue->Signal(fence, 2);
+        fence->SetEventOnCompletion(2, ev2);
+        WaitForSingleObject(ev2, 5000);
+        CloseHandle(ev2);
+
+        void* mapped = nullptr;
+        D3D12_RANGE rng{0, static_cast<SIZE_T>(total_bytes)};
+        KX_CHECK(SUCCEEDED(rb->Map(0, &rng, &mapped)), "Map readback");
+        const auto* bytes = static_cast<const uint8_t*>(mapped);
+        auto check_px = [&](uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b) {
+            const uint8_t* row = bytes + static_cast<size_t>(y) * fp.Footprint.RowPitch;
+            const size_t i = static_cast<size_t>(x) * 4u;
+            return std::abs(static_cast<int>(row[i + 0]) - static_cast<int>(r)) <= 1 &&
+                   std::abs(static_cast<int>(row[i + 1]) - static_cast<int>(g)) <= 1 &&
+                   std::abs(static_cast<int>(row[i + 2]) - static_cast<int>(b)) <= 1;
+        };
+
+        KX_CHECK(check_px(8, 8, 46, 164, 79), "GPU RT HUD border pixel verified");
+        KX_CHECK(check_px(9, 10, 86, 211, 100), "GPU RT HUD accent pixel verified");
+        KX_CHECK(check_px(400, 200, 20, 35, 65), "GPU RT untouched background pixel verified");
+        D3D12_RANGE empty{0, 0};
+        rb->Unmap(0, &empty);
+
+        std::cout << std::format("    -> Hardware [{}] {} PASS (PresentX 236x76 Telemetry HUD composited bit-exact)\n",
+                                 ad.index, ad.name);
+        ++hw_verified;
+
+        rb->Release();
+        rtv_heap->Release();
+        rt->Release();
+        fence->Release();
+        cmd->Release();
+        alloc->Release();
+        queue->Release();
+        dev->Release();
+    }
+
+    KX_CHECK(hw_verified >= 1, "At least one physical GPU verified PresentX HUD");
+    hle::set_d3d12x_preferred_adapter(-1);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -7861,6 +8094,8 @@ int main(int argc, char** argv) {
     run_test("Sparse Virtual Texturing (SVT) 64KB Page Table, LRU Eviction, Feedback & RDNA2 TFE", test_svt_page_table_lru_and_feedback);
     run_hw_test("Sparse Virtual Texturing (SVT) Reserved Resource, TFE Feedback & LRU Remap on Dual-GPU Hardware", test_svt_reserved_resource_tfe_feedback_dual_gpu);
     run_test("GDK Cryptographic Container (KXVC AES-128-CTR / Pass-Through) & XStore/XPackage License Decryption", test_gdk_crypto_container_and_xstore_license_decryption);
+    run_test("PresentX Frame Pacer (125 FPS Limiter, P99 Telemetry) & 5x7 HUD Rasterizer", test_frame_pacer_limiter_and_hud_rasterizer);
+    run_hw_test("PresentX Low-Latency Telemetry HUD GPU Compositor on Dual-GPU Hardware", test_presentx_low_latency_hud_composite_and_capture_dual_gpu);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

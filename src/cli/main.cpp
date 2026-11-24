@@ -40,7 +40,7 @@ void print_usage() {
         "  kestrel disasm <shader.bin>       Decode & disassemble raw RDNA2 (GFX10.3) microcode\n"
         "  kestrel selftest [--adapter N]    Run RDNA2 -> IR -> HLSL -> DXC -> real GPU execution test\n"
         "  kestrel run <dir|exe> [--adapter N] [--data-dir <dir>] [--cache-dir <dir>]\n"
-        "                        [--windowed] [--audio] [--capture <out.bmp>]\n"
+        "                        [--windowed] [--fullscreen] [--hud] [--fps <N>] [--tearing] [--audio] [--capture <out.bmp>]\n"
         "                                    Load & execute an Xbox-ABI PE title with Overlay VFS & KxDeviceProxy\n";
 }
 
@@ -204,7 +204,8 @@ int cmd_selftest(int adapter_filter) {
 }
 
 int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
-            const fs::path& cache_dir, bool windowed, bool audio, const fs::path& capture_path) {
+            const fs::path& cache_dir, bool windowed, bool audio, const fs::path& capture_path,
+            const hle::FramePacingConfig& pacing) {
     fs::path game_root = fs::is_directory(target) ? target : target.parent_path();
     fs::path exe_path = target;
     uint32_t title_id = 0x4B580001u;
@@ -240,6 +241,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
     hle::set_xgameruntime_title_id(title_id);
     hle::set_d3d12x_preferred_adapter(adapter_index);
     hle::set_d3d12x_windowed(windowed, 512, 512);
+    hle::set_d3d12x_frame_pacing(pacing);
     hle::set_d3d12x_capture_path(capture_path);
     if (!cache_dir.empty()) hle::set_d3d12x_shader_cache_dir(cache_dir);
     hle::set_xaudio2_wasapi_enabled(audio);
@@ -310,18 +312,24 @@ int main(int argc, char** argv) {
     bool windowed = false;
     bool audio = false;
     fs::path capture_path;
+    hle::FramePacingConfig pacing{};
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--adapter" && i + 1 < argc) adapter = std::stoi(argv[++i]);
         else if (arg == "--data-dir" && i + 1 < argc) data_dir = argv[++i];
         else if (arg == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
         else if (arg == "--windowed") windowed = true;
+        else if (arg == "--fullscreen") pacing.borderless_fullscreen = true;
+        else if (arg == "--hud") pacing.hud_enabled = true;
+        else if (arg == "--tearing") pacing.sync_mode = hle::PresentSyncMode::VariableRefreshTearing;
+        else if (arg == "--vsync") pacing.sync_mode = hle::PresentSyncMode::VSync;
+        else if (arg == "--fps" && i + 1 < argc) pacing.target_fps = std::stod(argv[++i]);
         else if (arg == "--audio") audio = true;
         else if (arg == "--capture" && i + 1 < argc) capture_path = argv[++i];
     }
 
     if (cmd == "selftest") return cmd_selftest(adapter);
-    if (cmd == "run" && argc >= 3) return cmd_run(argv[2], adapter, data_dir, cache_dir, windowed, audio, capture_path);
+    if (cmd == "run" && argc >= 3) return cmd_run(argv[2], adapter, data_dir, cache_dir, windowed, audio, capture_path, pacing);
 
     print_usage();
     return 1;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kestrel/hle/registry.hpp"
+#include "kestrel/hle/window_host.hpp"
 #include <d3d12.h>
 #include <atomic>
 #include <cstdint>
@@ -275,6 +276,8 @@ private:
 void set_d3d12x_preferred_adapter(int adapter_index);
 void set_d3d12x_windowed(bool enabled, uint32_t width = 640, uint32_t height = 640);
 void set_d3d12x_capture_path(const std::filesystem::path& bmp_path);
+void set_d3d12x_frame_pacing(const FramePacingConfig& config);
+FramePacingStats d3d12x_frame_pacing_stats();
 void set_d3d12x_shader_cache_dir(const std::filesystem::path& cache_dir);
 void clear_d3d12x_memory_shader_cache();
 void shutdown_d3d12x_window();

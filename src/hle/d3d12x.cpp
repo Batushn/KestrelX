@@ -18,10 +18,16 @@ namespace kestrel::hle {
 
 namespace {
 
-// Private internal IID used to safely unwrap KxGraphicsCommandListProxy inside ExecuteCommandLists
+// Private internal IIDs used to safely unwrap KestrelX COM proxies at native D3D12/DXGI boundaries
 // {9E1B5E73-8F24-4B9E-9A5E-4C12D30F1201}
 constexpr GUID kIID_KxGraphicsCommandListProxy = {
     0x9e1b5e73, 0x8f24, 0x4b9e, {0x9a, 0x5e, 0x4c, 0x12, 0xd3, 0x0f, 0x12, 0x01}};
+// {9E1B5E73-8F24-4B9E-9A5E-4C12D30F1202}
+constexpr GUID kIID_KxCommandQueueProxy = {
+    0x9e1b5e73, 0x8f24, 0x4b9e, {0x9a, 0x5e, 0x4c, 0x12, 0xd3, 0x0f, 0x12, 0x02}};
+// {9E1B5E73-8F24-4B9E-9A5E-4C12D30F1203}
+constexpr GUID kIID_KxDeviceProxy = {
+    0x9e1b5e73, 0x8f24, 0x4b9e, {0x9a, 0x5e, 0x4c, 0x12, 0xd3, 0x0f, 0x12, 0x03}};
 
 std::atomic<int> g_preferred_adapter{-1};
 std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0},
@@ -40,6 +46,8 @@ bool g_windowed = false;
 uint32_t g_win_w = 640;
 uint32_t g_win_h = 640;
 std::filesystem::path g_capture_path;
+std::atomic<uint32_t> g_max_frames{0};
+std::atomic<bool> g_capture_done{false};
 std::unique_ptr<WindowHost> g_window_host;
 FramePacingConfig g_pacing_cfg{};
 FramePacer g_headless_pacer;
@@ -603,6 +611,11 @@ KxCommandQueueProxy::~KxCommandQueueProxy() {
 
 HRESULT STDMETHODCALLTYPE KxCommandQueueProxy::QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
+    if (riid == kIID_KxCommandQueueProxy) {
+        *ppv = this;
+        AddRef();
+        return S_OK;
+    }
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12Pageable) ||
         riid == __uuidof(ID3D12CommandQueue)) {
@@ -697,6 +710,11 @@ KxDeviceProxy::~KxDeviceProxy() {
 
 HRESULT STDMETHODCALLTYPE KxDeviceProxy::QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
+    if (riid == kIID_KxDeviceProxy) {
+        *ppv = this;
+        AddRef();
+        return S_OK;
+    }
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12Device)) {
         *ppv = static_cast<ID3D12Device*>(this);
         AddRef();
@@ -804,7 +822,9 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandList(UINT m, D3D12_COMMAND
         r == __uuidof(ID3D12GraphicsCommandList2) ||
         r == __uuidof(ID3D12GraphicsCommandList3) ||
         r == __uuidof(ID3D12GraphicsCommandList4) ||
-        r == __uuidof(ID3D12GraphicsCommandList5)) {
+        r == __uuidof(ID3D12GraphicsCommandList5) ||
+        r == __uuidof(ID3D12GraphicsCommandList6) ||
+        r == __uuidof(ID3D12GraphicsCommandList7)) {
         ID3D12GraphicsCommandList* raw = nullptr;
         HRESULT hr = inner_->CreateCommandList(m, t, a, i, IID_PPV_ARGS(&raw));
         if (FAILED(hr)) return hr;
@@ -965,6 +985,11 @@ void set_d3d12x_windowed(bool enabled, uint32_t width, uint32_t height) {
 void set_d3d12x_capture_path(const std::filesystem::path& bmp_path) {
     std::lock_guard lock(g_present_mtx);
     g_capture_path = bmp_path;
+    g_capture_done.store(false, std::memory_order_relaxed);
+}
+
+void set_d3d12x_max_frames(uint32_t max_frames) {
+    g_max_frames.store(max_frames, std::memory_order_relaxed);
 }
 
 void set_d3d12x_frame_pacing(const FramePacingConfig& config) {
@@ -1012,20 +1037,398 @@ HRESULT __stdcall kx_D3D12GetInterface(REFCLSID, REFIID, void** ppv) {
     return S_OK;
 }
 
+
+namespace {
+
+IUnknown* unwrap_d3d12_for_dxgi(IUnknown* pDevice, ID3D12CommandQueue** out_queue) {
+    if (out_queue) *out_queue = nullptr;
+    if (!pDevice) return nullptr;
+    KxCommandQueueProxy* qproxy = nullptr;
+    if (SUCCEEDED(pDevice->QueryInterface(kIID_KxCommandQueueProxy, reinterpret_cast<void**>(&qproxy))) && qproxy) {
+        ID3D12CommandQueue* raw = qproxy->inner();
+        if (out_queue && raw) {
+            raw->AddRef();
+            *out_queue = raw;
+        }
+        qproxy->Release();
+        return raw;
+    }
+    KxDeviceProxy* dproxy = nullptr;
+    if (SUCCEEDED(pDevice->QueryInterface(kIID_KxDeviceProxy, reinterpret_cast<void**>(&dproxy))) && dproxy) {
+        ID3D12Device* raw = dproxy->inner();
+        dproxy->Release();
+        return raw;
+    }
+    if (out_queue) {
+        (void)pDevice->QueryInterface(IID_PPV_ARGS(out_queue));
+    }
+    return pDevice;
+}
+
+class KxSwapChainProxy final : public IDXGISwapChain4 {
+public:
+    KxSwapChainProxy(IDXGISwapChain* inner, ID3D12CommandQueue* raw_queue, HWND hwnd)
+        : inner_(inner), raw_queue_(raw_queue), hwnd_(hwnd) {
+        if (inner_) {
+            inner_->AddRef();
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner1_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner2_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner3_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner4_));
+        }
+        if (raw_queue_) raw_queue_->AddRef();
+    }
+    ~KxSwapChainProxy() {
+        if (inner4_) { inner4_->Release(); inner4_ = nullptr; }
+        if (inner3_) { inner3_->Release(); inner3_ = nullptr; }
+        if (inner2_) { inner2_->Release(); inner2_ = nullptr; }
+        if (inner1_) { inner1_->Release(); inner1_ = nullptr; }
+        if (inner_) { inner_->Release(); inner_ = nullptr; }
+        if (raw_queue_) { raw_queue_->Release(); raw_queue_ = nullptr; }
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) ||
+            riid == __uuidof(IDXGIDeviceSubObject) || riid == __uuidof(IDXGISwapChain)) {
+            *ppv = static_cast<IDXGISwapChain*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == __uuidof(IDXGISwapChain1) && inner1_) { *ppv = static_cast<IDXGISwapChain1*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGISwapChain2) && inner2_) { *ppv = static_cast<IDXGISwapChain2*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGISwapChain3) && inner3_) { *ppv = static_cast<IDXGISwapChain3*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGISwapChain4) && inner4_) { *ppv = static_cast<IDXGISwapChain4*>(this); AddRef(); return S_OK; }
+        return inner_->QueryInterface(riid, ppv);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ref_.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG next = ref_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (next == 0) delete this;
+        return next;
+    }
+
+    // IDXGIObject
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID n, UINT s, const void* d) override { return inner_->SetPrivateData(n, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID n, const IUnknown* u) override { return inner_->SetPrivateDataInterface(n, u); }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID n, UINT* s, void* d) override { return inner_->GetPrivateData(n, s, d); }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID r, void** p) override { return inner_->GetParent(r, p); }
+    // IDXGIDeviceSubObject
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID r, void** p) override { return inner_->GetDevice(r, p); }
+    // IDXGISwapChain
+    HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
+        maybe_capture_backbuffer();
+        HRESULT hr = inner_->Present(sync, flags);
+        on_presented();
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetBuffer(UINT b, REFIID r, void** s) override { return inner_->GetBuffer(b, r, s); }
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL f, IDXGIOutput* t) override { return inner_->SetFullscreenState(f, t); }
+    HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* f, IDXGIOutput** t) override { return inner_->GetFullscreenState(f, t); }
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* d) override { return inner_->GetDesc(d); }
+    HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT bc, UINT w, UINT h, DXGI_FORMAT nf, UINT fl) override { return inner_->ResizeBuffers(bc, w, h, nf, fl); }
+    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* d) override { return inner_->ResizeTarget(d); }
+    HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput** o) override { return inner_->GetContainingOutput(o); }
+    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* s) override { return inner_->GetFrameStatistics(s); }
+    HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* c) override { return inner_->GetLastPresentCount(c); }
+    // IDXGISwapChain1
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* d) override { return inner1_->GetDesc1(d); }
+    HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* d) override { return inner1_->GetFullscreenDesc(d); }
+    HRESULT STDMETHODCALLTYPE GetHwnd(HWND* h) override { return inner1_->GetHwnd(h); }
+    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID r, void** u) override { return inner1_->GetCoreWindow(r, u); }
+    HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) override {
+        maybe_capture_backbuffer();
+        HRESULT hr = inner1_->Present1(sync, flags, p);
+        on_presented();
+        return hr;
+    }
+    BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return inner1_->IsTemporaryMonoSupported(); }
+    HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** o) override { return inner1_->GetRestrictToOutput(o); }
+    HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* c) override { return inner1_->SetBackgroundColor(c); }
+    HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA* c) override { return inner1_->GetBackgroundColor(c); }
+    HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION r) override { return inner1_->SetRotation(r); }
+    HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION* r) override { return inner1_->GetRotation(r); }
+    // IDXGISwapChain2
+    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT w, UINT h) override { return inner2_->SetSourceSize(w, h); }
+    HRESULT STDMETHODCALLTYPE GetSourceSize(UINT* w, UINT* h) override { return inner2_->GetSourceSize(w, h); }
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT l) override { return inner2_->SetMaximumFrameLatency(l); }
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* l) override { return inner2_->GetMaximumFrameLatency(l); }
+    HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override { return inner2_->GetFrameLatencyWaitableObject(); }
+    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F* m) override { return inner2_->SetMatrixTransform(m); }
+    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F* m) override { return inner2_->GetMatrixTransform(m); }
+    // IDXGISwapChain3
+    UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return inner3_->GetCurrentBackBufferIndex(); }
+    HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE c, UINT* s) override { return inner3_->CheckColorSpaceSupport(c, s); }
+    HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE c) override { return inner3_->SetColorSpace1(c); }
+    HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT bc, UINT w, UINT h, DXGI_FORMAT f, UINT fl, const UINT* nm, IUnknown* const* pq) override {
+        if (!pq || bc == 0) return inner3_->ResizeBuffers1(bc, w, h, f, fl, nm, pq);
+        std::vector<IUnknown*> unwrapped(bc, nullptr);
+        for (UINT i = 0; i < bc; ++i) unwrapped[i] = unwrap_d3d12_for_dxgi(pq[i], nullptr);
+        return inner3_->ResizeBuffers1(bc, w, h, f, fl, nm, unwrapped.data());
+    }
+    // IDXGISwapChain4
+    HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE t, UINT s, void* d) override { return inner4_->SetHDRMetaData(t, s, d); }
+
+private:
+    void maybe_capture_backbuffer() {
+        if (!raw_queue_ || g_capture_done.load(std::memory_order_relaxed)) return;
+        std::filesystem::path cap_path;
+        {
+            std::lock_guard lock(g_present_mtx);
+            cap_path = g_capture_path;
+        }
+        if (cap_path.empty()) return;
+        const uint32_t max_f = g_max_frames.load(std::memory_order_relaxed);
+        const uint64_t next_frame = g_presents.load(std::memory_order_relaxed) + 1;
+        const uint64_t target_frame = (max_f >= 2) ? max_f : 1u;
+        if (next_frame < target_frame) return;
+
+        const UINT idx = inner3_ ? inner3_->GetCurrentBackBufferIndex() : 0u;
+        ID3D12Resource* bb = nullptr;
+        ID3D12Device* dev = nullptr;
+        if (SUCCEEDED(inner_->GetBuffer(idx, IID_PPV_ARGS(&bb))) && bb) {
+            if (SUCCEEDED(raw_queue_->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
+                if (capture_d3d12_texture_bmp(dev, raw_queue_, bb, D3D12_RESOURCE_STATE_PRESENT, cap_path)) {
+                    g_capture_done.store(true, std::memory_order_relaxed);
+                }
+                dev->Release();
+            }
+            bb->Release();
+        }
+    }
+
+    void on_presented() {
+        const uint64_t n = g_presents.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint32_t max_f = g_max_frames.load(std::memory_order_relaxed);
+        if (max_f > 0 && n >= max_f) {
+            HWND target = hwnd_;
+            if (!target && inner1_) (void)inner1_->GetHwnd(&target);
+            if (target) PostMessageW(target, WM_CLOSE, 0, 0);
+            else PostQuitMessage(0);
+        }
+    }
+
+    std::atomic<ULONG> ref_{1};
+    IDXGISwapChain* inner_ = nullptr;
+    IDXGISwapChain1* inner1_ = nullptr;
+    IDXGISwapChain2* inner2_ = nullptr;
+    IDXGISwapChain3* inner3_ = nullptr;
+    IDXGISwapChain4* inner4_ = nullptr;
+    ID3D12CommandQueue* raw_queue_ = nullptr;
+    HWND hwnd_ = nullptr;
+};
+
+class KxDxgiFactoryProxy final : public IDXGIFactory6 {
+public:
+    explicit KxDxgiFactoryProxy(IDXGIFactory* inner) : inner_(inner) {
+        if (inner_) {
+            inner_->AddRef();
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner1_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner2_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner3_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner4_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner5_));
+            (void)inner_->QueryInterface(IID_PPV_ARGS(&inner6_));
+        }
+    }
+    ~KxDxgiFactoryProxy() {
+        if (inner6_) { inner6_->Release(); inner6_ = nullptr; }
+        if (inner5_) { inner5_->Release(); inner5_ = nullptr; }
+        if (inner4_) { inner4_->Release(); inner4_ = nullptr; }
+        if (inner3_) { inner3_->Release(); inner3_ = nullptr; }
+        if (inner2_) { inner2_->Release(); inner2_ = nullptr; }
+        if (inner1_) { inner1_->Release(); inner1_ = nullptr; }
+        if (inner_) { inner_->Release(); inner_ = nullptr; }
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIFactory)) {
+            *ppv = static_cast<IDXGIFactory*>(this); AddRef(); return S_OK;
+        }
+        if (riid == __uuidof(IDXGIFactory1) && inner1_) { *ppv = static_cast<IDXGIFactory1*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGIFactory2) && inner2_) { *ppv = static_cast<IDXGIFactory2*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGIFactory3) && inner3_) { *ppv = static_cast<IDXGIFactory3*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGIFactory4) && inner4_) { *ppv = static_cast<IDXGIFactory4*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGIFactory5) && inner5_) { *ppv = static_cast<IDXGIFactory5*>(this); AddRef(); return S_OK; }
+        if (riid == __uuidof(IDXGIFactory6) && inner6_) { *ppv = static_cast<IDXGIFactory6*>(this); AddRef(); return S_OK; }
+        return inner_->QueryInterface(riid, ppv);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ref_.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG next = ref_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (next == 0) delete this;
+        return next;
+    }
+
+    // IDXGIObject
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID n, UINT s, const void* d) override { return inner_->SetPrivateData(n, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID n, const IUnknown* u) override { return inner_->SetPrivateDataInterface(n, u); }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID n, UINT* s, void* d) override { return inner_->GetPrivateData(n, s, d); }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID r, void** p) override { return inner_->GetParent(r, p); }
+    // IDXGIFactory
+    HRESULT STDMETHODCALLTYPE EnumAdapters(UINT a, IDXGIAdapter** o) override { return inner_->EnumAdapters(a, o); }
+    HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND h, UINT f) override { return inner_->MakeWindowAssociation(h, f); }
+    HRESULT STDMETHODCALLTYPE GetWindowAssociation(HWND* h) override { return inner_->GetWindowAssociation(h); }
+    HRESULT STDMETHODCALLTYPE CreateSwapChain(IUnknown* pDev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out) override {
+        ID3D12CommandQueue* raw_q = nullptr;
+        IUnknown* raw_dev = unwrap_d3d12_for_dxgi(pDev, &raw_q);
+        IDXGISwapChain* raw_sc = nullptr;
+        HRESULT hr = inner_->CreateSwapChain(raw_dev, d, &raw_sc);
+        if (SUCCEEDED(hr) && raw_sc && out) {
+            auto* proxy = new KxSwapChainProxy(raw_sc, raw_q, d ? d->OutputWindow : nullptr);
+            raw_sc->Release();
+            *out = static_cast<IDXGISwapChain*>(proxy);
+        } else if (out) {
+            *out = raw_sc;
+        }
+        if (raw_q) raw_q->Release();
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE CreateSoftwareAdapter(HMODULE m, IDXGIAdapter** o) override { return inner_->CreateSoftwareAdapter(m, o); }
+    // IDXGIFactory1
+    HRESULT STDMETHODCALLTYPE EnumAdapters1(UINT a, IDXGIAdapter1** o) override { return inner1_->EnumAdapters1(a, o); }
+    BOOL STDMETHODCALLTYPE IsCurrent() override { return inner1_->IsCurrent(); }
+    // IDXGIFactory2
+    BOOL STDMETHODCALLTYPE IsWindowedStereoEnabled() override { return inner2_->IsWindowedStereoEnabled(); }
+    HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* pDev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fd, IDXGIOutput* ro, IDXGISwapChain1** out) override {
+        ID3D12CommandQueue* raw_q = nullptr;
+        IUnknown* raw_dev = unwrap_d3d12_for_dxgi(pDev, &raw_q);
+        IDXGISwapChain1* raw_sc = nullptr;
+        HRESULT hr = inner2_->CreateSwapChainForHwnd(raw_dev, hwnd, d, fd, ro, &raw_sc);
+        if (SUCCEEDED(hr) && raw_sc && out) {
+            auto* proxy = new KxSwapChainProxy(raw_sc, raw_q, hwnd);
+            raw_sc->Release();
+            *out = static_cast<IDXGISwapChain1*>(proxy);
+        } else if (out) {
+            *out = raw_sc;
+        }
+        if (raw_q) raw_q->Release();
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(IUnknown* pDev, IUnknown* w, const DXGI_SWAP_CHAIN_DESC1* d, IDXGIOutput* ro, IDXGISwapChain1** out) override {
+        ID3D12CommandQueue* raw_q = nullptr;
+        IUnknown* raw_dev = unwrap_d3d12_for_dxgi(pDev, &raw_q);
+        IDXGISwapChain1* raw_sc = nullptr;
+        HRESULT hr = inner2_->CreateSwapChainForCoreWindow(raw_dev, w, d, ro, &raw_sc);
+        if (SUCCEEDED(hr) && raw_sc && out) {
+            auto* proxy = new KxSwapChainProxy(raw_sc, raw_q, nullptr);
+            raw_sc->Release();
+            *out = static_cast<IDXGISwapChain1*>(proxy);
+        } else if (out) {
+            *out = raw_sc;
+        }
+        if (raw_q) raw_q->Release();
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE h, LUID* l) override { return inner2_->GetSharedResourceAdapterLuid(h, l); }
+    HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND h, UINT m, DWORD* c) override { return inner2_->RegisterStereoStatusWindow(h, m, c); }
+    HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE h, DWORD* c) override { return inner2_->RegisterStereoStatusEvent(h, c); }
+    void STDMETHODCALLTYPE UnregisterStereoStatus(DWORD c) override { inner2_->UnregisterStereoStatus(c); }
+    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(HWND h, UINT m, DWORD* c) override { return inner2_->RegisterOcclusionStatusWindow(h, m, c); }
+    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusEvent(HANDLE h, DWORD* c) override { return inner2_->RegisterOcclusionStatusEvent(h, c); }
+    void STDMETHODCALLTYPE UnregisterOcclusionStatus(DWORD c) override { inner2_->UnregisterOcclusionStatus(c); }
+    HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(IUnknown* pDev, const DXGI_SWAP_CHAIN_DESC1* d, IDXGIOutput* ro, IDXGISwapChain1** out) override {
+        ID3D12CommandQueue* raw_q = nullptr;
+        IUnknown* raw_dev = unwrap_d3d12_for_dxgi(pDev, &raw_q);
+        IDXGISwapChain1* raw_sc = nullptr;
+        HRESULT hr = inner2_->CreateSwapChainForComposition(raw_dev, d, ro, &raw_sc);
+        if (SUCCEEDED(hr) && raw_sc && out) {
+            auto* proxy = new KxSwapChainProxy(raw_sc, raw_q, nullptr);
+            raw_sc->Release();
+            *out = static_cast<IDXGISwapChain1*>(proxy);
+        } else if (out) {
+            *out = raw_sc;
+        }
+        if (raw_q) raw_q->Release();
+        return hr;
+    }
+    // IDXGIFactory3
+    UINT STDMETHODCALLTYPE GetCreationFlags() override { return inner3_->GetCreationFlags(); }
+    // IDXGIFactory4
+    HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID l, REFIID r, void** o) override { return inner4_->EnumAdapterByLuid(l, r, o); }
+    HRESULT STDMETHODCALLTYPE EnumWarpAdapter(REFIID r, void** o) override { return inner4_->EnumWarpAdapter(r, o); }
+    // IDXGIFactory5
+    HRESULT STDMETHODCALLTYPE CheckFeatureSupport(DXGI_FEATURE f, void* d, UINT s) override { return inner5_->CheckFeatureSupport(f, d, s); }
+    // IDXGIFactory6
+    HRESULT STDMETHODCALLTYPE EnumAdapterByGpuPreference(UINT a, DXGI_GPU_PREFERENCE p, REFIID r, void** o) override { return inner6_->EnumAdapterByGpuPreference(a, p, r, o); }
+
+private:
+    std::atomic<ULONG> ref_{1};
+    IDXGIFactory* inner_ = nullptr;
+    IDXGIFactory1* inner1_ = nullptr;
+    IDXGIFactory2* inner2_ = nullptr;
+    IDXGIFactory3* inner3_ = nullptr;
+    IDXGIFactory4* inner4_ = nullptr;
+    IDXGIFactory5* inner5_ = nullptr;
+    IDXGIFactory6* inner6_ = nullptr;
+};
+
+HRESULT __stdcall kx_CreateDXGIFactory(REFIID riid, void** ppFactory) {
+    if (!ppFactory) return E_POINTER;
+    *ppFactory = nullptr;
+    IDXGIFactory* raw = nullptr;
+    HRESULT hr = CreateDXGIFactory(IID_PPV_ARGS(&raw));
+    if (FAILED(hr)) return hr;
+    auto* proxy = new KxDxgiFactoryProxy(raw);
+    raw->Release();
+    hr = proxy->QueryInterface(riid, ppFactory);
+    proxy->Release();
+    return hr;
+}
+
+HRESULT __stdcall kx_CreateDXGIFactory1(REFIID riid, void** ppFactory) {
+    if (!ppFactory) return E_POINTER;
+    *ppFactory = nullptr;
+    IDXGIFactory1* raw = nullptr;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&raw));
+    if (FAILED(hr)) return hr;
+    auto* proxy = new KxDxgiFactoryProxy(raw);
+    raw->Release();
+    hr = proxy->QueryInterface(riid, ppFactory);
+    proxy->Release();
+    return hr;
+}
+
+HRESULT __stdcall kx_CreateDXGIFactory2(UINT flags, REFIID riid, void** ppFactory) {
+    if (!ppFactory) return E_POINTER;
+    *ppFactory = nullptr;
+    IDXGIFactory2* raw = nullptr;
+    HRESULT hr = CreateDXGIFactory2(flags, IID_PPV_ARGS(&raw));
+    if (FAILED(hr)) return hr;
+    auto* proxy = new KxDxgiFactoryProxy(raw);
+    raw->Release();
+    hr = proxy->QueryInterface(riid, ppFactory);
+    proxy->Release();
+    return hr;
+}
+
+}  // namespace
+
 void register_d3d12x(Registry& reg) {
     reg.register_module("d3d12_xs.dll");
     reg.register_module("d3d12_x.dll");
-    reg.register_module("d3d12.dll");
-    reg.register_module("d3d12core.dll");
+    reg.register_module("d3d12.dll", true);
+    reg.register_module("d3d12core.dll", true);
     for (const char* mod : {"d3d12_xs.dll", "d3d12_x.dll", "d3d12.dll", "d3d12core.dll"}) {
         reg.register_export(mod, "D3D12CreateDevice", reinterpret_cast<void*>(&kx_D3D12CreateDevice));
+        reg.register_ordinal(mod, 101, "D3D12CreateDevice", reinterpret_cast<void*>(&kx_D3D12CreateDevice));
         reg.register_export(mod, "D3D12XboxCreateDevice", reinterpret_cast<void*>(&kx_D3D12XboxCreateDevice));
         reg.register_export(mod, "D3D12ZeroMemoryX", reinterpret_cast<void*>(&kx_D3D12ZeroMemoryX));
         reg.register_export(mod, "D3D12SerializeRootSignature", reinterpret_cast<void*>(&kx_D3D12SerializeRootSignature));
+        reg.register_ordinal(mod, 115, "D3D12SerializeRootSignature", reinterpret_cast<void*>(&kx_D3D12SerializeRootSignature));
         reg.register_export(mod, "D3D12PresentX", reinterpret_cast<void*>(&kx_D3D12PresentX));
         reg.register_export(mod, "D3D12WaitFrameEventX", reinterpret_cast<void*>(&kx_D3D12WaitFrameEventX));
         reg.register_export(mod, "D3D12GetInterface", reinterpret_cast<void*>(&kx_D3D12GetInterface));
+        reg.register_ordinal(mod, 110, "D3D12GetInterface", reinterpret_cast<void*>(&kx_D3D12GetInterface));
     }
+    reg.register_module("dxgi.dll", true);
+    reg.register_export("dxgi.dll", "CreateDXGIFactory", reinterpret_cast<void*>(&kx_CreateDXGIFactory));
+    reg.register_ordinal("dxgi.dll", 10, "CreateDXGIFactory", reinterpret_cast<void*>(&kx_CreateDXGIFactory));
+    reg.register_export("dxgi.dll", "CreateDXGIFactory1", reinterpret_cast<void*>(&kx_CreateDXGIFactory1));
+    reg.register_ordinal("dxgi.dll", 11, "CreateDXGIFactory1", reinterpret_cast<void*>(&kx_CreateDXGIFactory1));
+    reg.register_export("dxgi.dll", "CreateDXGIFactory2", reinterpret_cast<void*>(&kx_CreateDXGIFactory2));
+    reg.register_ordinal("dxgi.dll", 12, "CreateDXGIFactory2", reinterpret_cast<void*>(&kx_CreateDXGIFactory2));
 }
 
 void record_work_graph_created() {
@@ -1067,6 +1470,8 @@ void reset_d3d12x_stats() {
         g_window_host.reset();
         g_windowed = false;
         g_capture_path.clear();
+        g_capture_done.store(false, std::memory_order_relaxed);
+        g_max_frames.store(0, std::memory_order_relaxed);
         g_pacing_cfg = {};
         g_headless_pacer.reset();
         g_headless_pacer.configure(g_pacing_cfg);

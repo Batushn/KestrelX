@@ -238,7 +238,8 @@ Result<PeProbeReport> run_pe_probe(
         }
 
         HMODULE host_probe = nullptr;
-        if (!mp.hle_registered && !guest_img) {
+        const bool host_fb = hle.allows_host_fallback(redir_lower);
+        if ((!mp.hle_registered && !guest_img) || (mp.hle_registered && host_fb && redir_lower != "kernelx.dll")) {
             host_probe = LoadLibraryExA(mp.redirected_name.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
             mp.host_dll_found = (host_probe != nullptr);
         } else if (redir_lower == "kernelx.dll") {

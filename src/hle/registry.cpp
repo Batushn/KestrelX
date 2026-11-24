@@ -19,9 +19,44 @@ Registry::~Registry() {
     thunk_capacity_ = 0;
 }
 
-void Registry::register_module(std::string_view dll_name) {
+void Registry::register_module(std::string_view dll_name, bool allow_host_fallback) {
     std::lock_guard lock(mutex_);
-    named_[to_lower_ascii(dll_name)];
+    const auto key = to_lower_ascii(dll_name);
+    named_[key];
+    if (allow_host_fallback) {
+        host_fallback_[key] = true;
+    }
+}
+
+void Registry::register_host_overlay(std::string_view dll_name, std::string_view symbol, void* fn) {
+    std::lock_guard lock(mutex_);
+    host_overlays_[to_lower_ascii(dll_name)][std::string(symbol)] = fn;
+}
+
+void* Registry::resolve_host_overlay(std::string_view dll_name, std::string_view symbol) const {
+    std::lock_guard lock(mutex_);
+    const std::string key = to_lower_ascii(dll_name);
+    const std::string sym(symbol);
+    if (auto mit = host_overlays_.find(key); mit != host_overlays_.end()) {
+        if (auto sit = mit->second.find(sym); sit != mit->second.end()) {
+            return sit->second;
+        }
+    }
+    // Map Windows API-set forwarding DLLs to their canonical overlay buckets.
+    if (key.starts_with("api-ms-win-core-") || key == "kernelbase.dll") {
+        if (auto mit = host_overlays_.find("kernel32.dll"); mit != host_overlays_.end()) {
+            if (auto sit = mit->second.find(sym); sit != mit->second.end()) {
+                return sit->second;
+            }
+        }
+    } else if (key.starts_with("api-ms-win-crt-")) {
+        if (auto mit = host_overlays_.find("ucrtbase.dll"); mit != host_overlays_.end()) {
+            if (auto sit = mit->second.find(sym); sit != mit->second.end()) {
+                return sit->second;
+            }
+        }
+    }
+    return nullptr;
 }
 
 void Registry::register_export(std::string_view dll_name, std::string_view symbol, void* fn) {
@@ -40,6 +75,13 @@ bool Registry::has_module(std::string_view dll_name) const {
     std::lock_guard lock(mutex_);
     const auto key = to_lower_ascii(dll_name);
     return named_.contains(key) || ordinals_.contains(key);
+}
+
+bool Registry::allows_host_fallback(std::string_view dll_name) const {
+    std::lock_guard lock(mutex_);
+    const auto key = to_lower_ascii(dll_name);
+    auto it = host_fallback_.find(key);
+    return it != host_fallback_.end() && it->second;
 }
 
 void* Registry::resolve_name(std::string_view dll_name, std::string_view symbol) const {

@@ -198,7 +198,7 @@ BOOL __stdcall kx_ReadFileEx(
 void set_kernelx_vfs(vfs::OverlayVfs* vfs) { g_vfs = vfs; }
 
 void register_kernelx(Registry& reg) {
-    reg.register_module("kernelx.dll");
+    reg.register_module("kernelx.dll", true);
     reg.register_module("xmem.dll");
     reg.register_export("kernelx.dll", "XMemAlloc", reinterpret_cast<void*>(&kx_XMemAlloc));
     reg.register_export("kernelx.dll", "XMemFree", reinterpret_cast<void*>(&kx_XMemFree));

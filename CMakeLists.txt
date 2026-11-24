@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+﻿cmake_minimum_required(VERSION 3.24)
 project(KestrelX VERSION 0.10.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -57,8 +57,16 @@ add_library(kestrel_core STATIC
 target_include_directories(kestrel_core PUBLIC include)
 target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32 user32 gdi32 cabinet bcrypt)
 
+# Minimal dependency-free ntdll static TLS slot provider for real MSVC CRT guest binaries
+add_library(kestrel_tls_slot SHARED src/loader/tls_slot_dll.cpp)
+target_link_options(kestrel_tls_slot PRIVATE /DYNAMICBASE)
+set_target_properties(kestrel_tls_slot PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
 add_executable(kestrel src/cli/main.cpp)
 target_link_libraries(kestrel PRIVATE kestrel_core)
+add_dependencies(kestrel kestrel_tls_slot)
 
 # Synthetic console import libraries so our clean-room test title links against
 # console DLL names (kernelx.dll, xgameruntime.dll, d3d12_xs.dll, gameinput.dll,
@@ -123,12 +131,20 @@ add_custom_command(TARGET kestrel_test_title POST_BUILD
         "${CMAKE_BINARY_DIR}/test_title/data/readonly.txt"
 )
 
+# Standard full-CRT Win32 + D3D12 + DXGI + Static TLS test executable (no /NODEFAULTLIB, no custom /ENTRY)
+add_executable(kestrel_crt_d3d12_title WIN32 tests/crt_d3d12_title/main.cpp)
+target_link_libraries(kestrel_crt_d3d12_title PRIVATE d3d12 dxgi user32 gdi32 kernel32)
+set_target_properties(kestrel_crt_d3d12_title PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/crt_d3d12_title"
+)
+
 enable_testing()
 add_executable(kestrel_tests tests/test_runner.cpp)
 target_link_libraries(kestrel_tests PRIVATE kestrel_core)
-add_dependencies(kestrel_tests kestrel_test_title)
+add_dependencies(kestrel_tests kestrel_test_title kestrel_crt_d3d12_title kestrel_tls_slot)
 target_compile_definitions(kestrel_tests PRIVATE
     KESTREL_TEST_TITLE_DIR="${CMAKE_BINARY_DIR}/test_title"
+    KESTREL_CRT_D3D12_TITLE_DIR="${CMAKE_BINARY_DIR}/crt_d3d12_title"
     KESTREL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 add_test(NAME kestrel_unit_and_gpu_tests COMMAND kestrel_tests)

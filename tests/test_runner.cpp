@@ -8700,6 +8700,110 @@ void test_external_amd_rga_gfx1030_dual_gpu() {
         hw_adapters, total_dispatches, bit_exact_kernels);
 }
 
+
+void test_full_crt_win32_exe_static_tls_identity_and_exit_isolation() {
+    const std::filesystem::path exe_path =
+        std::filesystem::path(KESTREL_CRT_D3D12_TITLE_DIR) / "kestrel_crt_d3d12_title.exe";
+    KX_CHECK(std::filesystem::is_regular_file(exe_path), "kestrel_crt_d3d12_title.exe must exist");
+
+    hle::Registry reg;
+    hle::register_kernelx(reg);
+    hle::register_xgameruntime(reg);
+    hle::register_d3d12x(reg);
+    loader::register_guest_process_overlays(reg);
+
+    // 1. Audit with pe-probe: must resolve 100% of imports cleanly (0 missing stubs)
+    auto probe = loader::run_pe_probe(exe_path, reg);
+    KX_CHECK(probe.has_value(), "run_pe_probe on full-CRT Win32 EXE must succeed");
+    KX_CHECK(probe->has_tls, "full-CRT Win32 EXE must contain a .tls directory");
+    KX_CHECK(probe->missing_imports == 0, "full-CRT Win32 EXE must have 0 missing imports");
+    KX_CHECK(probe->total_imports >= 10, "full-CRT Win32 EXE must import Win32/CRT/D3D12 symbols");
+
+    // 2. Load & run full-CRT Win32 EXE in --mode=tls (Static TLS + worker thread TLS +
+    //    GetModuleHandle/FileName/CommandLine + dynamic LoadLibrary/GetProcAddress/#101 + ExitProcess(77))
+    loader::PeLoader pe_loader(reg, exe_path.parent_path());
+    auto mod = pe_loader.load_image(exe_path);
+    KX_CHECK(mod.has_value(), "PeLoader::load_image on full-CRT Win32 EXE must succeed");
+    KX_CHECK((*mod)->stub_imports == 0, "full-CRT Win32 EXE must have 0 stub imports");
+    KX_CHECK((*mod)->tls_slot != 0xFFFFFFFFu, "full-CRT Win32 EXE must receive an ntdll-managed static TLS slot");
+
+    loader::GuestRunOptions opts{};
+    opts.command_line_args = "--mode=tls";
+    opts.timeout_ms = 10000;
+    auto rc = pe_loader.execute_entry(**mod, opts);
+    KX_CHECK(rc.has_value(), "full-CRT Win32 EXE execution must succeed without crashing");
+    KX_CHECK(*rc == 77, "ExitProcess(77) must terminate guest cleanly and return 77 to host");
+}
+
+void test_full_crt_d3d12_swapchain_proxy_max_frames_and_capture_dual_gpu() {
+    const std::filesystem::path exe_path =
+        std::filesystem::path(KESTREL_CRT_D3D12_TITLE_DIR) / "kestrel_crt_d3d12_title.exe";
+    KX_CHECK(std::filesystem::is_regular_file(exe_path), "kestrel_crt_d3d12_title.exe must exist");
+
+    const auto tmp_dir = std::filesystem::temp_directory_path() / "kestrel_crt_d3d12_test";
+    std::filesystem::create_directories(tmp_dir);
+    const auto bmp_path = tmp_dir / "crt_d3d12_capture.bmp";
+    std::error_code ec;
+    std::filesystem::remove(bmp_path, ec);
+
+    hle::reset_d3d12x_stats();
+    hle::set_d3d12x_preferred_adapter(-1);
+    hle::set_d3d12x_max_frames(3);
+    hle::set_d3d12x_capture_path(bmp_path);
+
+    hle::Registry reg;
+    hle::register_kernelx(reg);
+    hle::register_xgameruntime(reg);
+    hle::register_d3d12x(reg);
+    loader::register_guest_process_overlays(reg);
+
+    loader::PeLoader pe_loader(reg, exe_path.parent_path());
+    auto mod = pe_loader.load_image(exe_path);
+    KX_CHECK(mod.has_value(), "PeLoader::load_image on full-CRT D3D12 EXE must succeed");
+    KX_CHECK((*mod)->stub_imports == 0, "full-CRT D3D12 EXE must have 0 stub imports");
+
+    loader::GuestRunOptions opts{};
+    opts.command_line_args = "--mode=d3d12";
+    opts.timeout_ms = 15000;
+    auto rc = pe_loader.execute_entry(**mod, opts);
+    KX_CHECK(rc.has_value(), "full-CRT D3D12 EXE must execute cleanly");
+    KX_CHECK(*rc == 0, "full-CRT D3D12 EXE must exit with code 0 after --max-frames 3");
+
+    const auto st = hle::d3d12x_stats();
+    KX_CHECK(st.devices_created >= 1, "KxDeviceProxy must record >= 1 device");
+    KX_CHECK(st.queues_created >= 1, "KxCommandQueueProxy must record >= 1 queue");
+    KX_CHECK(st.present_calls >= 3, "KxSwapChainProxy must record >= 3 presents");
+
+    // Verify captured 256x256 BMP exists and center pixel matches ClearRenderTargetView(0.10, 0.80, 0.30)
+    KX_CHECK(std::filesystem::is_regular_file(bmp_path), "backbuffer BMP capture must be written");
+    std::ifstream ifs(bmp_path, std::ios::binary);
+    KX_CHECK(ifs.good(), "backbuffer BMP must open cleanly");
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    KX_CHECK(bytes.size() >= 54u + 256u * 256u * 3u, "backbuffer BMP size must cover 256x256 RGB");
+    KX_CHECK(bytes[0] == 'B' && bytes[1] == 'M', "capture must have BM header");
+    int32_t w = 0, h = 0;
+    uint32_t px_off = 0;
+    std::memcpy(&px_off, bytes.data() + 10, 4);
+    std::memcpy(&w, bytes.data() + 18, 4);
+    std::memcpy(&h, bytes.data() + 22, 4);
+    KX_CHECK(w == 256 && std::abs(h) == 256, "captured BMP must be 256x256");
+    const size_t stride = (static_cast<size_t>(w) * 3u + 3u) & ~size_t{3};
+    const size_t center_off = px_off + 128u * stride + 128u * 3u;
+    KX_CHECK(center_off + 3u <= bytes.size(), "center pixel offset must be in bounds");
+    const int b = bytes[center_off + 0];
+    const int g = bytes[center_off + 1];
+    const int r = bytes[center_off + 2];
+    KX_CHECK(std::abs(r - 26) <= 4, "captured R channel must match 0.10 clear");
+    KX_CHECK(std::abs(g - 204) <= 4, "captured G channel must match 0.80 clear");
+    KX_CHECK(std::abs(b - 77) <= 4, "captured B channel must match 0.30 clear");
+    std::cout << std::format(
+        "    -> Full-CRT D3D12 EXE PASS: presents={}, BMP={}x{}, center RGB=({},{},{})\n",
+        st.present_calls, w, std::abs(h), r, g, b);
+
+    hle::reset_d3d12x_stats();
+    std::filesystem::remove_all(tmp_dir, ec);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -8784,6 +8888,8 @@ int main(int argc, char** argv) {
     run_test("PE32+ Compatibility Probe (HLE, Guest DLL, Host & Agility SDK Import Audit)", test_pe_probe_import_and_agility_audit);
     run_test("AMD GFX10.3 (RDNA2) ISA Spec Decoder Audit & Strict Refusal", test_gfx1030_isa_spec_decoder_audit);
     run_hw_test("External AMD RGA gfx1030 ELF64 Kernels (12 Real Kernels) on Dual-GPU Hardware", test_external_amd_rga_gfx1030_dual_gpu);
+    run_test("Full-CRT Win32 EXE Runtime (Static TLS, Worker Thread TLS, Process Identity, Dynamic LoadLibrary & ExitProcess Isolation)", test_full_crt_win32_exe_static_tls_identity_and_exit_isolation);
+    run_hw_test("Full-CRT Win32 + D3D12 + KxDxgiFactoryProxy/KxSwapChainProxy Render, --max-frames & BMP Capture", test_full_crt_d3d12_swapchain_proxy_max_frames_and_capture_dual_gpu);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

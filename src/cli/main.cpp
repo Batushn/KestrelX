@@ -46,7 +46,8 @@ void print_usage() {
         "  kestrel pe-probe <dir|pe> [--json <out.json>]\n"
         "                                    Audit PE32+ imports, Agility SDK, SEH/TLS & HLE resolution coverage\n"
         "  kestrel run <dir|exe> [--adapter N] [--data-dir <dir>] [--cache-dir <dir>]\n"
-        "                        [--windowed] [--fullscreen] [--hud] [--fps <N>] [--tearing] [--audio] [--capture <out.bmp>]\n"
+        "                        [--windowed] [--fullscreen] [--hud] [--fps <N>] [--tearing] [--audio]\n"
+        "                        [--capture <out.bmp>] [--max-frames <N>] [--guest-args <args>]\n"
         "                                    Load & execute an Xbox-ABI PE title with Overlay VFS & KxDeviceProxy\n";
 }
 
@@ -247,6 +248,7 @@ int cmd_pe_probe(const fs::path& target, const fs::path& json_out) {
     hle::register_d3d12x(registry);
     hle::register_gameinput(registry);
     hle::register_xaudio2(registry);
+    loader::register_guest_process_overlays(registry);
 
     auto res = loader::run_pe_probe(target, registry);
     if (!res) {
@@ -269,7 +271,7 @@ int cmd_pe_probe(const fs::path& target, const fs::path& json_out) {
 
 int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
             const fs::path& cache_dir, bool windowed, bool audio, const fs::path& capture_path,
-            const hle::FramePacingConfig& pacing) {
+            const hle::FramePacingConfig& pacing, uint32_t max_frames, const std::string& guest_args) {
     fs::path game_root = fs::is_directory(target) ? target : target.parent_path();
     fs::path exe_path = target;
     uint32_t title_id = 0x4B580001u;
@@ -307,6 +309,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
     hle::set_d3d12x_windowed(windowed, 512, 512);
     hle::set_d3d12x_frame_pacing(pacing);
     hle::set_d3d12x_capture_path(capture_path);
+    hle::set_d3d12x_max_frames(max_frames);
     if (!cache_dir.empty()) hle::set_d3d12x_shader_cache_dir(cache_dir);
     hle::set_xaudio2_wasapi_enabled(audio);
     hle::register_kernelx(registry);
@@ -315,6 +318,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
     hle::register_d3d12x(registry);
     hle::register_gameinput(registry);
     hle::register_xaudio2(registry);
+    loader::register_guest_process_overlays(registry);
 
     cpu::ScopedVehShim veh;
     loader::PeLoader pe_loader(registry, game_root);
@@ -333,7 +337,9 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
         (*mod)->relocs_applied, (*mod)->hle_imports, (*mod)->guest_imports,
         (*mod)->host_imports, (*mod)->stub_imports);
 
-    auto rc = pe_loader.execute_entry(**mod);
+    loader::GuestRunOptions run_opts{};
+    run_opts.command_line_args = guest_args;
+    auto rc = pe_loader.execute_entry(**mod, run_opts);
     hle::shutdown_xaudio2_wasapi();
     hle::shutdown_d3d12x_window();
     if (!rc) {
@@ -376,6 +382,8 @@ int main(int argc, char** argv) {
     bool windowed = false;
     bool audio = false;
     fs::path capture_path;
+    uint32_t max_frames = 0;
+    std::string guest_args;
     fs::path json_out;
     gpu::WaveMode wave_mode = gpu::WaveMode::Wave32;
     bool compile_dxil = true;
@@ -394,6 +402,8 @@ int main(int argc, char** argv) {
         else if (arg == "--fps" && i + 1 < argc) pacing.target_fps = std::stod(argv[++i]);
         else if (arg == "--audio") audio = true;
         else if (arg == "--capture" && i + 1 < argc) capture_path = argv[++i];
+        else if (arg == "--max-frames" && i + 1 < argc) max_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else if (arg == "--guest-args" && i + 1 < argc) guest_args = argv[++i];
         else if (arg == "--json" && i + 1 < argc) json_out = argv[++i];
         else if (arg == "--no-dxc") compile_dxil = false;
         else if (arg == "--limit" && i + 1 < argc) limit = static_cast<size_t>(std::stoull(argv[++i]));
@@ -406,7 +416,7 @@ int main(int argc, char** argv) {
     if (cmd == "selftest") return cmd_selftest(adapter);
     if (cmd == "shader-census" && argc >= 3) return cmd_shader_census(argv[2], wave_mode, compile_dxil, limit, json_out);
     if (cmd == "pe-probe" && argc >= 3) return cmd_pe_probe(argv[2], json_out);
-    if (cmd == "run" && argc >= 3) return cmd_run(argv[2], adapter, data_dir, cache_dir, windowed, audio, capture_path, pacing);
+    if (cmd == "run" && argc >= 3) return cmd_run(argv[2], adapter, data_dir, cache_dir, windowed, audio, capture_path, pacing, max_frames, guest_args);
 
     print_usage();
     return 1;

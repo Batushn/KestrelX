@@ -6363,6 +6363,165 @@ void test_overlay_vfs_drive_prefixes_and_kernelx_sandbox() {
     fs::remove_all(tmp, ec);
 }
 
+
+void test_dstorage_gdeflate_gpu_buffer_streaming() {
+    hle::reset_dstorage_stats();
+
+    // 1. Prepare raw RFC 1951 Deflate block (BFINAL=1, BTYPE=00)
+    const std::string original_text = "KESTRELX_GDEFLATE_V080_GPU_STREAMING_VERIFIED_PAYLOAD_CHUNK_12345";
+    const uint16_t len = static_cast<uint16_t>(original_text.size());
+    const uint16_t nlen = static_cast<uint16_t>(~len);
+    std::vector<uint8_t> compressed;
+    compressed.push_back(0x01); // BFINAL=1, BTYPE=00
+    compressed.push_back(static_cast<uint8_t>(len & 0xFF));
+    compressed.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+    compressed.push_back(static_cast<uint8_t>(nlen & 0xFF));
+    compressed.push_back(static_cast<uint8_t>((nlen >> 8) & 0xFF));
+    compressed.insert(compressed.end(), original_text.begin(), original_text.end());
+
+    // 2. Direct utility verification: decompress_gdeflate
+    std::vector<uint8_t> out_unpacked(original_text.size() + 16, 0);
+    size_t actual_bytes = 0;
+    HRESULT hr_dec = hle::decompress_gdeflate(compressed.data(), compressed.size(),
+                                             out_unpacked.data(), out_unpacked.size(), actual_bytes);
+    KX_CHECK(SUCCEEDED(hr_dec) && actual_bytes == original_text.size(), "decompress_gdeflate succeeded");
+    KX_CHECK(std::memcmp(out_unpacked.data(), original_text.data(), original_text.size()) == 0,
+             "decompress_gdeflate unpacked payload matches original bit-exact");
+
+    // 3. Test DirectStorage 1.2 Queue streaming into mapped D3D12 upload buffer
+    hle::IKxDStorageFactory* factory = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_DStorageGetFactory(IID_IUnknown, reinterpret_cast<void**>(&factory))) && factory,
+             "DStorageGetFactory");
+
+    hle::KxDStorageQueueDesc qdesc{};
+    qdesc.source_type = 1; // Memory
+    qdesc.capacity = 32;
+    hle::IKxDStorageQueue* queue = nullptr;
+    KX_CHECK(SUCCEEDED(factory->CreateQueue(&qdesc, IID_IUnknown, reinterpret_cast<void**>(&queue))) && queue,
+             "CreateQueue");
+
+    // Create D3D12 device and upload buffer for destination
+    auto adapters = gpu::enumerate_d3d12_adapters();
+    if (adapters && !adapters->empty()) {
+        ID3D12Device* dev = nullptr;
+        if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))) && dev) {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = 256;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* gpu_buf = nullptr;
+            if (SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                      IID_PPV_ARGS(&gpu_buf))) && gpu_buf) {
+                ID3D12Fence* fence = nullptr;
+                dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+
+                hle::KxDStorageRequest req{};
+                req.source_buffer = compressed.data();
+                req.source_size = static_cast<uint32_t>(compressed.size());
+                req.compression_format = hle::DStorageCompressionFormat::GDeflate;
+                req.uncompressed_size = static_cast<uint32_t>(original_text.size());
+                req.destination_type = hle::DStorageRequestDestinationType::Buffer;
+                req.destination_resource = gpu_buf;
+                req.destination_resource_offset = 16;
+                req.destination_size = static_cast<uint32_t>(original_text.size());
+
+                queue->EnqueueRequest(&req);
+                if (fence) queue->EnqueueSignal(fence, 100);
+                queue->Submit();
+
+                if (fence) {
+                    KX_CHECK(fence->GetCompletedValue() == 100, "DStorage fence signaled on completion");
+                    fence->Release();
+                }
+
+                // Verify buffer payload
+                D3D12_RANGE read_range{16, 16 + original_text.size()};
+                void* mapped = nullptr;
+                if (SUCCEEDED(gpu_buf->Map(0, &read_range, &mapped)) && mapped) {
+                    const char* text_in_buf = reinterpret_cast<const char*>(static_cast<const uint8_t*>(mapped) + 16);
+                    KX_CHECK(std::string_view(text_in_buf, original_text.size()) == original_text,
+                             "GPU buffer received GDeflate decompressed payload bit-exact");
+                    gpu_buf->Unmap(0, nullptr);
+                }
+
+                gpu_buf->Release();
+            }
+            dev->Release();
+        }
+    }
+
+    queue->Release();
+    factory->Release();
+
+    const auto st = hle::dstorage_stats();
+    KX_CHECK(st.gdeflate_requests >= 1, "GDeflate decompression requests counted");
+    KX_CHECK(st.gdeflate_decompressed_bytes >= original_text.size(), "GDeflate decompressed bytes counted");
+}
+
+void test_d3d12x_commandlist7_enhanced_barriers() {
+    hle::reset_d3d12x_stats();
+
+    ID3D12Device* raw_dev = nullptr;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&raw_dev))) || !raw_dev) {
+        return;
+    }
+    auto* dev_proxy = new hle::KxDeviceProxy(raw_dev);
+    raw_dev->Release();
+    ID3D12Device* dev = dev_proxy;
+
+    ID3D12CommandAllocator* alloc = nullptr;
+    KX_CHECK(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))),
+             "CreateCommandAllocator via KxDeviceProxy");
+
+    ID3D12GraphicsCommandList* cmd = nullptr;
+    KX_CHECK(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd))),
+             "CreateCommandList via KxDeviceProxy");
+
+    // Query ID3D12GraphicsCommandList6 and ID3D12GraphicsCommandList7
+    ID3D12GraphicsCommandList6* cmd6 = nullptr;
+    ID3D12GraphicsCommandList7* cmd7 = nullptr;
+    HRESULT hr6 = cmd->QueryInterface(IID_PPV_ARGS(&cmd6));
+    HRESULT hr7 = cmd->QueryInterface(IID_PPV_ARGS(&cmd7));
+    KX_CHECK(SUCCEEDED(hr6) && cmd6 != nullptr, "KxGraphicsCommandListProxy QI ID3D12GraphicsCommandList6");
+    KX_CHECK(SUCCEEDED(hr7) && cmd7 != nullptr, "KxGraphicsCommandListProxy QI ID3D12GraphicsCommandList7");
+
+    if (cmd6) {
+        cmd6->DispatchMesh(1, 1, 1);
+        cmd6->Release();
+    }
+
+    if (cmd7) {
+        D3D12_GLOBAL_BARRIER gb{};
+        gb.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+        gb.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+        gb.AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
+        gb.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+        D3D12_BARRIER_GROUP bg{};
+        bg.Type = D3D12_BARRIER_TYPE_GLOBAL;
+        bg.NumBarriers = 1;
+        bg.pGlobalBarriers = &gb;
+        cmd7->Barrier(1, &bg);
+        cmd7->Release();
+    }
+
+    cmd->Close();
+    cmd->Release();
+    alloc->Release();
+    dev->Release();
+
+    const auto stats = hle::d3d12x_stats();
+    KX_CHECK(stats.dispatch_mesh_calls >= 1, "KxGraphicsCommandListProxy telemetry: dispatch_mesh_calls counted");
+    KX_CHECK(stats.enhanced_barrier_calls >= 1, "KxGraphicsCommandListProxy telemetry: enhanced_barrier_calls counted");
+    KX_CHECK(stats.enhanced_barrier_groups >= 1, "KxGraphicsCommandListProxy telemetry: enhanced_barrier_groups counted");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6408,6 +6567,8 @@ int main(int argc, char** argv) {
     run_test("RDNA2 Multi-Texture & Multi-Buffer Dynamic Descriptor Remapping", test_rdna2_multi_texture_multi_buffer_descriptor_remapping);
     run_hw_test("RDNA2 Depth-Buffered 3D Lit & Textured Perspective Cube on Dual-GPU Hardware", test_rdna2_depth_buffered_3d_cube_dual_gpu);
     run_test("GDK XUser/XStore/XPackage & DirectStorage VFS Async Bridge", test_gdk_runtime_and_directstorage_bridge);
+    run_test("DirectStorage 1.2 GDeflate Decompression & GPU Buffer Streaming", test_dstorage_gdeflate_gpu_buffer_streaming);
+    run_test("D3D12.X ID3D12GraphicsCommandList6/7 Enhanced Barriers & DispatchMesh Proxy", test_d3d12x_commandlist7_enhanced_barriers);
     run_hw_test("RDNA2 2D/3D Compute Workgroup Tiling & LDS Spatial Exchange on Dual-GPU Hardware", test_rdna2_compute_2d_workgroup_tiling_dual_gpu);
     run_hw_test("RDNA2 PBR Material Deferred GBuffer (Albedo, Normal, Material) MRT Pipeline on Dual-GPU Hardware", test_rdna2_pbr_deferred_mrt_pipeline_dual_gpu);
     run_test("D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization", test_d3d12x_async_compute_queue_fence_sync);

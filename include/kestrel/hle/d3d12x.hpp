@@ -33,11 +33,14 @@ struct D3D12XStats {
     uint64_t vrs_image_binds = 0;
     uint64_t work_graphs_created = 0;
     uint64_t work_graph_dispatches = 0;
+    uint64_t dispatch_mesh_calls = 0;
+    uint64_t enhanced_barrier_calls = 0;
+    uint64_t enhanced_barrier_groups = 0;
 };
 
 // Pure COM wrapper around ID3D12GraphicsCommandList..ID3D12GraphicsCommandList5
 // for draw/dispatch/barrier/VRS Tier 2 telemetry.
-class KxGraphicsCommandListProxy final : public ID3D12GraphicsCommandList5 {
+class KxGraphicsCommandListProxy final : public ID3D12GraphicsCommandList7 {
 public:
     explicit KxGraphicsCommandListProxy(ID3D12GraphicsCommandList* inner);
     ~KxGraphicsCommandListProxy();
@@ -136,6 +139,12 @@ public:
     void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE baseShadingRate, const D3D12_SHADING_RATE_COMBINER* combiners) override;
     void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* shadingRateImage) override;
 
+    // ID3D12GraphicsCommandList6 (Mesh & Amplification Shaders)
+    void STDMETHODCALLTYPE DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) override;
+
+    // ID3D12GraphicsCommandList7 (Enhanced Barriers)
+    void STDMETHODCALLTYPE Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP* pBarrierGroups) override;
+
 private:
     std::atomic<ULONG> ref_{1};
     ID3D12GraphicsCommandList* inner_ = nullptr;
@@ -144,6 +153,8 @@ private:
     ID3D12GraphicsCommandList3* inner3_ = nullptr;
     ID3D12GraphicsCommandList4* inner4_ = nullptr;
     ID3D12GraphicsCommandList5* inner5_ = nullptr;
+    ID3D12GraphicsCommandList6* inner6_ = nullptr;
+    ID3D12GraphicsCommandList7* inner7_ = nullptr;
 };
 
 // Pure COM wrapper around ID3D12CommandQueue (zero driver vtable patching).

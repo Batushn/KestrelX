@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0-2ea44f?style=for-the-badge" alt="Release: v0.6.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-55%2F55_PASS-brightgreen?style=for-the-badge" alt="Tests: 55/55 PASS" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-57%2F57_PASS-brightgreen?style=for-the-badge" alt="Tests: 57/57 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
     <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
@@ -287,7 +287,7 @@ KestrelX Verification Suite
   [PASS] D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization
   [PASS] GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge
 
-Summary: 55 passed, 0 failed
+Summary: 57 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

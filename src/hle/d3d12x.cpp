@@ -31,7 +31,8 @@ std::atomic<uint64_t> g_devices{0}, g_queues{0}, g_cmd_lists{0}, g_resources{0},
     g_draw_calls{0}, g_dispatch_calls{0}, g_barrier_calls{0}, g_pso_binds{0},
     g_compute_queues{0}, g_inter_queue_fences{0},
     g_vrs_rate_sets{0}, g_vrs_image_binds{0},
-    g_work_graphs_created{0}, g_work_graph_dispatches{0};
+    g_work_graphs_created{0}, g_work_graph_dispatches{0},
+    g_dispatch_mesh_calls{0}, g_enhanced_barrier_calls{0}, g_enhanced_barrier_groups{0};
 
 std::mutex g_present_mtx;
 bool g_windowed = false;
@@ -316,9 +317,13 @@ KxGraphicsCommandListProxy::KxGraphicsCommandListProxy(ID3D12GraphicsCommandList
         (void)inner_->QueryInterface(IID_PPV_ARGS(&inner3_));
         (void)inner_->QueryInterface(IID_PPV_ARGS(&inner4_));
         (void)inner_->QueryInterface(IID_PPV_ARGS(&inner5_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner6_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner7_));
     }
 }
 KxGraphicsCommandListProxy::~KxGraphicsCommandListProxy() {
+    if (inner7_) { inner7_->Release(); inner7_ = nullptr; }
+    if (inner6_) { inner6_->Release(); inner6_ = nullptr; }
     if (inner5_) { inner5_->Release(); inner5_ = nullptr; }
     if (inner4_) { inner4_->Release(); inner4_ = nullptr; }
     if (inner3_) { inner3_->Release(); inner3_ = nullptr; }
@@ -363,6 +368,16 @@ HRESULT STDMETHODCALLTYPE KxGraphicsCommandListProxy::QueryInterface(REFIID riid
     }
     if (riid == __uuidof(ID3D12GraphicsCommandList5) && inner5_) {
         *ppv = static_cast<ID3D12GraphicsCommandList5*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (riid == __uuidof(ID3D12GraphicsCommandList6) && inner6_) {
+        *ppv = static_cast<ID3D12GraphicsCommandList6*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (riid == __uuidof(ID3D12GraphicsCommandList7) && inner7_) {
+        *ppv = static_cast<ID3D12GraphicsCommandList7*>(this);
         AddRef();
         return S_OK;
     }
@@ -527,6 +542,21 @@ void STDMETHODCALLTYPE KxGraphicsCommandListProxy::RSSetShadingRate(D3D12_SHADIN
 void STDMETHODCALLTYPE KxGraphicsCommandListProxy::RSSetShadingRateImage(ID3D12Resource* shadingRateImage) {
     g_vrs_image_binds.fetch_add(1, std::memory_order_relaxed);
     if (inner5_) inner5_->RSSetShadingRateImage(shadingRateImage);
+}
+
+// ID3D12GraphicsCommandList6
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
+    g_dispatch_mesh_calls.fetch_add(1, std::memory_order_relaxed);
+    if (inner6_) inner6_->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+}
+
+// ID3D12GraphicsCommandList7 (Enhanced Barriers)
+void STDMETHODCALLTYPE KxGraphicsCommandListProxy::Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP* pBarrierGroups) {
+    g_enhanced_barrier_calls.fetch_add(1, std::memory_order_relaxed);
+    g_enhanced_barrier_groups.fetch_add(NumBarrierGroups, std::memory_order_relaxed);
+    if (inner7_) {
+        inner7_->Barrier(NumBarrierGroups, pBarrierGroups);
+    }
 }
 
 // ---- KxCommandQueueProxy ----
@@ -920,7 +950,8 @@ D3D12XStats d3d12x_stats() {
             g_draw_calls.load(), g_dispatch_calls.load(), g_barrier_calls.load(), g_pso_binds.load(),
             g_compute_queues.load(), g_inter_queue_fences.load(),
             g_vrs_rate_sets.load(), g_vrs_image_binds.load(),
-            g_work_graphs_created.load(), g_work_graph_dispatches.load()};
+            g_work_graphs_created.load(), g_work_graph_dispatches.load(),
+            g_dispatch_mesh_calls.load(), g_enhanced_barrier_calls.load(), g_enhanced_barrier_groups.load()};
 }
 
 void reset_d3d12x_stats() {
@@ -929,7 +960,7 @@ void reset_d3d12x_stats() {
         g_stream_pso_recomp = g_disk_cache_hits = g_disk_cache_misses = g_device_qi_upgrades =
         g_draw_calls = g_dispatch_calls = g_barrier_calls = g_pso_binds = g_compute_queues =
         g_inter_queue_fences = g_vrs_rate_sets = g_vrs_image_binds =
-        g_work_graphs_created = g_work_graph_dispatches = 0;
+        g_work_graphs_created = g_work_graph_dispatches = g_dispatch_mesh_calls = g_enhanced_barrier_calls = g_enhanced_barrier_groups = 0;
     {
         std::lock_guard lock(g_shader_cache_mtx);
         g_dxil_cache.clear();

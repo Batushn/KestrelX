@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "kestrel/hle/registry.hpp"
 #include "kestrel/vfs/overlay_vfs.hpp"
@@ -10,8 +10,20 @@
 #include <unknwn.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace kestrel::hle {
+
+enum class DStorageCompressionFormat : uint32_t {
+    None = 0,
+    GDeflate = 1,
+};
+
+enum class DStorageRequestDestinationType : uint32_t {
+    Memory = 0,
+    Buffer = 1,
+    Texture = 2,
+};
 
 struct DStorageStats {
     uint32_t files_opened = 0;
@@ -19,10 +31,13 @@ struct DStorageStats {
     uint32_t requests_submitted = 0;
     uint64_t bytes_read = 0;
     uint32_t fences_signaled = 0;
+    uint32_t gdeflate_requests = 0;
+    uint64_t gdeflate_decompressed_bytes = 0;
+    uint32_t gpu_buffer_destinations = 0;
 };
 
 struct KxDStorageQueueDesc {
-    uint32_t source_type = 0;   // 0 = File
+    uint32_t source_type = 0;   // 0 = File, 1 = Memory
     uint16_t capacity = 64;
     int8_t priority = 0;
     const char* name = nullptr;
@@ -36,11 +51,17 @@ struct IKxDStorageFile : public IUnknown {
 
 struct KxDStorageRequest {
     IKxDStorageFile* source_file = nullptr;
+    const void* source_buffer = nullptr;
     uint64_t source_offset = 0;
     uint32_t source_size = 0;
     void* destination_buffer = nullptr;
     uint32_t destination_size = 0;
     uint64_t tag = 0;
+    DStorageCompressionFormat compression_format = DStorageCompressionFormat::None;
+    uint32_t uncompressed_size = 0;
+    DStorageRequestDestinationType destination_type = DStorageRequestDestinationType::Memory;
+    ID3D12Resource* destination_resource = nullptr;
+    uint64_t destination_resource_offset = 0;
 };
 
 struct IKxDStorageQueue : public IUnknown {
@@ -59,6 +80,9 @@ void set_dstorage_vfs(vfs::OverlayVfs* vfs);
 void register_dstorage(Registry& reg);
 DStorageStats dstorage_stats();
 void reset_dstorage_stats();
+
+// GDeflate stream decompressor utility (clean-room RFC 1951 / Deflate tile decompression)
+HRESULT decompress_gdeflate(const void* src, size_t src_size, void* dst, size_t dst_size, size_t& out_unpacked);
 
 HRESULT __stdcall kx_DStorageGetFactory(REFIID riid, void** ppv);
 HRESULT __stdcall kx_DStorageSetConfiguration(const void* config);

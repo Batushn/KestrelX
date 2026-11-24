@@ -6,7 +6,7 @@
 
   <p>
     <a href="#milestone-timeline"><img src="https://img.shields.io/badge/Release-v0.9.0-2ea44f?style=for-the-badge" alt="Release: v0.9.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-66%2F66_PASS-brightgreen?style=for-the-badge" alt="Tests: 66/66 PASS" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-68%2F68_PASS-brightgreen?style=for-the-badge" alt="Tests: 68/68 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
     <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
@@ -172,7 +172,8 @@ KestrelX v0.9.0 completes the full v0.8.0 & v0.9.0 roadmap across graphics, GDK 
 * **Sparse Virtual Texturing (SVT) & Feedback Maps**: 64KB physical page table (`VirtualTexturePageTable`) with LRU eviction, `SvtFeedbackAnalyzer` (RGBA8 residency & min-mip feedback maps), RDNA2 `MIMG` `TFE=1` (`CheckAccessFullyMapped`) lifting, and real D3D12 `CreateReservedResource` + `UpdateTileMappings` + `CopyTiles` telemetry.
 * **GDK Cryptographic Container (`KXVC`) & License Decryption Shim**: Clean-room `GdkContentContainer` supporting transparent unencrypted pass-through (`GdkCipherMode::None`) and seekable Win32 CNG AES-128-CTR stream decryption (`GdkCipherMode::Aes128Ctr`) with CRC32 segment verification, `GdkKeyRing` SHA-256 token key derivation, and full `xgameruntime.dll` HLE shims (`XGameRuntimeInitialize`, `XStoreAcquireLicenseForPackageAsync`/`Durables`/`CanAcquireLicense`/`QueryAddOnLicenses`, `XPackageMountWithUiAsync` -> `OverlayVfs`).
 * **PresentX Frame Pacing, Waitable Flip-Model & Low-Latency HUD**: High-resolution `FramePacer` (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, P99 & sliding-window telemetry), `IDXGISwapChain3` waitable frame latency + `DXGI_PRESENT_ALLOW_TEARING` (`--tearing`), borderless fullscreen (`--fullscreen` / `Alt+Enter`), and a crisp 236×76 5×7 GPU-composited telemetry HUD (`--hud`, `--fps <N>`).
-* **Dual-GPU Verification Expanded to 66/66 PASS**: Every feature tested bit-exact across physical NVIDIA RTX 4060 and AMD Radeon 780M hardware, plus `--unit-only` mode (51 passed, 15 skipped) and GitHub Actions CI.
+* **Batch Shader Census & PE32+ Compatibility Probe (`shader-census` / `pe-probe`)**: Offline CLI tools to batch-unpack/decode/recompile `SGD5`, RPF-embedded `SGD5`, `DXBC`, and raw RDNA2 shaders (with unsupported-opcode histograms and `--json` export) and audit any PE32+ binary's Agility SDK exports, relocations, `.pdata`/TLS, and HLE import coverage.
+* **Dual-GPU Verification Expanded to 68/68 PASS**: Every feature tested bit-exact across physical NVIDIA RTX 4060 and AMD Radeon 780M hardware, plus `--unit-only` mode (53 passed, 15 skipped) and GitHub Actions CI.
 
 ---
 
@@ -214,7 +215,7 @@ flowchart TD
 3. **Sparse Virtual Texturing (SVT) & Feedback Maps**: 64KB physical page table LRU remapping, RGBA8/Min-Mip feedback, RDNA2 `MIMG` `TFE=1` (`CheckAccessFullyMapped`), and D3D12 `CreateReservedResource`.
 4. **Frame Pacing & PresentX Low-Latency HUD**: Waitable flip-model tear-free sync, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` frame limiter, borderless fullscreen toggle, and GPU-composited 236×76 performance HUD.
 
-> **Honest Scope Note (`v0.9.0`):** KestrelX completes all `v0.8.0` and `v0.9.0` architectural foundations with **66/66 tests verified bit-exact** across physical NVIDIA RTX 4060 and AMD Radeon 780M GPUs (and **51/51** in `--unit-only` CI). It executes clean-room Xbox-ABI titles with full RDNA2 Compute/VS/PS/Mesh/AS/BVH/TFE shader translation, GDK crypto containers, SVT, and PresentX HUD. Booting unmodified commercial retail Xbox Series X|S titles remains the `v1.0.0` commercial bring-up horizon (requiring per-title shader/HLE surface coverage and retail key provisioning outside this clean-room repository).
+> **Honest Scope Note (`v0.9.0`):** KestrelX completes all `v0.8.0` and `v0.9.0` architectural foundations with **68/68 tests verified bit-exact** across physical NVIDIA RTX 4060 and AMD Radeon 780M GPUs (and **53/53** in `--unit-only` CI). It executes clean-room Xbox-ABI titles with full RDNA2 Compute/VS/PS/Mesh/AS/BVH/TFE shader translation, GDK crypto containers, SVT, and PresentX HUD. Booting unmodified commercial retail Xbox Series X|S titles remains the `v1.0.0` commercial bring-up horizon (requiring per-title shader/HLE surface coverage and retail key provisioning outside this clean-room repository).
 
 ---
 
@@ -225,7 +226,7 @@ flowchart TD
 | **Loader & System Libraries** | 0.90 | ✅ Verified | PE32+ loader with recursive guest DLL mapping, base relocations, .pdata SEH via RtlAddFunctionTable, TLS callbacks, kernelx.dll (XMemAlloc/Free), xgameruntime.dll, and AMD Zen 2 VEH shim (CLZERO/MONITORX/MWAITX + SSE4a EXTRQ/INSERTQ for Intel compatibility). Compatible with game_scarlett_master.exe PE32+ structures. |
 | **Shader Translation** | 0.90 | ✅ Verified | Clean-room RDNA2 (GFX10.3) microcode decoder, CFG IR lifter, dual Wave32/Wave64 SM 6.6 HLSL emission, in-process DXC (dxcompiler.dll), atomic disk cache (.kxdxil), strict refusal of unhandled opcodes (Test 10), and SGD5 container archive unpacking (shaders.rpf, Test 27). |
 | **Graphics Layer** | 0.85 | ✅ Verified | Pure COM wrapper KxDeviceProxy (ID3D12Device -> Device10 QI), Stream PSO recomp, dedicated Async Compute command queues (D3D12_COMMAND_LIST_TYPE_COMPUTE), cross-queue fence synchronization telemetry, and Win32 WindowHost flip-model swapchain PresentX. |
-| **Proven on Test Title** | 0.80 | ✅ Verified | Stand-alone clean-room guest test title (kestrel_test_title.exe + kestrel_test_dll.dll linked against synthetic GDK import libraries) boots via PeLoader with d3d12_xs.dll RTV clear + PresentX; 66/66 dual-GPU bit-exact test receipts (plus 51/51 `--unit-only` CI) on NVIDIA RTX 4060 and AMD Radeon 780M with 0 compiler warnings. |
+| **Proven on Test Title** | 0.80 | ✅ Verified | Stand-alone clean-room guest test title (kestrel_test_title.exe + kestrel_test_dll.dll linked against synthetic GDK import libraries) boots via PeLoader with d3d12_xs.dll RTV clear + PresentX; 68/68 dual-GPU bit-exact test receipts (plus 51/51 `--unit-only` CI) on NVIDIA RTX 4060 and AMD Radeon 780M with 0 compiler warnings. |
 
 ## Architecture
 
@@ -249,7 +250,7 @@ flowchart LR
 | **Shader Pipeline** | **RDNA2 (GFX10.3) -> CFG Basic-Block IR -> Dual Wave32 & Wave64 SM 6.6 HLSL -> In-Process DXC + Persistent Disk Cache** | Compiles native Wave32 shaders for NVIDIA warps and native Wave64 shaders for AMD RDNA GPUs from the same structured IR, verified bit-exact on dual-GPU hardware. |
 | **CPU Execution** | **Native PE32+ x64 Loader + VEH Zen 2 Shim** | Runs x86-64 natively with full relocations, guest DLL chaining, TLS callbacks, `.pdata` SEH, and VEH emulation for AMD Zen 2 instructions so Intel CPUs do not trap with `0xC000001D`. |
 | **Filesystem** | **Copy-on-Write Overlay VFS** | Maps `GAME:\`, `G:\`, `D:\`, `S:\`, and `T:\` with whiteouts and path-traversal rejection. The source title directory is **never mutated**. |
-| **Verification** | **66 Self-Contained Hardware & Unit Tests + Clean-Room Guest Title** | Links against 5 synthetic console import libs (`kernelx`, `xgameruntime`, `d3d12_xs`, `gameinput`, `xaudio2_9`) and validates every layer on real GPUs with zero retail files. |
+| **Verification** | **68 Self-Contained Hardware & Unit Tests + Clean-Room Guest Title** | Links against 5 synthetic console import libs (`kernelx`, `xgameruntime`, `d3d12_xs`, `gameinput`, `xaudio2_9`) and validates every layer on real GPUs with zero retail files. |
 
 ---
 
@@ -313,7 +314,6 @@ KestrelX Verification Suite
   [PASS] Spatial Audio 5.1 & 7.1 Multi-Channel Surround Downmix Matrix (ITU-R BS.775)
   [PASS] GDK Multi-User Profile Identity, Controller Binding & Isolated S:\ Saves
   [PASS] RDNA2 Hardware Raytracing BVH (IMAGE_BVH_INTERSECT_RAY) Decode, IR Lift & SM 6.6 RayQuery DXIL
-
   [PASS] GDK Agility SDK Query, Dynamic DLL Redirection & Modern D3D12/D3D12Core HLE Export Shims
   [PASS] Sparse Virtual Texturing (SVT) 64KB Page Table, LRU Eviction, Feedback & RDNA2 TFE
   [PASS] Sparse Virtual Texturing (SVT) Reserved Resource, TFE Feedback & LRU Remap on Dual-GPU Hardware
@@ -323,7 +323,11 @@ KestrelX Verification Suite
     -> Hardware [1] AMD Radeon(TM) 780M PASS (PresentX 236x76 Telemetry HUD composited bit-exact)
     -> Hardware [2] NVIDIA GeForce RTX 4060 Laptop GPU PASS (PresentX 236x76 Telemetry HUD composited bit-exact)
   [PASS] PresentX Low-Latency Telemetry HUD GPU Compositor on Dual-GPU Hardware
-Summary: 66 passed, 0 failed
+    -> Shader Census: 5/5 SGD5 unpacked, 4/5 DXIL compiled, histogram pinned vop1_99
+  [PASS] Batch RDNA2 Shader Census (SGD5 Archive + DXC DXIL + Unsupported Opcode Histogram)
+    -> PE Probe: 32/32 imports resolved on test_title + Agility v614 & missing API audit PASS
+  [PASS] PE32+ Compatibility Probe (HLE, Guest DLL, Host & Agility SDK Import Audit)
+Summary: 68 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:
@@ -362,6 +366,12 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Config Release
 # Inspect a title directory (MicrosoftGame.config + PE32+ imports)
 .\build\Release\kestrel.exe inspect build\Release\test_title
 
+# Audit PE32+ import resolution against KestrelX HLE + Agility SDK + guest/host DLLs (optional --json)
+.\build\Release\kestrel.exe pe-probe build\Release\test_title --json pe_probe.json
+
+# Batch-decode & recompile SGD5 / RPF-embedded SGD5 / DXBC / raw RDNA2 shaders (optional --wave 64, --no-dxc, --limit N, --json)
+.\build\Release\kestrel.exe shader-census path\to\shaders.sgd --wave 32 --json shader_census.json
+
 # Disassemble raw RDNA2 (GFX10.3) microcode
 .\build\Release\kestrel.exe disasm path\to\shader.bin
 
@@ -381,13 +391,13 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Config Release
 ```text
 include/kestrel/
   common/    # Result<T>, hex/UTF-8 helpers
-  loader/    # MicrosoftGame.config parser, PE32+ parser, native PeLoader
+  loader/    # MicrosoftGame.config parser, PE32+ parser, native PeLoader, PeProbe compatibility auditor
   cpu/       # VEH AMD Zen 2 instruction decoder & emulator
   vfs/       # Copy-on-Write Overlay VFS with whiteouts
   hle/       # HLE registry + stub thunks, kernelx (async I/O), xgameruntime, d3d12x (Dev1..10 + CmdListProxy), WindowHost, GameInput, XAudio2 (WASAPI)
-  gpu/       # RDNA2 ISA decoder (SOP/VOP/FLAT/SMEM/DS/MUBUF/MTBUF/MIMG/EXP), DXBC parser, CFG IR, multi-stage HLSL recompiler, DiskShaderCache, DXC, GPU runner, GFX10 tiling
+  gpu/       # RDNA2 ISA decoder (SOP/VOP/FLAT/SMEM/DS/MUBUF/MTBUF/MIMG/EXP), DXBC parser, CFG IR, multi-stage HLSL recompiler, ShaderCensus, DiskShaderCache, DXC, GPU runner, GFX10 tiling
 src/         # Corresponding C++23 implementations + CLI (src/cli/main.cpp)
-tests/       # 66-test unit/dual-GPU verification runner + clean-room Xbox-ABI guest test title & fixtures
+tests/       # 68-test unit/dual-GPU verification runner + clean-room Xbox-ABI guest test title & fixtures
 docs/        # Architecture documentation & hardware-captured renders (first_light.png, textured_quad.png)
 ```
 

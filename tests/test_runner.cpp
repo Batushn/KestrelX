@@ -6,6 +6,7 @@
 #include "kestrel/gpu/ir.hpp"
 #include "kestrel/gpu/rdna2_isa.hpp"
 #include "kestrel/gpu/rdna2_recomp.hpp"
+#include "kestrel/gpu/shader_census.hpp"
 #include "kestrel/gpu/svt.hpp"
 #include "kestrel/gpu/shader_cache.hpp"
 #include "kestrel/gpu/shader_container.hpp"
@@ -22,6 +23,7 @@
 #include "kestrel/loader/game_config.hpp"
 #include "kestrel/loader/pe_image.hpp"
 #include "kestrel/loader/pe_loader.hpp"
+#include "kestrel/loader/pe_probe.hpp"
 #include "kestrel/vfs/overlay_vfs.hpp"
 #include "kestrel/formats/gdk_container.hpp"
 #include "kestrel/formats/sgd5.hpp"
@@ -8016,6 +8018,216 @@ void test_presentx_low_latency_hud_composite_and_capture_dual_gpu() {
     hle::set_d3d12x_preferred_adapter(-1);
 }
 
+
+void test_shader_census_sgd5_batch_and_histogram() {
+    using namespace gpu::encode;
+
+    auto make_kx = [](const char magic[4], const std::vector<uint32_t>& words) {
+        std::vector<uint8_t> out(8 + words.size() * 4);
+        std::memcpy(out.data(), magic, 4);
+        const uint32_t cb = static_cast<uint32_t>(words.size() * 4);
+        std::memcpy(out.data() + 4, &cb, 4);
+        if (!words.empty()) std::memcpy(out.data() + 8, words.data(), cb);
+        return out;
+    };
+
+    // 1. Valid Compute Shader
+    std::vector<uint32_t> cs_words;
+    cs_words.push_back(vop2(26, 1, 130, 0));                     // v_lshlrev_b32 v1, 2, v0
+    global_mem(cs_words, 12, 2, 1, 127, 0);                      // global_load_dword v2, v1
+    vop3(cs_words, 0x14B, 3, 256 + 2, 244, 242);                 // v_fma_f32 v3, v2, 2.0, 1.0
+    global_mem(cs_words, 28, 3, 1, 127, 0);                      // global_store_dword v1, v3
+    cs_words.push_back(sopp(1));                                 // s_endpgm
+
+    // 2. Valid Vertex Shader
+    std::vector<uint32_t> vs_words;
+    vs_words.push_back(vop1(1, 1, 242));                         // v_mov_b32 v1, 1.0
+    vs_words.push_back(vop1(1, 2, 128));                         // v_mov_b32 v2, 0
+    exp(vs_words, gpu::kExpTargetPos0, 0xFu, 1, 1, 2, 1, true);  // exp pos0 done
+    vs_words.push_back(sopp(1));                                 // s_endpgm
+
+    // 3. Valid Pixel Shader
+    std::vector<uint32_t> ps_words;
+    ps_words.push_back(vop1(1, 0, 242));                         // v_mov_b32 v0, 1.0
+    ps_words.push_back(vop1(1, 1, 128));                         // v_mov_b32 v1, 0
+    exp(ps_words, gpu::kExpTargetMrt0, 0xFu, 0, 1, 1, 0, true);  // exp mrt0 done
+    ps_words.push_back(sopp(1));                                 // s_endpgm
+
+    // 4. Valid Mesh Shader
+    std::vector<uint32_t> ms_words;
+    mesh_alloc(ms_words, 3, 1);
+    ms_words.push_back(vop1(1, 1, 242));                         // v_mov_b32 v1, 1.0
+    exp(ms_words, gpu::kExpTargetPos0, 0xFu, 1, 1, 1, 1, false);
+    ms_words.push_back(vop1(1, 2, 128));                         // v_mov_b32 v2, 0
+    exp_prim0(ms_words, 2, 2, 2, true);
+    ms_words.push_back(sopp(1));
+
+    // 5. Compute shader containing an intentional unhandled RDNA2 opcode
+    std::vector<uint32_t> bad_words;
+    bad_words.push_back(vop1(99, 1, 256));                       // unimplemented vop1_99
+    bad_words.push_back(sopp(1));
+
+    std::vector<std::tuple<std::string, uint8_t, std::vector<uint8_t>>> items = {
+        {"CS_Sample", static_cast<uint8_t>(formats::Sgd5ShaderKind::ComputeShader), make_kx("KXRN", cs_words)},
+        {"VS_Sample", static_cast<uint8_t>(formats::Sgd5ShaderKind::StandardShader), make_kx("KXRV", vs_words)},
+        {"PS_Sample", static_cast<uint8_t>(formats::Sgd5ShaderKind::StandardShader), make_kx("KXRP", ps_words)},
+        {"MS_Sample", static_cast<uint8_t>(formats::Sgd5ShaderKind::MeshShader), make_kx("KXRM", ms_words)},
+        {"CS_UnknownOp", static_cast<uint8_t>(formats::Sgd5ShaderKind::ComputeShader), make_kx("KXRN", bad_words)},
+    };
+    const auto sgd_bytes = formats::Sgd5Archive::synthesize_archive(items);
+
+    const fs::path tmp_dir = fs::temp_directory_path() / "KestrelX_Test_ShaderCensus";
+    fs::remove_all(tmp_dir);
+    fs::create_directories(tmp_dir);
+    const fs::path sgd_path = tmp_dir / "census_test.sgd";
+    {
+        std::ofstream ofs(sgd_path, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(sgd_bytes.data()),
+                  static_cast<std::streamsize>(sgd_bytes.size()));
+    }
+
+    gpu::ShaderCensusOptions opt{};
+    opt.wave_mode = gpu::WaveMode::Wave32;
+    opt.compile_dxil = true;
+    auto rep = gpu::run_shader_census(sgd_path, opt);
+    KX_CHECK(rep.has_value(), "run_shader_census must succeed on SGD5 archive");
+    KX_CHECK(rep->sgd5_archives == 1, "Must detect 1 SGD5 archive");
+    KX_CHECK(rep->total_entries == 5, "Must scan all 5 entries");
+    KX_CHECK(rep->unpacked_ok == 5 && rep->unpack_failed == 0, "All 5 SGD5 records must unpack");
+    KX_CHECK(rep->decoded_ok == 5, "All 5 RDNA2 streams must decode cleanly");
+    KX_CHECK(rep->ir_lifted_ok == 4, "4/5 shaders must lift cleanly with 0 unknown ops");
+    KX_CHECK(rep->hlsl_emitted_ok == 4, "4/5 shaders must emit HLSL");
+    KX_CHECK(rep->dxc_available && rep->dxc_compiled_ok == 4, "4/5 shaders must compile to DXIL via DXC");
+    KX_CHECK(rep->compute.total == 2 && rep->compute.dxc_compiled_ok == 1, "Compute breakdown must match");
+    KX_CHECK(rep->vertex.dxc_compiled_ok == 1 && rep->pixel.dxc_compiled_ok == 1 && rep->mesh.dxc_compiled_ok == 1,
+             "VS/PS/MS stage breakdowns must match");
+    KX_CHECK(rep->unknown_instructions == 1, "Exactly 1 unsupported instruction counted");
+    KX_CHECK(!rep->top_unknown_opcodes.empty() && rep->top_unknown_opcodes[0].mnemonic == "vop1_99",
+             "Unknown opcode histogram must pinpoint vop1_99");
+
+    const std::string text = gpu::format_shader_census_text(*rep);
+    const std::string json = gpu::format_shader_census_json(*rep);
+    KX_CHECK(text.find("vop1_99") != std::string::npos, "Text report contains unknown opcode");
+    KX_CHECK(json.find("\"dxc_compiled_ok\": 4") != std::string::npos, "JSON report contains DXIL count");
+
+    fs::remove_all(tmp_dir);
+    std::cout << "    -> Shader Census: 5/5 SGD5 unpacked, 4/5 DXIL compiled, histogram pinned vop1_99\n";
+}
+
+void test_pe_probe_import_and_agility_audit() {
+    hle::Registry reg;
+    hle::register_kernelx(reg);
+    hle::register_xgameruntime(reg);
+    hle::register_dstorage(reg);
+    hle::register_d3d12x(reg);
+    hle::register_gameinput(reg);
+    hle::register_xaudio2(reg);
+
+    // 1. Audit clean-room Xbox-ABI kestrel_test_title.exe (HLE + Guest DLL + Host)
+    const fs::path title_dir = KESTREL_TEST_TITLE_DIR;
+    auto rep = loader::run_pe_probe(title_dir, reg);
+    KX_CHECK(rep.has_value(), "run_pe_probe must succeed on kestrel_test_title directory");
+    KX_CHECK(rep->total_imports >= 20, "Test title must import >=20 symbols");
+    KX_CHECK(rep->hle_resolved >= 20, "Test title HLE symbols must resolve cleanly");
+    KX_CHECK(rep->guest_resolved >= 1, "Test title guest DLL import must resolve cleanly");
+    KX_CHECK(rep->host_resolved >= 1, "Test title host imports must resolve cleanly");
+    KX_CHECK(rep->missing_imports == 0, "Test title must have 0 missing/stubbed imports");
+    KX_CHECK(rep->has_relocations && rep->has_pdata_seh && rep->has_tls,
+             "Test title PE hardening flags (relocs, .pdata, TLS) detected");
+
+    const std::string text = loader::format_pe_probe_text(*rep);
+    const std::string json = loader::format_pe_probe_json(*rep);
+    KX_CHECK(text.find("100.0%") != std::string::npos, "Text probe reports 100.0% import resolution");
+    KX_CHECK(json.find("\"missing_imports\": 0") != std::string::npos, "JSON probe reports 0 missing imports");
+
+    // 2. Audit synthetic Agility SDK PE + unresolved Xbox API gap detection
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestPeProbe";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp);
+    const fs::path probe_exe = tmp / "probe_agility.exe";
+    {
+        SynthPeBuilder exe(false);
+        const uint32_t ver_rva = exe.alloc_data(4, 4);
+        exe.write_at_data_rva<uint32_t>(ver_rva, 614u);
+        const uint32_t str_rva = exe.write_cstring(".\\D3D12\\");
+        const uint32_t ptr_rva = exe.alloc_data(8, 8);
+        exe.write_at_data_rva<uint64_t>(ptr_rva, 0x0000000140000000ull + str_rva);
+
+        const uint32_t exp_start = exe.alloc_data(sizeof(IMAGE_EXPORT_DIRECTORY), 4);
+        const uint32_t funcs_rva = exe.alloc_data(2 * 4, 4);
+        const uint32_t names_rva = exe.alloc_data(2 * 4, 4);
+        const uint32_t ords_rva = exe.alloc_data(2 * 2, 2);
+        const uint32_t mod_str = exe.write_cstring("probe_agility.exe");
+        const uint32_t s0 = exe.write_cstring("D3D12SDKPath");
+        const uint32_t s1 = exe.write_cstring("D3D12SDKVersion");
+        exe.write_at_data_rva<uint32_t>(funcs_rva + 0, ptr_rva);
+        exe.write_at_data_rva<uint32_t>(funcs_rva + 4, ver_rva);
+        exe.write_at_data_rva<uint32_t>(names_rva + 0, s0);
+        exe.write_at_data_rva<uint32_t>(names_rva + 4, s1);
+        exe.write_at_data_rva<uint16_t>(ords_rva + 0, 0);
+        exe.write_at_data_rva<uint16_t>(ords_rva + 2, 1);
+        IMAGE_EXPORT_DIRECTORY ed{};
+        ed.Name = mod_str;
+        ed.Base = 1;
+        ed.NumberOfFunctions = 2;
+        ed.NumberOfNames = 2;
+        ed.AddressOfFunctions = funcs_rva;
+        ed.AddressOfNames = names_rva;
+        ed.AddressOfNameOrdinals = ords_rva;
+        exe.write_at_data_rva(exp_start, ed);
+        exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_EXPORT, exp_start,
+                         (SynthPeBuilder::kDataRva + exe.data_cursor) - exp_start);
+
+        const uint32_t hn_d3d = exe.write_hint_name("D3D12CreateDevice");
+        const uint32_t hn_missing = exe.write_hint_name("XMissingAuditApi");
+        const uint32_t dll_d3d = exe.write_cstring("d3d12.dll");
+        const uint32_t dll_kx = exe.write_cstring("kernelx.dll");
+
+        const uint32_t ilt0 = exe.alloc_data(16, 8);
+        const uint32_t iat0 = exe.alloc_data(16, 8);
+        exe.write_at_data_rva<uint64_t>(ilt0, hn_d3d);
+        exe.write_at_data_rva<uint64_t>(ilt0 + 8, 0ull);
+
+        const uint32_t ilt1 = exe.alloc_data(16, 8);
+        const uint32_t iat1 = exe.alloc_data(16, 8);
+        exe.write_at_data_rva<uint64_t>(ilt1, hn_missing);
+        exe.write_at_data_rva<uint64_t>(ilt1 + 8, 0ull);
+
+        const uint32_t imp_rva = exe.alloc_data(3 * sizeof(IMAGE_IMPORT_DESCRIPTOR), 4);
+        IMAGE_IMPORT_DESCRIPTOR d0{};
+        d0.OriginalFirstThunk = ilt0;
+        d0.Name = dll_d3d;
+        d0.FirstThunk = iat0;
+        IMAGE_IMPORT_DESCRIPTOR d1{};
+        d1.OriginalFirstThunk = ilt1;
+        d1.Name = dll_kx;
+        d1.FirstThunk = iat1;
+        exe.write_at_data_rva(imp_rva, d0);
+        exe.write_at_data_rva(imp_rva + sizeof(IMAGE_IMPORT_DESCRIPTOR), d1);
+        exe.set_data_dir(IMAGE_DIRECTORY_ENTRY_IMPORT, imp_rva, 3 * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        exe.write_file(probe_exe);
+    }
+
+    auto rep2 = loader::run_pe_probe(probe_exe, reg);
+    KX_CHECK(rep2.has_value(), "run_pe_probe must succeed on synthetic Agility SDK PE");
+    KX_CHECK(rep2->agility_sdk_detected && rep2->agility_sdk_version == 614,
+             "PE probe must detect Agility SDK v614");
+    KX_CHECK(rep2->agility_sdk_path == ".\\D3D12\\", "PE probe must extract Agility SDK path");
+    KX_CHECK(rep2->hle_resolved == 1 && rep2->missing_imports == 1,
+             "d3d12.dll redirected to d3d12_xs HLE and unresolved Xbox API flagged");
+    KX_CHECK(rep2->modules.size() == 2 &&
+             rep2->modules[0].redirected_name == "d3d12_xs.dll" &&
+             rep2->modules[1].missing_symbol_names.size() == 1 &&
+             rep2->modules[1].missing_symbol_names[0] == "XMissingAuditApi",
+             "Missing symbol name and Agility redirection recorded");
+
+    fs::remove_all(tmp, ec);
+    std::cout << std::format("    -> PE Probe: {}/{} imports resolved on test_title + Agility v614 & missing API audit PASS\n",
+                             rep->hle_resolved + rep->guest_resolved + rep->host_resolved,
+                             rep->total_imports);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -8096,6 +8308,8 @@ int main(int argc, char** argv) {
     run_test("GDK Cryptographic Container (KXVC AES-128-CTR / Pass-Through) & XStore/XPackage License Decryption", test_gdk_crypto_container_and_xstore_license_decryption);
     run_test("PresentX Frame Pacer (125 FPS Limiter, P99 Telemetry) & 5x7 HUD Rasterizer", test_frame_pacer_limiter_and_hud_rasterizer);
     run_hw_test("PresentX Low-Latency Telemetry HUD GPU Compositor on Dual-GPU Hardware", test_presentx_low_latency_hud_composite_and_capture_dual_gpu);
+    run_test("Batch RDNA2 Shader Census (SGD5 Archive + DXC DXIL + Unsupported Opcode Histogram)", test_shader_census_sgd5_batch_and_histogram);
+    run_test("PE32+ Compatibility Probe (HLE, Guest DLL, Host & Agility SDK Import Audit)", test_pe_probe_import_and_agility_audit);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

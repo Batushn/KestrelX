@@ -5,6 +5,7 @@
 #include "kestrel/gpu/ir.hpp"
 #include "kestrel/gpu/rdna2_isa.hpp"
 #include "kestrel/gpu/rdna2_recomp.hpp"
+#include "kestrel/gpu/shader_census.hpp"
 #include "kestrel/hle/d3d12x.hpp"
 #include "kestrel/hle/dstorage.hpp"
 #include "kestrel/hle/gameinput.hpp"
@@ -15,6 +16,7 @@
 #include "kestrel/loader/game_config.hpp"
 #include "kestrel/loader/pe_image.hpp"
 #include "kestrel/loader/pe_loader.hpp"
+#include "kestrel/loader/pe_probe.hpp"
 #include "kestrel/vfs/overlay_vfs.hpp"
 
 #include <cmath>
@@ -39,6 +41,10 @@ void print_usage() {
         "  kestrel inspect <dir|pe>          Inspect MicrosoftGame.config and/or PE32+ Xbox imports\n"
         "  kestrel disasm <shader.bin>       Decode & disassemble raw RDNA2 (GFX10.3) microcode\n"
         "  kestrel selftest [--adapter N]    Run RDNA2 -> IR -> HLSL -> DXC -> real GPU execution test\n"
+        "  kestrel shader-census <path> [--wave 32|64] [--no-dxc] [--limit N] [--json <out.json>]\n"
+        "                                    Batch-decode/recompile SGD5, RPF-embedded SGD5, DXBC, or RDNA2 shaders\n"
+        "  kestrel pe-probe <dir|pe> [--json <out.json>]\n"
+        "                                    Audit PE32+ imports, Agility SDK, SEH/TLS & HLE resolution coverage\n"
         "  kestrel run <dir|exe> [--adapter N] [--data-dir <dir>] [--cache-dir <dir>]\n"
         "                        [--windowed] [--fullscreen] [--hud] [--fps <N>] [--tearing] [--audio] [--capture <out.bmp>]\n"
         "                                    Load & execute an Xbox-ABI PE title with Overlay VFS & KxDeviceProxy\n";
@@ -203,6 +209,64 @@ int cmd_selftest(int adapter_filter) {
     return 0;
 }
 
+int cmd_shader_census(
+    const fs::path& target,
+    gpu::WaveMode wave_mode,
+    bool compile_dxil,
+    size_t limit,
+    const fs::path& json_out) {
+    gpu::ShaderCensusOptions opt{};
+    opt.wave_mode = wave_mode;
+    opt.compile_dxil = compile_dxil;
+    opt.max_shaders = limit;
+
+    auto res = gpu::run_shader_census(target, opt);
+    if (!res) {
+        std::cerr << "Shader census failed: " << res.error().message << "\n";
+        return 1;
+    }
+
+    std::cout << gpu::format_shader_census_text(*res);
+    if (!json_out.empty()) {
+        std::ofstream ofs(json_out, std::ios::binary);
+        if (!ofs) {
+            std::cerr << "Failed to write JSON report: " << json_out.string() << "\n";
+            return 1;
+        }
+        ofs << gpu::format_shader_census_json(*res);
+        std::cout << "Wrote JSON report: " << json_out.string() << "\n";
+    }
+    return 0;
+}
+
+int cmd_pe_probe(const fs::path& target, const fs::path& json_out) {
+    hle::Registry registry;
+    hle::register_kernelx(registry);
+    hle::register_xgameruntime(registry);
+    hle::register_dstorage(registry);
+    hle::register_d3d12x(registry);
+    hle::register_gameinput(registry);
+    hle::register_xaudio2(registry);
+
+    auto res = loader::run_pe_probe(target, registry);
+    if (!res) {
+        std::cerr << "PE probe failed: " << res.error().message << "\n";
+        return 1;
+    }
+
+    std::cout << loader::format_pe_probe_text(*res);
+    if (!json_out.empty()) {
+        std::ofstream ofs(json_out, std::ios::binary);
+        if (!ofs) {
+            std::cerr << "Failed to write JSON report: " << json_out.string() << "\n";
+            return 1;
+        }
+        ofs << loader::format_pe_probe_json(*res);
+        std::cout << "Wrote JSON report: " << json_out.string() << "\n";
+    }
+    return 0;
+}
+
 int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
             const fs::path& cache_dir, bool windowed, bool audio, const fs::path& capture_path,
             const hle::FramePacingConfig& pacing) {
@@ -312,6 +376,10 @@ int main(int argc, char** argv) {
     bool windowed = false;
     bool audio = false;
     fs::path capture_path;
+    fs::path json_out;
+    gpu::WaveMode wave_mode = gpu::WaveMode::Wave32;
+    bool compile_dxil = true;
+    size_t limit = 0;
     hle::FramePacingConfig pacing{};
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
@@ -326,9 +394,18 @@ int main(int argc, char** argv) {
         else if (arg == "--fps" && i + 1 < argc) pacing.target_fps = std::stod(argv[++i]);
         else if (arg == "--audio") audio = true;
         else if (arg == "--capture" && i + 1 < argc) capture_path = argv[++i];
+        else if (arg == "--json" && i + 1 < argc) json_out = argv[++i];
+        else if (arg == "--no-dxc") compile_dxil = false;
+        else if (arg == "--limit" && i + 1 < argc) limit = static_cast<size_t>(std::stoull(argv[++i]));
+        else if (arg == "--wave" && i + 1 < argc) {
+            const int w = std::stoi(argv[++i]);
+            wave_mode = (w == 64) ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
+        }
     }
 
     if (cmd == "selftest") return cmd_selftest(adapter);
+    if (cmd == "shader-census" && argc >= 3) return cmd_shader_census(argv[2], wave_mode, compile_dxil, limit, json_out);
+    if (cmd == "pe-probe" && argc >= 3) return cmd_pe_probe(argv[2], json_out);
     if (cmd == "run" && argc >= 3) return cmd_run(argv[2], adapter, data_dir, cache_dir, windowed, audio, capture_path, pacing);
 
     print_usage();

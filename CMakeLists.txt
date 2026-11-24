@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(KestrelX VERSION 0.6.0 LANGUAGES CXX)
+project(KestrelX VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,6 +50,8 @@ add_library(kestrel_core STATIC
     src/gpu/work_graph.cpp
     src/formats/sgd5.cpp
     src/formats/gdk_container.cpp
+    src/gpu/shader_census.cpp
+    src/loader/pe_probe.cpp
 )
 target_include_directories(kestrel_core PUBLIC include)
 target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32 user32 gdi32 cabinet bcrypt)

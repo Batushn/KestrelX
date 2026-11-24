@@ -132,6 +132,39 @@ void apply_matrix_accumulate(
                 out_frame[d] += v;
             }
         }
+    } else if (src_ch == 6 && dst_ch == 2) {
+        // ITU-R BS.775 5.1 -> Stereo downmix
+        // Channel layout: 0:FL, 1:FR, 2:FC, 3:LFE, 4:BL, 5:BR
+        constexpr float kWeight = 0.70710678f;
+        for (size_t i = 0; i < frames; ++i) {
+            const float* in_frame = src_interleaved + i * 6;
+            float* out_frame = dst_interleaved + i * 2;
+            const float fl = in_frame[0] * ch_gain(0);
+            const float fr = in_frame[1] * ch_gain(1);
+            const float fc = in_frame[2] * ch_gain(2);
+            // LFE (in_frame[3]) is omitted per ITU-R BS.775 to avoid subwoofer overload
+            const float bl = in_frame[4] * ch_gain(4);
+            const float br = in_frame[5] * ch_gain(5);
+            out_frame[0] += fl + kWeight * fc + kWeight * bl;
+            out_frame[1] += fr + kWeight * fc + kWeight * br;
+        }
+    } else if (src_ch == 8 && dst_ch == 2) {
+        // ITU-R BS.775 7.1 -> Stereo downmix
+        // Channel layout: 0:FL, 1:FR, 2:FC, 3:LFE, 4:BL, 5:BR, 6:SL, 7:SR
+        constexpr float kWeight = 0.70710678f;
+        for (size_t i = 0; i < frames; ++i) {
+            const float* in_frame = src_interleaved + i * 8;
+            float* out_frame = dst_interleaved + i * 2;
+            const float fl = in_frame[0] * ch_gain(0);
+            const float fr = in_frame[1] * ch_gain(1);
+            const float fc = in_frame[2] * ch_gain(2);
+            const float bl = in_frame[4] * ch_gain(4);
+            const float br = in_frame[5] * ch_gain(5);
+            const float sl = in_frame[6] * ch_gain(6);
+            const float sr = in_frame[7] * ch_gain(7);
+            out_frame[0] += fl + kWeight * fc + kWeight * (bl + sl);
+            out_frame[1] += fr + kWeight * fc + kWeight * (br + sr);
+        }
     } else {
         const uint32_t common = std::min(src_ch, dst_ch);
         for (size_t i = 0; i < frames; ++i) {
@@ -1005,6 +1038,44 @@ void __stdcall kx_X3DAudioCalculate(
             } else if (src_ch == 2) {
                 dsp_settings->matrix_coefficients[0 * src_ch + 0] = left_gain;
                 dsp_settings->matrix_coefficients[1 * src_ch + 1] = right_gain;
+            } else if (src_ch == 6) {
+                // ITU-R BS.775 5.1 -> Stereo pan matrix
+                constexpr float kWeight = 0.70710678f;
+                // row 0: Left [FL, FR, FC, LFE, BL, BR]
+                dsp_settings->matrix_coefficients[0 * 6 + 0] = left_gain * 1.0f;
+                dsp_settings->matrix_coefficients[0 * 6 + 1] = 0.0f;
+                dsp_settings->matrix_coefficients[0 * 6 + 2] = left_gain * kWeight;
+                dsp_settings->matrix_coefficients[0 * 6 + 3] = 0.0f;
+                dsp_settings->matrix_coefficients[0 * 6 + 4] = left_gain * kWeight;
+                dsp_settings->matrix_coefficients[0 * 6 + 5] = 0.0f;
+                // row 1: Right [FL, FR, FC, LFE, BL, BR]
+                dsp_settings->matrix_coefficients[1 * 6 + 0] = 0.0f;
+                dsp_settings->matrix_coefficients[1 * 6 + 1] = right_gain * 1.0f;
+                dsp_settings->matrix_coefficients[1 * 6 + 2] = right_gain * kWeight;
+                dsp_settings->matrix_coefficients[1 * 6 + 3] = 0.0f;
+                dsp_settings->matrix_coefficients[1 * 6 + 4] = 0.0f;
+                dsp_settings->matrix_coefficients[1 * 6 + 5] = right_gain * kWeight;
+            } else if (src_ch == 8) {
+                // ITU-R BS.775 7.1 -> Stereo pan matrix
+                constexpr float kWeight = 0.70710678f;
+                // row 0: Left [FL, FR, FC, LFE, BL, BR, SL, SR]
+                dsp_settings->matrix_coefficients[0 * 8 + 0] = left_gain * 1.0f;
+                dsp_settings->matrix_coefficients[0 * 8 + 1] = 0.0f;
+                dsp_settings->matrix_coefficients[0 * 8 + 2] = left_gain * kWeight;
+                dsp_settings->matrix_coefficients[0 * 8 + 3] = 0.0f;
+                dsp_settings->matrix_coefficients[0 * 8 + 4] = left_gain * kWeight;
+                dsp_settings->matrix_coefficients[0 * 8 + 5] = 0.0f;
+                dsp_settings->matrix_coefficients[0 * 8 + 6] = left_gain * kWeight;
+                dsp_settings->matrix_coefficients[0 * 8 + 7] = 0.0f;
+                // row 1: Right [FL, FR, FC, LFE, BL, BR, SL, SR]
+                dsp_settings->matrix_coefficients[1 * 8 + 0] = 0.0f;
+                dsp_settings->matrix_coefficients[1 * 8 + 1] = right_gain * 1.0f;
+                dsp_settings->matrix_coefficients[1 * 8 + 2] = right_gain * kWeight;
+                dsp_settings->matrix_coefficients[1 * 8 + 3] = 0.0f;
+                dsp_settings->matrix_coefficients[1 * 8 + 4] = 0.0f;
+                dsp_settings->matrix_coefficients[1 * 8 + 5] = right_gain * kWeight;
+                dsp_settings->matrix_coefficients[1 * 8 + 6] = 0.0f;
+                dsp_settings->matrix_coefficients[1 * 8 + 7] = right_gain * kWeight;
             } else {
                 const float inv_src = 1.0f / static_cast<float>(src_ch);
                 for (uint32_t s = 0; s < src_ch; ++s) {

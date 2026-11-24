@@ -5,8 +5,8 @@
   <p><strong>Clean-Room Xbox Series X|S Native Compatibility &amp; Dynamic RDNA2 (GFX10.3) &rarr; SM 6.6 DXIL Shader Recompilation Runtime</strong></p>
 
   <p>
-    <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0-2ea44f?style=for-the-badge" alt="Release: v0.6.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-57%2F57_PASS-brightgreen?style=for-the-badge" alt="Tests: 57/57 PASS" /></a>
+    <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0-2ea44f?style=for-the-badge" alt="Release: v0.7.0" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-59%2F59_PASS-brightgreen?style=for-the-badge" alt="Tests: 59/59 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
     <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
@@ -124,15 +124,15 @@ flowchart LR
 | :--- | :--- | :---: | :--- | :--- |
 | **PE32+ Loader & System Libs** | `██████████ 100%` | ✅ Ready | `MicrosoftGame.config` XML, PE32+ relocs (DIR64/HIGHLOW), delay-load imports (RVA/legacy VA), export forwarders (DLL.Symbol, DLL.#Ordinal), multi-page thunk leak cleanup, `.pdata` SEH, TLS callbacks | Dynamic GDK Agility SDK DLL redirection |
 | **CPU VEH Zen 2 Shim** | `██████████ 100%` | ✅ Ready | In-process VEH emulator for AMD Zen 2 `CLZERO`, `MONITORX`, `MWAITX`, `MCOMMIT`, `RDPRU`, `PREFETCHW`, and SSE4a `EXTRQ`/`INSERTQ` for crash-free Intel processor compatibility | Dynamic TSC virtualization & CPU core topology pinning |
-| **Copy-on-Write Overlay VFS** | `██████████ 100%` | ✅ Ready | Case-insensitive per-layer path lookup cache, merged `list_directory` across base and overlay, whiteout suppression, non-throwing `std::error_code` safety, Xbox drive prefixes (`GAME:\`, `G:\`, `D:\`, `C:\`, `S:\`, `T:\`) | Encrypted container archive streaming mounts |
+| **Copy-on-Write Overlay VFS** | `██████████ 100%` | ✅ Ready | Case-insensitive per-layer path lookup cache, merged `list_directory` across base and overlay, whiteout suppression, non-throwing `std::error_code` safety, multi-user save partition isolation (`set_active_user_xuid`, `active_save_root`), Xbox drive prefixes (`GAME:\`, `G:\`, `D:\`, `C:\`, `S:\`, `T:\`) | Encrypted container archive streaming mounts |
 | **RDNA2 -> IR -> SM 6.6 DXIL** | `█████████░ 95%` | ✅ Ready | Complete 30-predicate VCmp/SCmp, 64-bit scalar ALU, Mesh Shaders (`ms_6_6`), Amplification Shaders (`as_6_6`), VRS Tier 2 decoders & combiners, PBR 3-MRT GBuffer, 2D compute tiling, Wave intrinsics | Raytracing BVH traversal (`image_bvh_intersect_ray`) |
 | **RDNA2 IR Optimization Passes** | `██████████ 100%` | ✅ Ready | Unreachable basic-block pruning, intra-block copy propagation, constant folding (integer & float operations), backward liveness DCE & unused flag pruning, bit-exact dual-GPU parity | Inter-block global value numbering (GVN) |
 | **Persistent DXIL Shader Cache** | `██████████ 100%` | ✅ Ready | Mutex-protected thread-safe `DiskShaderCache`, LRU size quotas (`max_entries`, `max_bytes`), multi-dimensional dispatch keys (`group_y`, `group_z`, `mrt_mask`), corruption eviction | Background async shader pre-compilation pool |
-| **D3D12.X COM Proxy (`d3d12_xs`)** | `█████████░ 95%` | ✅ Ready | Pure COM `KxDeviceProxy` (`ID3D12Device`–`Device10` QI), stream PSO auto-recomp, dedicated Async Compute queues with timeline fence sync, Work Graph DAG validation & 2-node `ExecuteIndirect` producer->consumer | Enhanced barriers (`D3D12_BARRIER_GROUP`) |
+| **D3D12.X COM Proxy (`d3d12_xs`)** | `██████████ 98%` | ✅ Ready | Pure COM `KxDeviceProxy` (`ID3D12Device`-`Device10` QI), stream PSO auto-recomp, dedicated Async Compute queues with timeline fence sync, Work Graph DAG validation & 2-node `ExecuteIndirect` producer->consumer, `ID3D12GraphicsCommandList6/7` Enhanced Barriers & `DispatchMesh` | DirectSR super-resolution bridge |
 | **WindowHost & PresentX** | `████████░░ 85%` | ✅ Ready | Win32 `WindowHost` + `IDXGISwapChain3` flip-model (`--windowed`), headless GPU readback BMP capture (`--capture`), `D3D12PresentX` | Fullscreen borderless toggle & frame-pacing telemetry HUD |
 | **Input (`gameinput.dll`)** | `█████████░ 95%` | ✅ Ready | COM `GameInputCreate`, multi-controller slot management (0..3), dynamic hotplugging callbacks & telemetry, impulse trigger force-feedback + dual-motor rumble bridging | Virtual gamepad remapping & deadzone calibration |
-| **Audio (`xaudio2_9.dll`)** | `█████████░ 95%` | ✅ Ready | COM `XAudio2Create`, multi-voice software mixer, submix bus routing, non-48kHz pitch resampling, X3DAudio 3D spatial positioning, WASAPI thread lifecycle | 7.1 surround downmixing & WASAPI exclusive mode |
-| **KernelX & GDK HLE** | `█████████░ 90%` | ✅ Ready | `XMemAlloc`/`Free`/`Size`, `TitleMemoryStatus`, `CreateFileA/W/2`, `ReadFileEx`, `XTaskQueue*`, DirectStorage VFS async bridge, `XUserAddAsync`, `XUserGetGamertag`, `XStoreCreateContext` | Multi-user identity profiles & isolated save mounts |
+| **Audio (`xaudio2_9.dll`)** | `██████████ 98%` | ✅ Ready | COM `XAudio2Create`, multi-voice software mixer, submix bus routing, non-48kHz pitch resampling, X3DAudio 3D spatial positioning, ITU-R BS.775 5.1 & 7.1 surround downmixing matrix, WASAPI thread lifecycle | WASAPI exclusive mode stream sync |
+| **KernelX & GDK HLE** | `█████████░ 95%` | ✅ Ready | `XMemAlloc`/`Free`/`Size`, `TitleMemoryStatus`, `CreateFileA/W/2`, `ReadFileEx`, `XTaskQueue*`, DirectStorage 1.2 GDeflate GPU streaming, multi-user identity profiles (`kx_XUserAddAsync`, `kx_XUserFindControllerUser`, `kx_XUserSetActive`), controller binding, isolated `S:\` save partitions | Cloud save sync stubbing |
 | **GFX10 Texture Tiling** | `█████████░ 90%` | ✅ Ready | Clean-room 2D swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block tiling, 256B-aligned multi-level mip-chains, SGD5 archive decompression | 3D/Array volume tiling & live upload staging |
 
 ---
@@ -286,8 +286,10 @@ KestrelX Verification Suite
   [PASS] RDNA2 PBR Material Deferred GBuffer (Albedo, Normal, Material) MRT Pipeline on Dual-GPU Hardware
   [PASS] D3D12.X Async Compute Queue & Inter-Queue Fence Synchronization
   [PASS] GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge
+  [PASS] Spatial Audio 5.1 & 7.1 Multi-Channel Surround Downmix Matrix (ITU-R BS.775)
+  [PASS] GDK Multi-User Profile Identity, Controller Binding & Isolated S:\ Saves
 
-Summary: 57 passed, 0 failed
+Summary: 59 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

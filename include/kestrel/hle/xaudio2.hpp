@@ -124,9 +124,18 @@ constexpr uint32_t KxX3DAudioCalculateReverb       = 0x00000010u;
 constexpr uint32_t KxX3DAudioCalculateDoppler      = 0x00000020u;
 constexpr uint32_t KxX3DAudioCalculateEmitterAngle = 0x00000040u;
 
-constexpr uint32_t KxSpeakerFrontLeft  = 0x00000001u;
-constexpr uint32_t KxSpeakerFrontRight = 0x00000002u;
-constexpr uint32_t KxSpeakerStereo     = KxSpeakerFrontLeft | KxSpeakerFrontRight;
+constexpr uint32_t KxSpeakerFrontLeft        = 0x00000001u;
+constexpr uint32_t KxSpeakerFrontRight       = 0x00000002u;
+constexpr uint32_t KxSpeakerFrontCenter      = 0x00000004u;
+constexpr uint32_t KxSpeakerLowFrequency     = 0x00000008u;
+constexpr uint32_t KxSpeakerBackLeft         = 0x00000010u;
+constexpr uint32_t KxSpeakerBackRight        = 0x00000020u;
+constexpr uint32_t KxSpeakerSideLeft         = 0x00000200u;
+constexpr uint32_t KxSpeakerSideRight        = 0x00000400u;
+constexpr uint32_t KxSpeakerStereo           = KxSpeakerFrontLeft | KxSpeakerFrontRight;
+constexpr uint32_t KxSpeakerQuad             = KxSpeakerFrontLeft | KxSpeakerFrontRight | KxSpeakerBackLeft | KxSpeakerBackRight;
+constexpr uint32_t KxSpeaker5Point1          = KxSpeakerFrontLeft | KxSpeakerFrontRight | KxSpeakerFrontCenter | KxSpeakerLowFrequency | KxSpeakerBackLeft | KxSpeakerBackRight;
+constexpr uint32_t KxSpeaker7Point1          = KxSpeaker5Point1 | KxSpeakerSideLeft | KxSpeakerSideRight;
 
 struct KxX3DAudioListener {
     KxVec3 orient_front{0.0f, 0.0f, 1.0f};

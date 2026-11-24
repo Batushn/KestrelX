@@ -268,9 +268,10 @@ Result<std::filesystem::path> OverlayVfs::resolve(std::string_view console_path,
     std::lock_guard lock(mutex_);
 
     if (parsed->mount == MountKind::PersistentSave) {
+        const auto save_root = current_save_root_locked();
         if (for_write) {
             save_cache_.invalidate(parsed->lower_rel);
-            const auto p = save_root_ / parsed->rel;
+            const auto p = save_root / parsed->rel;
             if (p.has_parent_path()) {
                 std::error_code ec;
                 std::filesystem::create_directories(p.parent_path(), ec);
@@ -279,7 +280,7 @@ Result<std::filesystem::path> OverlayVfs::resolve(std::string_view console_path,
             return p;
         }
         const auto hit = save_cache_.lookup(parsed->parts, parsed->lower_rel, stats_);
-        return hit.exists ? hit.host_path : (save_root_ / parsed->rel);
+        return hit.exists ? hit.host_path : (save_root / parsed->rel);
     }
 
     if (parsed->mount == MountKind::TempScratch) {
@@ -331,8 +332,9 @@ Result<void> OverlayVfs::remove_file(std::string_view console_path) {
     std::error_code ec;
 
     if (parsed->mount == MountKind::PersistentSave) {
+        const auto save_root = current_save_root_locked();
         const auto hit = save_cache_.lookup(parsed->parts, parsed->lower_rel, stats_);
-        const auto target = hit.exists ? hit.host_path : (save_root_ / parsed->rel);
+        const auto target = hit.exists ? hit.host_path : (save_root / parsed->rel);
         std::filesystem::remove(target, ec);
         save_cache_.invalidate(parsed->lower_rel);
         return {};
@@ -442,12 +444,42 @@ void OverlayVfs::invalidate_caches() const {
     game_cache_.clear();
     overlay_cache_.clear();
     save_cache_.clear();
+    save_cache_.root = current_save_root_locked();
     temp_cache_.clear();
 }
 
 CacheStats OverlayVfs::cache_stats() const {
     std::lock_guard lock(mutex_);
     return stats_;
+}
+
+std::filesystem::path OverlayVfs::current_save_root_locked() const {
+    if (active_user_xuid_ == 0) {
+        return save_root_;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "user_%016llx", static_cast<unsigned long long>(active_user_xuid_));
+    return save_root_ / buf;
+}
+
+void OverlayVfs::set_active_user_xuid(uint64_t xuid) {
+    std::lock_guard lock(mutex_);
+    if (active_user_xuid_ == xuid) return;
+    active_user_xuid_ = xuid;
+    save_cache_.clear();
+    save_cache_.root = current_save_root_locked();
+    std::error_code ec;
+    std::filesystem::create_directories(save_cache_.root, ec);
+}
+
+uint64_t OverlayVfs::active_user_xuid() const {
+    std::lock_guard lock(mutex_);
+    return active_user_xuid_;
+}
+
+std::filesystem::path OverlayVfs::active_save_root() const {
+    std::lock_guard lock(mutex_);
+    return current_save_root_locked();
 }
 
 }  // namespace kestrel::vfs

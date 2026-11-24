@@ -54,6 +54,13 @@ public:
 
     CacheStats cache_stats() const;
 
+    // Multi-user save partition isolation:
+    // When xuid == 0 (default), S:\ routes to save_root_.
+    // When xuid != 0, S:\ routes to save_root_ / "user_<xuid>".
+    void set_active_user_xuid(uint64_t xuid);
+    uint64_t active_user_xuid() const;
+    std::filesystem::path active_save_root() const;
+
     const std::filesystem::path& game_root() const { return game_root_; }
     const std::filesystem::path& overlay_root() const { return overlay_root_; }
     const std::filesystem::path& save_root() const { return save_root_; }
@@ -99,11 +106,13 @@ private:
     };
 
     Result<ParsedPath> parse_console_path(std::string_view console_path) const;
+    std::filesystem::path current_save_root_locked() const;
 
     std::filesystem::path game_root_;
     std::filesystem::path overlay_root_;
     std::filesystem::path save_root_;
     std::filesystem::path temp_root_;
+    uint64_t active_user_xuid_ = 0;
     mutable std::mutex mutex_;
     std::unordered_set<std::string> whiteouts_;
     mutable LayerCache game_cache_;

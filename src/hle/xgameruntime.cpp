@@ -10,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace kestrel::hle {
 
@@ -20,6 +21,8 @@ std::atomic<uint32_t> g_users_added{0};
 std::atomic<uint32_t> g_store_contexts{0};
 std::atomic<uint32_t> g_package_queries{0};
 std::atomic<uint32_t> g_async_completed{0};
+std::atomic<uint32_t> g_next_user_index{0};
+std::atomic<uint64_t> g_active_user_xuid{0x000900004B580001ull};
 
 using TaskCallback = void(__stdcall*)(void* context, bool canceled);
 
@@ -38,7 +41,11 @@ struct KxUserHandle {
     uint64_t xuid = 0x000900004B580001ull;
     std::string gamertag = "KestrelPlayer";
     uint32_t local_id = 1;
+    uint32_t controller_index = 0;
 };
+
+std::mutex g_user_table_mtx;
+std::unordered_map<uint32_t, KxUserHandle*> g_users_by_controller;
 
 struct KxStoreContext {
     uint64_t owner_xuid = 0;
@@ -112,7 +119,21 @@ HRESULT __stdcall kx_XAsyncGetStatus(KxXAsyncBlock* async, bool) {
 
 HRESULT __stdcall kx_XUserAddAsync(uint32_t, KxXAsyncBlock* async) {
     if (!async) return E_INVALIDARG;
+    const uint32_t user_idx = g_next_user_index.fetch_add(1, std::memory_order_relaxed) + 1;
     auto* user = new KxUserHandle();
+    user->local_id = user_idx;
+    user->xuid = 0x000900004B580000ull + user_idx;
+    user->gamertag = (user_idx == 1) ? "KestrelPlayer" : ("KestrelPlayer" + std::to_string(user_idx));
+    user->controller_index = user_idx - 1;
+
+    {
+        std::lock_guard lock(g_user_table_mtx);
+        g_users_by_controller[user->controller_index] = user;
+    }
+    if (user_idx == 1) {
+        g_active_user_xuid.store(user->xuid, std::memory_order_relaxed);
+    }
+
     AsyncInternalState st{};
     st.magic = kAsyncMagic;
     st.status = S_OK;
@@ -157,8 +178,43 @@ HRESULT __stdcall kx_XUserGetGamertag(void* user, uint32_t, size_t buf_size, cha
     return S_OK;
 }
 
+HRESULT __stdcall kx_XUserFindControllerUser(uint32_t controller_index, void** out_user) {
+    if (!out_user) return E_INVALIDARG;
+    std::lock_guard lock(g_user_table_mtx);
+    auto it = g_users_by_controller.find(controller_index);
+    if (it != g_users_by_controller.end()) {
+        *out_user = it->second;
+        return S_OK;
+    }
+    *out_user = nullptr;
+    return HRESULT_FROM_WIN32(ERROR_NO_SUCH_USER);
+}
+
+HRESULT __stdcall kx_XUserSetActive(void* user) {
+    if (!user) return E_INVALIDARG;
+    auto* u = static_cast<KxUserHandle*>(user);
+    g_active_user_xuid.store(u->xuid, std::memory_order_relaxed);
+    return S_OK;
+}
+
+uint64_t __stdcall kx_XUserGetActiveXuid() {
+    return g_active_user_xuid.load(std::memory_order_relaxed);
+}
+
 void __stdcall kx_XUserCloseHandle(void* user) {
-    delete static_cast<KxUserHandle*>(user);
+    if (!user) return;
+    auto* u = static_cast<KxUserHandle*>(user);
+    {
+        std::lock_guard lock(g_user_table_mtx);
+        for (auto it = g_users_by_controller.begin(); it != g_users_by_controller.end(); ) {
+            if (it->second == u) {
+                it = g_users_by_controller.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    delete u;
 }
 
 HRESULT __stdcall kx_XPackageGetCurrentProcessPackageIdentifier(size_t buf_size, char* buf) {
@@ -200,6 +256,10 @@ void reset_xgameruntime_stats() {
     g_store_contexts = 0;
     g_package_queries = 0;
     g_async_completed = 0;
+    g_next_user_index = 0;
+    g_active_user_xuid = 0x000900004B580001ull;
+    std::lock_guard lock(g_user_table_mtx);
+    g_users_by_controller.clear();
 }
 
 void register_xgameruntime(Registry& reg) {
@@ -215,6 +275,9 @@ void register_xgameruntime(Registry& reg) {
     reg.register_export("xgameruntime.dll", "XUserAddResult", reinterpret_cast<void*>(&kx_XUserAddResult));
     reg.register_export("xgameruntime.dll", "XUserGetId", reinterpret_cast<void*>(&kx_XUserGetId));
     reg.register_export("xgameruntime.dll", "XUserGetGamertag", reinterpret_cast<void*>(&kx_XUserGetGamertag));
+    reg.register_export("xgameruntime.dll", "XUserFindControllerUser", reinterpret_cast<void*>(&kx_XUserFindControllerUser));
+    reg.register_export("xgameruntime.dll", "XUserSetActive", reinterpret_cast<void*>(&kx_XUserSetActive));
+    reg.register_export("xgameruntime.dll", "XUserGetActiveXuid", reinterpret_cast<void*>(&kx_XUserGetActiveXuid));
     reg.register_export("xgameruntime.dll", "XUserCloseHandle", reinterpret_cast<void*>(&kx_XUserCloseHandle));
     reg.register_export("xgameruntime.dll", "XPackageGetCurrentProcessPackageIdentifier", reinterpret_cast<void*>(&kx_XPackageGetCurrentProcessPackageIdentifier));
     reg.register_export("xgameruntime.dll", "XStoreCreateContext", reinterpret_cast<void*>(&kx_XStoreCreateContext));

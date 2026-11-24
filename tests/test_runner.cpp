@@ -6522,6 +6522,215 @@ void test_d3d12x_commandlist7_enhanced_barriers() {
     KX_CHECK(stats.enhanced_barrier_groups >= 1, "KxGraphicsCommandListProxy telemetry: enhanced_barrier_groups counted");
 }
 
+void test_xaudio2_surround_5point1_and_7point1_downmix() {
+    hle::reset_xaudio2_stats();
+
+    // 1. Verify speaker channel masks
+    static_assert(hle::KxSpeakerStereo == 0x3, "KxSpeakerStereo == 0x3");
+    static_assert(hle::KxSpeaker5Point1 == 0x3F, "KxSpeaker5Point1 == 0x3F");
+    static_assert(hle::KxSpeaker7Point1 == 0x63F, "KxSpeaker7Point1 == 0x63F");
+
+    hle::Registry reg;
+    hle::register_xaudio2(reg);
+
+    using XAudio2CreateFn = HRESULT(__stdcall*)(void**, uint32_t, uint32_t);
+    auto xa2_create = reinterpret_cast<XAudio2CreateFn>(reg.resolve_name("xaudio2_9.dll", "XAudio2Create"));
+    KX_CHECK(xa2_create != nullptr, "XAudio2Create resolved");
+
+    void* raw_xa2 = nullptr;
+    KX_CHECK(SUCCEEDED(xa2_create(&raw_xa2, 0, 0)) && raw_xa2, "XAudio2 instance created");
+    auto* xa2 = static_cast<hle::IKxXAudio2*>(raw_xa2);
+
+    hle::IKxMasteringVoice* master = nullptr;
+    KX_CHECK(SUCCEEDED(xa2->CreateMasteringVoice(&master, 2, 48000)) && master, "Stereo mastering voice created");
+
+    // 2. Test 5.1 Surround Source Voice Downmix (ITU-R BS.775)
+    hle::KxWaveFormat fmt51{};
+    fmt51.format_tag = 3;  // f32
+    fmt51.channels = 6;    // 5.1 [FL, FR, FC, LFE, BL, BR]
+    fmt51.sample_rate = 48000;
+    fmt51.bits_per_sample = 32;
+
+    hle::IKxSourceVoice* src51 = nullptr;
+    KX_CHECK(SUCCEEDED(xa2->CreateSourceVoice(&src51, &fmt51)) && src51, "5.1 Source voice created");
+
+    // Submit 64 frames of pure Center channel (FC = index 2) = 1.0f
+    // Per ITU-R BS.775: Left and Right should both receive 0.70710678 * FC = ~0.7071
+    constexpr size_t kFrames = 64;
+    std::vector<float> pcm51(kFrames * 6, 0.0f);
+    for (size_t i = 0; i < kFrames; ++i) {
+        pcm51[i * 6 + 2] = 1.0f; // FC
+    }
+    hle::KxAudioBuffer buf51{};
+    buf51.audio_bytes = static_cast<uint32_t>(pcm51.size() * sizeof(float));
+    buf51.audio_data = reinterpret_cast<const uint8_t*>(pcm51.data());
+
+    KX_CHECK(SUCCEEDED(src51->SubmitSourceBuffer(&buf51)), "Submit 5.1 buffer");
+    KX_CHECK(SUCCEEDED(src51->Start()), "Start 5.1 voice");
+
+    std::vector<float> drained(kFrames * 2, 0.0f);
+    size_t pulled = hle::xaudio2_drain_stereo_f32(drained.data(), kFrames);
+    KX_CHECK(pulled == kFrames, "Drained 64 stereo frames from 5.1 mix");
+    KX_CHECK(std::abs(drained[0] - 0.70710678f) < 1e-4f, "5.1 Center -> Left ITU-R BS.775 0.7071 weight bit-exact");
+    KX_CHECK(std::abs(drained[1] - 0.70710678f) < 1e-4f, "5.1 Center -> Right ITU-R BS.775 0.7071 weight bit-exact");
+
+    src51->DestroyVoice();
+
+    // 3. Test 7.1 Surround Source Voice Downmix (ITU-R BS.775)
+    hle::KxWaveFormat fmt71{};
+    fmt71.format_tag = 3;  // f32
+    fmt71.channels = 8;    // 7.1 [FL, FR, FC, LFE, BL, BR, SL, SR]
+    fmt71.sample_rate = 48000;
+    fmt71.bits_per_sample = 32;
+
+    hle::IKxSourceVoice* src71 = nullptr;
+    KX_CHECK(SUCCEEDED(xa2->CreateSourceVoice(&src71, &fmt71)) && src71, "7.1 Source voice created");
+
+    // Submit 64 frames of Side Left (SL = index 6) = 1.0f
+    // Per ITU-R BS.775: Left gets 0.7071, Right gets 0.0
+    std::vector<float> pcm71(kFrames * 8, 0.0f);
+    for (size_t i = 0; i < kFrames; ++i) {
+        pcm71[i * 8 + 6] = 1.0f; // SL
+    }
+    hle::KxAudioBuffer buf71{};
+    buf71.audio_bytes = static_cast<uint32_t>(pcm71.size() * sizeof(float));
+    buf71.audio_data = reinterpret_cast<const uint8_t*>(pcm71.data());
+
+    KX_CHECK(SUCCEEDED(src71->SubmitSourceBuffer(&buf71)), "Submit 7.1 buffer");
+    KX_CHECK(SUCCEEDED(src71->Start()), "Start 7.1 voice");
+
+    drained.assign(kFrames * 2, 0.0f);
+    pulled = hle::xaudio2_drain_stereo_f32(drained.data(), kFrames);
+    KX_CHECK(pulled == kFrames, "Drained 64 stereo frames from 7.1 mix");
+    KX_CHECK(std::abs(drained[0] - 0.70710678f) < 1e-4f, "7.1 Side Left -> Left 0.7071 weight bit-exact");
+    KX_CHECK(std::abs(drained[1] - 0.0f) < 1e-5f, "7.1 Side Left -> Right 0.0 weight bit-exact");
+
+    src71->DestroyVoice();
+
+    // 4. Test X3DAudio 5.1 and 7.1 Panning Matrix Calculation
+    hle::KxX3DAudioHandle handle{};
+    KX_CHECK(SUCCEEDED(hle::kx_X3DAudioInitialize(hle::KxSpeakerStereo, 343.5f, &handle)), "X3DAudioInitialize 5.1/7.1");
+
+    hle::KxX3DAudioListener listener{};
+    hle::KxX3DAudioEmitter emitter{};
+    emitter.channel_count = 6;
+    emitter.position = {0.0f, 0.0f, 1.0f};
+
+    std::vector<float> matrix51(2 * 6, 0.0f);
+    hle::KxX3DAudioDspSettings dsp51{};
+    dsp51.src_channel_count = 6;
+    dsp51.dst_channel_count = 2;
+    dsp51.matrix_coefficients = matrix51.data();
+
+    hle::kx_X3DAudioCalculate(&handle, &listener, &emitter, hle::KxX3DAudioCalculateMatrix, &dsp51);
+    KX_CHECK(matrix51[0 * 6 + 0] > 0.0f, "5.1 FL -> L positive");
+    KX_CHECK(matrix51[1 * 6 + 1] > 0.0f, "5.1 FR -> R positive");
+    KX_CHECK(matrix51[0 * 6 + 2] > 0.0f && matrix51[1 * 6 + 2] > 0.0f, "5.1 Center -> L+R balanced");
+
+    master->DestroyVoice();
+    xa2->Release();
+}
+
+void test_gdk_multi_user_profile_save_isolation() {
+    hle::reset_xgameruntime_stats();
+
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestMultiUserSave";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    const fs::path base = tmp / "base";
+    const fs::path data = tmp / "data";
+    fs::create_directories(base, ec);
+    fs::create_directories(data, ec);
+
+    vfs::OverlayVfs vfs(base, data);
+    hle::set_kernelx_vfs(&vfs);
+
+    // 1. Create two distinct users via XUserAddAsync
+    hle::KxXAsyncBlock async1{};
+    KX_CHECK(SUCCEEDED(hle::kx_XUserAddAsync(0, &async1)), "XUserAddAsync User 1");
+    void* user1 = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserAddResult(&async1, &user1)) && user1, "XUserAddResult User 1");
+
+    hle::KxXAsyncBlock async2{};
+    KX_CHECK(SUCCEEDED(hle::kx_XUserAddAsync(0, &async2)), "XUserAddAsync User 2");
+    void* user2 = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserAddResult(&async2, &user2)) && user2, "XUserAddResult User 2");
+
+    uint64_t xuid1 = 0, xuid2 = 0;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserGetId(user1, &xuid1)), "XUserGetId User 1");
+    KX_CHECK(SUCCEEDED(hle::kx_XUserGetId(user2, &xuid2)), "XUserGetId User 2");
+    KX_CHECK(xuid1 != xuid2, "Multi-user XUIDs are distinct");
+    KX_CHECK(xuid1 == 0x000900004B580001ull, "User 1 XUID matches standard base");
+    KX_CHECK(xuid2 == 0x000900004B580002ull, "User 2 XUID incremented");
+
+    char tag1[64]{}, tag2[64]{};
+    size_t used1 = 0, used2 = 0;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserGetGamertag(user1, 0, sizeof(tag1), tag1, &used1)), "Gamertag User 1");
+    KX_CHECK(SUCCEEDED(hle::kx_XUserGetGamertag(user2, 0, sizeof(tag2), tag2, &used2)), "Gamertag User 2");
+    KX_CHECK(std::string_view(tag1) == "KestrelPlayer", "User 1 Gamertag matches");
+    KX_CHECK(std::string_view(tag2) == "KestrelPlayer2", "User 2 Gamertag matches");
+
+    // 2. Controller-to-user binding lookup
+    void* ctrl_user0 = nullptr;
+    void* ctrl_user1 = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XUserFindControllerUser(0, &ctrl_user0)) && ctrl_user0 == user1,
+             "Controller slot 0 mapped to User 1");
+    KX_CHECK(SUCCEEDED(hle::kx_XUserFindControllerUser(1, &ctrl_user1)) && ctrl_user1 == user2,
+             "Controller slot 1 mapped to User 2");
+
+    // 3. Isolated S:\ Save Mount Verification
+    // Switch to User 1 and write save.dat
+    vfs.set_active_user_xuid(xuid1);
+    KX_CHECK(vfs.active_user_xuid() == xuid1, "VFS active user xuid set to user 1");
+
+    auto r1 = vfs.resolve("S:\\profile.sav", true);
+    KX_CHECK(r1.has_value(), "S: resolved for write under User 1");
+    {
+        std::ofstream ofs(*r1, std::ios::binary);
+        ofs << "USER_1_GAME_SAVE_DATA_LEVEL_99";
+    }
+    KX_CHECK(vfs.exists("S:\\profile.sav"), "S:\\profile.sav exists for User 1");
+
+    // Switch to User 2: S:\profile.sav must NOT exist (isolated namespace!)
+    vfs.set_active_user_xuid(xuid2);
+    KX_CHECK(vfs.active_user_xuid() == xuid2, "VFS active user xuid switched to user 2");
+    KX_CHECK(!vfs.exists("S:\\profile.sav"), "S:\\profile.sav does NOT bleed into User 2's partition");
+
+    // Write different save data for User 2
+    auto r2 = vfs.resolve("S:\\profile.sav", true);
+    KX_CHECK(r2.has_value() && *r2 != *r1, "User 2 gets separate physical path");
+    {
+        std::ofstream ofs(*r2, std::ios::binary);
+        ofs << "USER_2_GAME_SAVE_DATA_LEVEL_01";
+    }
+    KX_CHECK(vfs.exists("S:\\profile.sav"), "S:\\profile.sav exists for User 2");
+
+    // Verify isolation by reading content back for each user
+    vfs.set_active_user_xuid(xuid1);
+    auto p1 = vfs.resolve("S:\\profile.sav", false);
+    std::string content1;
+    {
+        std::ifstream ifs(*p1, std::ios::binary);
+        ifs >> content1;
+    }
+    KX_CHECK(content1 == "USER_1_GAME_SAVE_DATA_LEVEL_99", "User 1 save content verified");
+
+    vfs.set_active_user_xuid(xuid2);
+    auto p2 = vfs.resolve("S:\\profile.sav", false);
+    std::string content2;
+    {
+        std::ifstream ifs(*p2, std::ios::binary);
+        ifs >> content2;
+    }
+    KX_CHECK(content2 == "USER_2_GAME_SAVE_DATA_LEVEL_01", "User 2 save content verified");
+
+    // Cleanup handles & VFS
+    hle::kx_XUserCloseHandle(user1);
+    hle::kx_XUserCloseHandle(user2);
+    hle::set_kernelx_vfs(nullptr);
+    fs::remove_all(tmp, ec);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6595,6 +6804,8 @@ int main(int argc, char** argv) {
     run_test("PE32+ DIR64 & HIGHLOW Base Relocations", test_pe_dir64_and_highlow_relocations);
     run_test("PE32+ Loader Bounds Hardening & Error Rollback", test_pe_bounds_hardening_and_rollback);
     run_test("HLE Registry Multi-Page (>2048 Stubs) Thunk Cleanup", test_registry_multipage_thunk_cleanup);
+    run_test("Spatial Audio 5.1 & 7.1 Multi-Channel Surround Downmix Matrix (ITU-R BS.775)", test_xaudio2_surround_5point1_and_7point1_downmix);
+    run_test("GDK Multi-User Profile Identity, Controller Binding & Isolated S:\\ Saves", test_gdk_multi_user_profile_save_isolation);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

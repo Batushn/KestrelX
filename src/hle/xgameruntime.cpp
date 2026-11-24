@@ -5,12 +5,14 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kestrel::hle {
 
@@ -21,8 +23,18 @@ std::atomic<uint32_t> g_users_added{0};
 std::atomic<uint32_t> g_store_contexts{0};
 std::atomic<uint32_t> g_package_queries{0};
 std::atomic<uint32_t> g_async_completed{0};
+std::atomic<uint32_t> g_runtime_inits{0};
+std::atomic<uint32_t> g_licenses_acquired{0};
+std::atomic<uint32_t> g_active_licenses{0};
+std::atomic<uint32_t> g_packages_mounted{0};
+std::atomic<uint32_t> g_containers_decrypted{0};
+std::atomic<uint64_t> g_decrypted_bytes{0};
 std::atomic<uint32_t> g_next_user_index{0};
 std::atomic<uint64_t> g_active_user_xuid{0x000900004B580001ull};
+std::atomic<bool> g_runtime_initialized{false};
+
+vfs::OverlayVfs* g_vfs = nullptr;
+formats::GdkKeyRing g_keyring;
 
 using TaskCallback = void(__stdcall*)(void* context, bool canceled);
 
@@ -52,6 +64,36 @@ struct KxStoreContext {
     bool license_active = true;
 };
 
+struct RegisteredPackageEntry {
+    formats::GdkKeyId key_id{};
+    std::string license_token;
+    std::filesystem::path container_path;
+    std::string mount_prefix = "GAME:\\";
+};
+
+std::mutex g_pkg_mtx;
+std::unordered_map<std::string, RegisteredPackageEntry> g_registered_packages;
+std::vector<KxXStoreAddonLicense> g_addon_licenses;
+
+struct KxStoreLicenseHandle {
+    std::string package_or_store_id;
+    bool is_valid = false;
+    bool is_durable = false;
+};
+
+struct KxPackageMountHandle {
+    std::string package_id;
+    std::string mount_path;
+};
+
+struct KxCanAcquireAsyncResult {
+    KxXStoreCanAcquireLicenseResult value{};
+};
+
+struct KxAddonQueryAsyncResult {
+    std::vector<KxXStoreAddonLicense> items;
+};
+
 struct AsyncInternalState {
     uint32_t magic = 0;
     HRESULT status = E_PENDING;
@@ -68,7 +110,123 @@ void __stdcall async_completion_trampoline(void* ctx, bool) {
     }
 }
 
+void complete_async(KxXAsyncBlock* async, HRESULT hr, void* result_ptr) {
+    AsyncInternalState st{};
+    st.magic = kAsyncMagic;
+    st.status = hr;
+    st.result_ptr = result_ptr;
+    std::memcpy(async->internal, &st, sizeof(st));
+    g_async_completed.fetch_add(1, std::memory_order_relaxed);
+
+    if (async->queue && async->callback) {
+        kx_XTaskQueueSubmitCallback(async->queue, 1, async, &async_completion_trampoline);
+    } else if (async->callback) {
+        async->callback(async);
+    }
+}
+
+void copy_cstr_trunc(char* dst, size_t dst_cap, std::string_view src) {
+    if (!dst || dst_cap == 0) return;
+    const size_t n = (std::min)(src.size(), dst_cap - 1);
+    if (n > 0) std::memcpy(dst, src.data(), n);
+    dst[n] = '\0';
+}
+
+HRESULT acquire_license_impl(void* store_ctx, const char* id, bool is_durable, KxXAsyncBlock* async) {
+    if (!store_ctx || !id || id[0] == '\0' || !async) return E_INVALIDARG;
+    const std::string key_str(id);
+
+    HRESULT status = S_OK;
+    bool valid = true;
+
+    RegisteredPackageEntry entry{};
+    bool found_entry = false;
+    {
+        std::lock_guard lock(g_pkg_mtx);
+        auto it = g_registered_packages.find(key_str);
+        if (it != g_registered_packages.end()) {
+            entry = it->second;
+            found_entry = true;
+        }
+    }
+
+    if (found_entry) {
+        if (!entry.license_token.empty()) {
+            auto derived = formats::GdkKeyRing::derive_key_from_token(entry.license_token, entry.key_id);
+            if (derived) {
+                g_keyring.register_key(entry.key_id, *derived);
+            } else {
+                status = E_FAIL;
+                valid = false;
+            }
+        } else if (!g_keyring.find_key(entry.key_id).has_value()) {
+            status = E_ACCESSDENIED;
+            valid = false;
+        }
+    }
+
+    if (SUCCEEDED(status) && is_durable) {
+        std::lock_guard lock(g_pkg_mtx);
+        bool updated = false;
+        for (auto& addon : g_addon_licenses) {
+            if (std::string_view(addon.sku_store_id) == key_str) {
+                addon.is_active = true;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            KxXStoreAddonLicense addon{};
+            copy_cstr_trunc(addon.sku_store_id, sizeof(addon.sku_store_id), key_str);
+            copy_cstr_trunc(addon.in_app_offer_token, sizeof(addon.in_app_offer_token), "kestrel-durable-token");
+            addon.is_active = true;
+            addon.expiration_date = 0x7FFFFFFFFFFFFFFFull;
+            g_addon_licenses.push_back(addon);
+        }
+    }
+
+    auto* lic = new KxStoreLicenseHandle();
+    lic->package_or_store_id = key_str;
+    lic->is_valid = valid;
+    lic->is_durable = is_durable;
+
+    complete_async(async, status, lic);
+    return S_OK;
+}
+
+HRESULT acquire_license_result_impl(KxXAsyncBlock* async, void** out_license) {
+    if (!async || !out_license) return E_INVALIDARG;
+    AsyncInternalState st{};
+    std::memcpy(&st, async->internal, sizeof(st));
+    if (st.magic != kAsyncMagic) return E_PENDING;
+
+    auto* lic = static_cast<KxStoreLicenseHandle*>(st.result_ptr);
+    if (FAILED(st.status)) {
+        delete lic;
+        st.result_ptr = nullptr;
+        std::memcpy(async->internal, &st, sizeof(st));
+        *out_license = nullptr;
+        return st.status;
+    }
+    if (!lic) return E_PENDING;
+
+    *out_license = lic;
+    g_licenses_acquired.fetch_add(1, std::memory_order_relaxed);
+    g_active_licenses.fetch_add(1, std::memory_order_relaxed);
+    return S_OK;
+}
+
 }  // namespace
+
+HRESULT __stdcall kx_XGameRuntimeInitialize() {
+    g_runtime_initialized.store(true, std::memory_order_relaxed);
+    g_runtime_inits.fetch_add(1, std::memory_order_relaxed);
+    return S_OK;
+}
+
+void __stdcall kx_XGameRuntimeUninitialize() {
+    g_runtime_initialized.store(false, std::memory_order_relaxed);
+}
 
 HRESULT __stdcall kx_XGameGetXboxTitleId(uint32_t* out_id) {
     if (!out_id) return E_INVALIDARG;
@@ -134,18 +292,7 @@ HRESULT __stdcall kx_XUserAddAsync(uint32_t, KxXAsyncBlock* async) {
         g_active_user_xuid.store(user->xuid, std::memory_order_relaxed);
     }
 
-    AsyncInternalState st{};
-    st.magic = kAsyncMagic;
-    st.status = S_OK;
-    st.result_ptr = user;
-    std::memcpy(async->internal, &st, sizeof(st));
-    g_async_completed.fetch_add(1, std::memory_order_relaxed);
-
-    if (async->queue && async->callback) {
-        kx_XTaskQueueSubmitCallback(async->queue, 1, async, &async_completion_trampoline);
-    } else if (async->callback) {
-        async->callback(async);
-    }
+    complete_async(async, S_OK, user);
     return S_OK;
 }
 
@@ -227,6 +374,110 @@ HRESULT __stdcall kx_XPackageGetCurrentProcessPackageIdentifier(size_t buf_size,
     return S_OK;
 }
 
+HRESULT __stdcall kx_XPackageMountWithUiAsync(const char* package_id, KxXAsyncBlock* async) {
+    if (!package_id || package_id[0] == '\0' || !async) return E_INVALIDARG;
+    const std::string pkg_key(package_id);
+
+    RegisteredPackageEntry entry{};
+    bool found_entry = false;
+    {
+        std::lock_guard lock(g_pkg_mtx);
+        auto it = g_registered_packages.find(pkg_key);
+        if (it != g_registered_packages.end()) {
+            entry = it->second;
+            found_entry = true;
+        }
+    }
+
+    std::filesystem::path container_path;
+    std::string mount_prefix = "GAME:\\";
+    if (found_entry) {
+        container_path = entry.container_path;
+        mount_prefix = entry.mount_prefix;
+    } else {
+        std::error_code ec;
+        std::filesystem::path p(pkg_key);
+        if (std::filesystem::exists(p, ec) && std::filesystem::is_regular_file(p, ec)) {
+            container_path = p;
+        }
+    }
+
+    auto* mount = new KxPackageMountHandle();
+    mount->package_id = pkg_key;
+    mount->mount_path = g_vfs ? g_vfs->overlay_root().string() : "G:\\";
+
+    HRESULT status = S_OK;
+    if (!container_path.empty()) {
+        auto parsed = formats::GdkContentContainer::parse_file(container_path);
+        if (!parsed) {
+            status = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        } else if (g_vfs) {
+            auto mounted = parsed->mount_to_vfs(*g_vfs, g_keyring, mount_prefix);
+            if (!mounted) {
+                status = E_ACCESSDENIED;
+            } else {
+                uint64_t total_seg_bytes = 0;
+                for (const auto& seg : parsed->segments()) {
+                    total_seg_bytes += seg.logical_size;
+                }
+                g_packages_mounted.fetch_add(1, std::memory_order_relaxed);
+                if (parsed->header().cipher == formats::GdkCipherMode::Aes128Ctr) {
+                    g_containers_decrypted.fetch_add(1, std::memory_order_relaxed);
+                    g_decrypted_bytes.fetch_add(total_seg_bytes, std::memory_order_relaxed);
+                }
+            }
+        } else {
+            g_packages_mounted.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        if (g_vfs) {
+            mount->mount_path = g_vfs->game_root().string();
+        }
+        g_packages_mounted.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    complete_async(async, status, mount);
+    return S_OK;
+}
+
+HRESULT __stdcall kx_XPackageMountWithUiResult(KxXAsyncBlock* async, void** out_mount) {
+    if (!async || !out_mount) return E_INVALIDARG;
+    AsyncInternalState st{};
+    std::memcpy(&st, async->internal, sizeof(st));
+    if (st.magic != kAsyncMagic) return E_PENDING;
+
+    auto* mount = static_cast<KxPackageMountHandle*>(st.result_ptr);
+    if (FAILED(st.status)) {
+        delete mount;
+        st.result_ptr = nullptr;
+        std::memcpy(async->internal, &st, sizeof(st));
+        *out_mount = nullptr;
+        return st.status;
+    }
+    if (!mount) return E_PENDING;
+    *out_mount = mount;
+    return S_OK;
+}
+
+HRESULT __stdcall kx_XPackageGetMountPathSize(void* mount, size_t* path_size) {
+    if (!mount || !path_size) return E_INVALIDARG;
+    *path_size = static_cast<KxPackageMountHandle*>(mount)->mount_path.size() + 1;
+    return S_OK;
+}
+
+HRESULT __stdcall kx_XPackageGetMountPath(void* mount, size_t path_size, char* path) {
+    if (!mount || !path || path_size == 0) return E_INVALIDARG;
+    const auto& mp = static_cast<KxPackageMountHandle*>(mount)->mount_path;
+    const size_t needed = mp.size() + 1;
+    if (path_size < needed) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, mp.c_str(), needed);
+    return S_OK;
+}
+
+void __stdcall kx_XPackageCloseMountHandle(void* mount) {
+    delete static_cast<KxPackageMountHandle*>(mount);
+}
+
 HRESULT __stdcall kx_XStoreCreateContext(void* user, void** out_ctx) {
     if (!out_ctx) return E_INVALIDARG;
     auto* ctx = new KxStoreContext();
@@ -240,7 +491,117 @@ void __stdcall kx_XStoreCloseContextHandle(void* ctx) {
     delete static_cast<KxStoreContext*>(ctx);
 }
 
+HRESULT __stdcall kx_XStoreAcquireLicenseForPackageAsync(void* store_ctx, const char* package_id, KxXAsyncBlock* async) {
+    return acquire_license_impl(store_ctx, package_id, /*is_durable=*/false, async);
+}
+
+HRESULT __stdcall kx_XStoreAcquireLicenseForPackageResult(KxXAsyncBlock* async, void** out_license) {
+    return acquire_license_result_impl(async, out_license);
+}
+
+HRESULT __stdcall kx_XStoreAcquireLicenseForDurablesAsync(void* store_ctx, const char* store_id, KxXAsyncBlock* async) {
+    return acquire_license_impl(store_ctx, store_id, /*is_durable=*/true, async);
+}
+
+HRESULT __stdcall kx_XStoreAcquireLicenseForDurablesResult(KxXAsyncBlock* async, void** out_license) {
+    return acquire_license_result_impl(async, out_license);
+}
+
+HRESULT __stdcall kx_XStoreCanAcquireLicenseForStoreIdAsync(void* store_ctx, const char* store_id, KxXAsyncBlock* async) {
+    if (!store_ctx || !store_id || store_id[0] == '\0' || !async) return E_INVALIDARG;
+    auto* res = new KxCanAcquireAsyncResult();
+    res->value.status = 1;  // Licensable
+    copy_cstr_trunc(res->value.store_id, sizeof(res->value.store_id), store_id);
+    complete_async(async, S_OK, res);
+    return S_OK;
+}
+
+HRESULT __stdcall kx_XStoreCanAcquireLicenseForStoreIdResult(KxXAsyncBlock* async, KxXStoreCanAcquireLicenseResult* out_result) {
+    if (!async || !out_result) return E_INVALIDARG;
+    AsyncInternalState st{};
+    std::memcpy(&st, async->internal, sizeof(st));
+    if (st.magic != kAsyncMagic || !st.result_ptr) return E_PENDING;
+    auto* res = static_cast<KxCanAcquireAsyncResult*>(st.result_ptr);
+    *out_result = res->value;
+    delete res;
+    st.result_ptr = nullptr;
+    std::memcpy(async->internal, &st, sizeof(st));
+    return st.status;
+}
+
+bool __stdcall kx_XStoreIsLicenseValid(void* license) {
+    if (!license) return false;
+    return static_cast<KxStoreLicenseHandle*>(license)->is_valid;
+}
+
+void __stdcall kx_XStoreCloseLicenseHandle(void* license) {
+    if (!license) return;
+    auto* lic = static_cast<KxStoreLicenseHandle*>(license);
+    if (lic->is_valid) {
+        uint32_t prev = g_active_licenses.load(std::memory_order_relaxed);
+        while (prev > 0 && !g_active_licenses.compare_exchange_weak(prev, prev - 1, std::memory_order_relaxed)) {}
+    }
+    lic->is_valid = false;
+    delete lic;
+}
+
+HRESULT __stdcall kx_XStoreQueryAddOnLicensesAsync(void* store_ctx, KxXAsyncBlock* async) {
+    if (!store_ctx || !async) return E_INVALIDARG;
+    auto* res = new KxAddonQueryAsyncResult();
+    {
+        std::lock_guard lock(g_pkg_mtx);
+        res->items = g_addon_licenses;
+    }
+    complete_async(async, S_OK, res);
+    return S_OK;
+}
+
+HRESULT __stdcall kx_XStoreQueryAddOnLicensesResultCount(KxXAsyncBlock* async, uint32_t* count) {
+    if (!async || !count) return E_INVALIDARG;
+    AsyncInternalState st{};
+    std::memcpy(&st, async->internal, sizeof(st));
+    if (st.magic != kAsyncMagic || !st.result_ptr) return E_PENDING;
+    auto* res = static_cast<KxAddonQueryAsyncResult*>(st.result_ptr);
+    *count = static_cast<uint32_t>(res->items.size());
+    return st.status;
+}
+
+HRESULT __stdcall kx_XStoreQueryAddOnLicensesResult(KxXAsyncBlock* async, uint32_t count, KxXStoreAddonLicense* licenses) {
+    if (!async || (count > 0 && !licenses)) return E_INVALIDARG;
+    AsyncInternalState st{};
+    std::memcpy(&st, async->internal, sizeof(st));
+    if (st.magic != kAsyncMagic || !st.result_ptr) return E_PENDING;
+    auto* res = static_cast<KxAddonQueryAsyncResult*>(st.result_ptr);
+    const size_t n = (std::min)(static_cast<size_t>(count), res->items.size());
+    for (size_t i = 0; i < n; ++i) {
+        licenses[i] = res->items[i];
+    }
+    delete res;
+    st.result_ptr = nullptr;
+    std::memcpy(async->internal, &st, sizeof(st));
+    return st.status;
+}
+
 void set_xgameruntime_title_id(uint32_t title_id) { g_title_id = title_id; }
+
+void set_xgameruntime_vfs(vfs::OverlayVfs* vfs) { g_vfs = vfs; }
+
+formats::GdkKeyRing& xgameruntime_keyring() { return g_keyring; }
+
+void register_gdk_package_license(
+    std::string_view package_or_store_id,
+    const formats::GdkKeyId& key_id,
+    std::string_view license_token,
+    const std::filesystem::path& container_path,
+    std::string_view mount_prefix) {
+    std::lock_guard lock(g_pkg_mtx);
+    RegisteredPackageEntry entry{};
+    entry.key_id = key_id;
+    entry.license_token = std::string(license_token);
+    entry.container_path = container_path;
+    entry.mount_prefix = mount_prefix.empty() ? std::string("GAME:\\") : std::string(mount_prefix);
+    g_registered_packages[std::string(package_or_store_id)] = std::move(entry);
+}
 
 XGameRuntimeStats xgameruntime_stats() {
     return {
@@ -248,6 +609,12 @@ XGameRuntimeStats xgameruntime_stats() {
         g_store_contexts.load(std::memory_order_relaxed),
         g_package_queries.load(std::memory_order_relaxed),
         g_async_completed.load(std::memory_order_relaxed),
+        g_runtime_inits.load(std::memory_order_relaxed),
+        g_licenses_acquired.load(std::memory_order_relaxed),
+        g_active_licenses.load(std::memory_order_relaxed),
+        g_packages_mounted.load(std::memory_order_relaxed),
+        g_containers_decrypted.load(std::memory_order_relaxed),
+        g_decrypted_bytes.load(std::memory_order_relaxed),
     };
 }
 
@@ -256,14 +623,31 @@ void reset_xgameruntime_stats() {
     g_store_contexts = 0;
     g_package_queries = 0;
     g_async_completed = 0;
+    g_runtime_inits = 0;
+    g_licenses_acquired = 0;
+    g_active_licenses = 0;
+    g_packages_mounted = 0;
+    g_containers_decrypted = 0;
+    g_decrypted_bytes = 0;
     g_next_user_index = 0;
     g_active_user_xuid = 0x000900004B580001ull;
-    std::lock_guard lock(g_user_table_mtx);
-    g_users_by_controller.clear();
+    g_runtime_initialized = false;
+    g_keyring.clear();
+    {
+        std::lock_guard lock(g_user_table_mtx);
+        g_users_by_controller.clear();
+    }
+    {
+        std::lock_guard lock(g_pkg_mtx);
+        g_registered_packages.clear();
+        g_addon_licenses.clear();
+    }
 }
 
 void register_xgameruntime(Registry& reg) {
     reg.register_module("xgameruntime.dll");
+    reg.register_export("xgameruntime.dll", "XGameRuntimeInitialize", reinterpret_cast<void*>(&kx_XGameRuntimeInitialize));
+    reg.register_export("xgameruntime.dll", "XGameRuntimeUninitialize", reinterpret_cast<void*>(&kx_XGameRuntimeUninitialize));
     reg.register_export("xgameruntime.dll", "XGameGetXboxTitleId", reinterpret_cast<void*>(&kx_XGameGetXboxTitleId));
     reg.register_export("xgameruntime.dll", "XSystemGetDeviceType", reinterpret_cast<void*>(&kx_XSystemGetDeviceType));
     reg.register_export("xgameruntime.dll", "XTaskQueueCreate", reinterpret_cast<void*>(&kx_XTaskQueueCreate));
@@ -280,8 +664,24 @@ void register_xgameruntime(Registry& reg) {
     reg.register_export("xgameruntime.dll", "XUserGetActiveXuid", reinterpret_cast<void*>(&kx_XUserGetActiveXuid));
     reg.register_export("xgameruntime.dll", "XUserCloseHandle", reinterpret_cast<void*>(&kx_XUserCloseHandle));
     reg.register_export("xgameruntime.dll", "XPackageGetCurrentProcessPackageIdentifier", reinterpret_cast<void*>(&kx_XPackageGetCurrentProcessPackageIdentifier));
+    reg.register_export("xgameruntime.dll", "XPackageMountWithUiAsync", reinterpret_cast<void*>(&kx_XPackageMountWithUiAsync));
+    reg.register_export("xgameruntime.dll", "XPackageMountWithUiResult", reinterpret_cast<void*>(&kx_XPackageMountWithUiResult));
+    reg.register_export("xgameruntime.dll", "XPackageGetMountPathSize", reinterpret_cast<void*>(&kx_XPackageGetMountPathSize));
+    reg.register_export("xgameruntime.dll", "XPackageGetMountPath", reinterpret_cast<void*>(&kx_XPackageGetMountPath));
+    reg.register_export("xgameruntime.dll", "XPackageCloseMountHandle", reinterpret_cast<void*>(&kx_XPackageCloseMountHandle));
     reg.register_export("xgameruntime.dll", "XStoreCreateContext", reinterpret_cast<void*>(&kx_XStoreCreateContext));
     reg.register_export("xgameruntime.dll", "XStoreCloseContextHandle", reinterpret_cast<void*>(&kx_XStoreCloseContextHandle));
+    reg.register_export("xgameruntime.dll", "XStoreAcquireLicenseForPackageAsync", reinterpret_cast<void*>(&kx_XStoreAcquireLicenseForPackageAsync));
+    reg.register_export("xgameruntime.dll", "XStoreAcquireLicenseForPackageResult", reinterpret_cast<void*>(&kx_XStoreAcquireLicenseForPackageResult));
+    reg.register_export("xgameruntime.dll", "XStoreAcquireLicenseForDurablesAsync", reinterpret_cast<void*>(&kx_XStoreAcquireLicenseForDurablesAsync));
+    reg.register_export("xgameruntime.dll", "XStoreAcquireLicenseForDurablesResult", reinterpret_cast<void*>(&kx_XStoreAcquireLicenseForDurablesResult));
+    reg.register_export("xgameruntime.dll", "XStoreCanAcquireLicenseForStoreIdAsync", reinterpret_cast<void*>(&kx_XStoreCanAcquireLicenseForStoreIdAsync));
+    reg.register_export("xgameruntime.dll", "XStoreCanAcquireLicenseForStoreIdResult", reinterpret_cast<void*>(&kx_XStoreCanAcquireLicenseForStoreIdResult));
+    reg.register_export("xgameruntime.dll", "XStoreIsLicenseValid", reinterpret_cast<void*>(&kx_XStoreIsLicenseValid));
+    reg.register_export("xgameruntime.dll", "XStoreCloseLicenseHandle", reinterpret_cast<void*>(&kx_XStoreCloseLicenseHandle));
+    reg.register_export("xgameruntime.dll", "XStoreQueryAddOnLicensesAsync", reinterpret_cast<void*>(&kx_XStoreQueryAddOnLicensesAsync));
+    reg.register_export("xgameruntime.dll", "XStoreQueryAddOnLicensesResultCount", reinterpret_cast<void*>(&kx_XStoreQueryAddOnLicensesResultCount));
+    reg.register_export("xgameruntime.dll", "XStoreQueryAddOnLicensesResult", reinterpret_cast<void*>(&kx_XStoreQueryAddOnLicensesResult));
 }
 
 }  // namespace kestrel::hle

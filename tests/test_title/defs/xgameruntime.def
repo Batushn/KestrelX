@@ -1,5 +1,7 @@
 LIBRARY xgameruntime
 EXPORTS
+    XGameRuntimeInitialize
+    XGameRuntimeUninitialize
     XGameGetXboxTitleId
     XSystemGetDeviceType
     XTaskQueueCreate
@@ -11,7 +13,26 @@ EXPORTS
     XUserAddResult
     XUserGetId
     XUserGetGamertag
+    XUserFindControllerUser
+    XUserSetActive
+    XUserGetActiveXuid
     XUserCloseHandle
     XPackageGetCurrentProcessPackageIdentifier
+    XPackageMountWithUiAsync
+    XPackageMountWithUiResult
+    XPackageGetMountPathSize
+    XPackageGetMountPath
+    XPackageCloseMountHandle
     XStoreCreateContext
     XStoreCloseContextHandle
+    XStoreAcquireLicenseForPackageAsync
+    XStoreAcquireLicenseForPackageResult
+    XStoreAcquireLicenseForDurablesAsync
+    XStoreAcquireLicenseForDurablesResult
+    XStoreCanAcquireLicenseForStoreIdAsync
+    XStoreCanAcquireLicenseForStoreIdResult
+    XStoreIsLicenseValid
+    XStoreCloseLicenseHandle
+    XStoreQueryAddOnLicensesAsync
+    XStoreQueryAddOnLicensesResultCount
+    XStoreQueryAddOnLicensesResult

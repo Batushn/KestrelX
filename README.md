@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0-2ea44f?style=for-the-badge" alt="Release: v0.7.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-63%2F63_PASS-brightgreen?style=for-the-badge" alt="Tests: 63/63 PASS" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-64%2F64_PASS-brightgreen?style=for-the-badge" alt="Tests: 64/64 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
     <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
@@ -132,7 +132,7 @@ flowchart LR
 | **WindowHost & PresentX** | `████████░░ 85%` | ✅ Ready | Win32 `WindowHost` + `IDXGISwapChain3` flip-model (`--windowed`), headless GPU readback BMP capture (`--capture`), `D3D12PresentX` | Fullscreen borderless toggle & frame-pacing telemetry HUD |
 | **Input (`gameinput.dll`)** | `█████████░ 95%` | ✅ Ready | COM `GameInputCreate`, multi-controller slot management (0..3), dynamic hotplugging callbacks & telemetry, impulse trigger force-feedback + dual-motor rumble bridging | Virtual gamepad remapping & deadzone calibration |
 | **Audio (`xaudio2_9.dll`)** | `██████████ 98%` | ✅ Ready | COM `XAudio2Create`, multi-voice software mixer, submix bus routing, non-48kHz pitch resampling, X3DAudio 3D spatial positioning, ITU-R BS.775 5.1 & 7.1 surround downmixing matrix, WASAPI thread lifecycle | WASAPI exclusive mode stream sync |
-| **KernelX & GDK HLE** | `█████████░ 95%` | ✅ Ready | `XMemAlloc`/`Free`/`Size`, `TitleMemoryStatus`, `CreateFileA/W/2`, `ReadFileEx`, `XTaskQueue*`, DirectStorage 1.2 GDeflate GPU streaming, multi-user identity profiles (`kx_XUserAddAsync`, `kx_XUserFindControllerUser`, `kx_XUserSetActive`), controller binding, isolated `S:\` save partitions | Cloud save sync stubbing |
+| **KernelX & GDK HLE** | `█████████░ 95%` | ✅ Ready | `XMemAlloc`/`Free`/`Size`, `TitleMemoryStatus`, `CreateFileA/W/2`, `ReadFileEx`, `XTaskQueue*`, DirectStorage 1.2 GDeflate GPU streaming, multi-user identity profiles (`kx_XUserAddAsync`, `kx_XUserFindControllerUser`, `kx_XUserSetActive`), controller binding, isolated `S:\` save partitions, clean-room `KXVC` AES-128-CTR / pass-through containers (`GdkContentContainer`, `GdkKeyRing`), `XStoreAcquireLicense*`, `XPackageMountWithUiAsync` VFS decryption | Cloud save sync stubbing |
 | **GFX10 Texture Tiling** | `█████████░ 90%` | ✅ Ready | Clean-room 2D swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block tiling, 256B-aligned multi-level mip-chains, SGD5 archive decompression, 64KB SVT virtual texture layout & LRU physical tile pool | 3D/Array volume tiling & live upload staging |
 
 ---
@@ -150,7 +150,8 @@ KestrelX v0.7.0 delivers major architectural expansions across the graphics, com
 * **Audio & Input Hardening**: Multi-voice XAudio2 mixer with submix routing, pitch resampling, X3DAudio spatialization, and 4-slot GameInput multi-controller hotplugging.
 * **GDK Agility SDK Query & Dynamic DLL Redirection**: Discovers guest exports `D3D12SDKVersion` and `D3D12SDKPath`, automatically mounts packaged SDK directories to search paths, and transparently redirects guest imports for `d3d12.dll` and `d3d12core.dll` to KestrelX HLE shims (`kx_D3D12GetInterface`, `D3D12CreateDevice`).
 * **Sparse Virtual Texturing (SVT) & Feedback Maps**: 64KB physical page table (`VirtualTexturePageTable`) with LRU eviction, `SvtFeedbackAnalyzer` (RGBA8 residency & min-mip feedback maps), RDNA2 `MIMG` `TFE=1` (`CheckAccessFullyMapped`) lifting, and real D3D12 `CreateReservedResource` + `UpdateTileMappings` + `CopyTiles` telemetry.
-* **Dual-GPU Verification Expanded to 63/63 PASS**: Every feature tested bit-exact across physical NVIDIA RTX 4060 and AMD Radeon 780M hardware, plus `--unit-only` mode (49 passed, 14 skipped) and GitHub Actions CI.
+* **GDK Cryptographic Container (`KXVC`) & License Decryption Shim**: Clean-room `GdkContentContainer` supporting transparent unencrypted pass-through (`GdkCipherMode::None`) and seekable Win32 CNG AES-128-CTR stream decryption (`GdkCipherMode::Aes128Ctr`) with CRC32 segment verification, `GdkKeyRing` SHA-256 token key derivation, and full `xgameruntime.dll` HLE shims (`XGameRuntimeInitialize`, `XStoreAcquireLicenseForPackageAsync`/`Durables`/`CanAcquireLicense`/`QueryAddOnLicenses`, `XPackageMountWithUiAsync` -> `OverlayVfs`).
+* **Dual-GPU Verification Expanded to 64/64 PASS**: Every feature tested bit-exact across physical NVIDIA RTX 4060 and AMD Radeon 780M hardware, plus `--unit-only` mode (50 passed, 14 skipped) and GitHub Actions CI.
 
 ---
 
@@ -295,7 +296,8 @@ KestrelX Verification Suite
   [PASS] GDK Agility SDK Query, Dynamic DLL Redirection & Modern D3D12/D3D12Core HLE Export Shims
   [PASS] Sparse Virtual Texturing (SVT) 64KB Page Table, LRU Eviction, Feedback & RDNA2 TFE
   [PASS] Sparse Virtual Texturing (SVT) Reserved Resource, TFE Feedback & LRU Remap on Dual-GPU Hardware
-Summary: 63 passed, 0 failed
+  [PASS] GDK Cryptographic Container (KXVC AES-128-CTR / Pass-Through) & XStore/XPackage License Decryption
+Summary: 64 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

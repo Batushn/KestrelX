@@ -236,6 +236,7 @@ int cmd_run(const fs::path& target, int adapter_index, fs::path data_dir,
     hle::Registry registry;
     hle::set_kernelx_vfs(&overlay);
     hle::set_dstorage_vfs(&overlay);
+    hle::set_xgameruntime_vfs(&overlay);
     hle::set_xgameruntime_title_id(title_id);
     hle::set_d3d12x_preferred_adapter(adapter_index);
     hle::set_d3d12x_windowed(windowed, 512, 512);

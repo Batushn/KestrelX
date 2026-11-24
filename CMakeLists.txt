@@ -49,9 +49,10 @@ add_library(kestrel_core STATIC
     src/gpu/vrs.cpp
     src/gpu/work_graph.cpp
     src/formats/sgd5.cpp
+    src/formats/gdk_container.cpp
 )
 target_include_directories(kestrel_core PUBLIC include)
-target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32 user32 gdi32 cabinet)
+target_link_libraries(kestrel_core PUBLIC d3d12 dxgi dxguid ole32 user32 gdi32 cabinet bcrypt)
 
 add_executable(kestrel src/cli/main.cpp)
 target_link_libraries(kestrel PRIVATE kestrel_core)

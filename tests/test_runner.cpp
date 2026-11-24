@@ -23,6 +23,7 @@
 #include "kestrel/loader/pe_image.hpp"
 #include "kestrel/loader/pe_loader.hpp"
 #include "kestrel/vfs/overlay_vfs.hpp"
+#include "kestrel/formats/gdk_container.hpp"
 #include "kestrel/formats/sgd5.hpp"
 
 #include <dxgi1_6.h>
@@ -7539,6 +7540,249 @@ void test_svt_reserved_resource_tfe_feedback_dual_gpu() {
     hle::set_d3d12x_preferred_adapter(-1);
 }
 
+
+void test_gdk_crypto_container_and_xstore_license_decryption() {
+    hle::reset_xgameruntime_stats();
+
+    const fs::path temp_dir = fs::temp_directory_path() / "KestrelX_GdkCryptoTest";
+    std::error_code ec;
+    fs::remove_all(temp_dir, ec);
+    fs::create_directories(temp_dir / "game_base", ec);
+    fs::create_directories(temp_dir / "data_overlay", ec);
+
+    vfs::OverlayVfs vfs(temp_dir / "game_base", temp_dir / "data_overlay");
+    hle::set_xgameruntime_vfs(&vfs);
+
+    // 1. Transparent unencrypted (GdkCipherMode::None) KXVC container pass-through
+    const formats::GdkKeyId zero_kid{};
+    const formats::GdkIvNonce zero_iv{};
+    const std::string plain_manifest = "{\"title\": \"KestrelX CleanRoom\", \"version\": 1}";
+    const std::vector<uint8_t> plain_manifest_bytes(plain_manifest.begin(), plain_manifest.end());
+    const std::vector<uint8_t> plain_chunk = {0x4B, 0x58, 0x56, 0x43, 0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB};
+
+    auto plain_blob = formats::GdkContentContainer::synthesize_container(
+        0x4B580001u,
+        formats::GdkCipherMode::None,
+        zero_kid,
+        zero_iv,
+        std::nullopt,
+        {
+            {"data/manifest.json", plain_manifest_bytes},
+            {"data/plain_chunk.bin", plain_chunk},
+        });
+    KX_CHECK(plain_blob.has_value(), "Synthesize unencrypted KXVC container");
+    KX_CHECK(formats::GdkContentContainer::is_gdk_container(*plain_blob), "Detect KXVC magic");
+
+    auto plain_container = formats::GdkContentContainer::parse(*plain_blob);
+    KX_CHECK(plain_container.has_value(), "Parse unencrypted KXVC container");
+    KX_CHECK(plain_container->header().cipher == formats::GdkCipherMode::None, "Cipher mode is None");
+
+    formats::GdkKeyRing empty_ring;
+    auto seg_manifest = plain_container->read_segment("data/manifest.json", empty_ring);
+    KX_CHECK(seg_manifest.has_value() && *seg_manifest == plain_manifest_bytes,
+             "Unencrypted segment reads transparently without keys");
+    auto plain_mounted = plain_container->mount_to_vfs(vfs, empty_ring, "GAME:\\");
+    KX_CHECK(plain_mounted.has_value() && *plain_mounted == 2, "Mount unencrypted KXVC to OverlayVfs");
+    KX_CHECK(vfs.exists("GAME:\\data\\manifest.json"), "VFS exposes unencrypted mounted manifest");
+
+    // 2. AES-128-CTR encrypted KXVC container, key derivation, wrong-key CRC rejection & seekable decryption
+    const formats::GdkKeyId enc_key_id = {
+        0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01
+    };
+    const formats::GdkIvNonce enc_iv = {
+        0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+    };
+    const std::string license_token = "KESTRELX-STORE-LICENSE-TOKEN-V1";
+    auto derived_key = formats::GdkKeyRing::derive_key_from_token(license_token, enc_key_id);
+    KX_CHECK(derived_key.has_value(), "Derive 128-bit AES content key via Win32 CNG SHA-256");
+
+    const std::string secret_cfg =
+        "KESTREL-GDK-SECRET-CONFIG:AES128-CTR-STREAM-VERIFIED-PAYLOAD-BLOCK-0123456789ABCDEF";
+    const std::vector<uint8_t> secret_cfg_bytes(secret_cfg.begin(), secret_cfg.end());
+    std::vector<uint8_t> hero_dds(256);
+    for (size_t i = 0; i < hero_dds.size(); ++i) {
+        hero_dds[i] = static_cast<uint8_t>((i * 37u + 11u) & 0xFFu);
+    }
+
+    auto enc_blob = formats::GdkContentContainer::synthesize_container(
+        0x4B580002u,
+        formats::GdkCipherMode::Aes128Ctr,
+        enc_key_id,
+        enc_iv,
+        *derived_key,
+        {
+            {"data/secrets/config.cfg", secret_cfg_bytes},
+            {"data/textures/hero.dds", hero_dds},
+        });
+    KX_CHECK(enc_blob.has_value(), "Synthesize AES-128-CTR encrypted KXVC container");
+
+    // Verify ciphertext does not expose plaintext bytes on disk
+    const std::string_view enc_view(reinterpret_cast<const char*>(enc_blob->data()), enc_blob->size());
+    KX_CHECK(enc_view.find("KESTREL-GDK-SECRET-CONFIG") == std::string_view::npos,
+             "Encrypted KXVC container conceals plaintext payload");
+
+    const fs::path enc_container_path = temp_dir / "dlc_pack.kxvc";
+    {
+        std::ofstream ofs(enc_container_path, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(enc_blob->data()), static_cast<std::streamsize>(enc_blob->size()));
+    }
+
+    auto enc_container = formats::GdkContentContainer::parse_file(enc_container_path);
+    KX_CHECK(enc_container.has_value(), "Parse encrypted KXVC container from file");
+    KX_CHECK(enc_container->header().cipher == formats::GdkCipherMode::Aes128Ctr, "Cipher mode is Aes128Ctr");
+
+    // Without key -> rejected
+    KX_CHECK(!enc_container->read_segment("data/secrets/config.cfg", empty_ring).has_value(),
+             "Missing content key refuses decryption");
+
+    // Wrong key -> rejected via CRC32 verification
+    formats::GdkKeyRing wrong_ring;
+    formats::GdkAes128Key bad_key{};
+    bad_key.fill(0x5Au);
+    wrong_ring.register_key(enc_key_id, bad_key);
+    KX_CHECK(!enc_container->read_segment("data/secrets/config.cfg", wrong_ring).has_value(),
+             "Wrong content key rejected by segment CRC32 integrity check");
+
+    // 3. Full GDK XGameRuntime + XStore licensing + XPackageMountWithUiAsync workflow
+    KX_CHECK(SUCCEEDED(hle::kx_XGameRuntimeInitialize()), "XGameRuntimeInitialize");
+
+    void* store_ctx = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreCreateContext(nullptr, &store_ctx)) && store_ctx != nullptr, "XStoreCreateContext");
+
+    const char* dlc_pkg_id = "KestrelX.CleanRoom.DlcPack01_1.0.0.0_x64__kestrel";
+    const char* durable_store_id = "9NBLGGH4DLC01";
+
+    // Check CanAcquireLicenseForStoreIdAsync
+    hle::KxXAsyncBlock can_async{};
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreCanAcquireLicenseForStoreIdAsync(store_ctx, durable_store_id, &can_async)),
+             "XStoreCanAcquireLicenseForStoreIdAsync");
+    hle::KxXStoreCanAcquireLicenseResult can_res{};
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreCanAcquireLicenseForStoreIdResult(&can_async, &can_res)) && can_res.status == 1,
+             "XStoreCanAcquireLicenseForStoreIdResult licensable");
+
+    // Register package metadata (binds package ID -> KeyID + token + container path)
+    hle::register_gdk_package_license(dlc_pkg_id, enc_key_id, license_token, enc_container_path, "GAME:\\");
+
+    // Attempting XPackageMountWithUiAsync BEFORE XStoreAcquireLicenseForPackageAsync must fail (E_ACCESSDENIED)
+    hle::KxXAsyncBlock mount_unlicensed{};
+    KX_CHECK(SUCCEEDED(hle::kx_XPackageMountWithUiAsync(dlc_pkg_id, &mount_unlicensed)),
+             "XPackageMountWithUiAsync submitted before license");
+    KX_CHECK(hle::kx_XAsyncGetStatus(&mount_unlicensed, true) == E_ACCESSDENIED,
+             "Unlicensed encrypted container mount rejected with E_ACCESSDENIED");
+    void* denied_mount = nullptr;
+    KX_CHECK(hle::kx_XPackageMountWithUiResult(&mount_unlicensed, &denied_mount) == E_ACCESSDENIED &&
+             denied_mount == nullptr,
+             "XPackageMountWithUiResult propagates E_ACCESSDENIED");
+
+    // Acquire package license via XStoreAcquireLicenseForPackageAsync (unlocks AES-128 key into GdkKeyRing)
+    hle::KxXAsyncBlock lic_async{};
+    bool lic_cb_fired = false;
+    lic_async.context = &lic_cb_fired;
+    lic_async.callback = [](hle::KxXAsyncBlock* a) {
+        if (a) *static_cast<bool*>(a->context) = true;
+    };
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreAcquireLicenseForPackageAsync(store_ctx, dlc_pkg_id, &lic_async)),
+             "XStoreAcquireLicenseForPackageAsync");
+    KX_CHECK(lic_cb_fired && hle::kx_XAsyncGetStatus(&lic_async, false) == S_OK,
+             "License async completion callback fired with S_OK");
+
+    void* pkg_license = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreAcquireLicenseForPackageResult(&lic_async, &pkg_license)) && pkg_license != nullptr,
+             "XStoreAcquireLicenseForPackageResult");
+    KX_CHECK(hle::kx_XStoreIsLicenseValid(pkg_license), "XStoreIsLicenseValid == true");
+
+    // Verify seekable mid-block decryption at unaligned offset (19 bytes into payload, spanning AES block boundary)
+    auto mid_slice = enc_container->read_range(19, 25, hle::xgameruntime_keyring());
+    KX_CHECK(mid_slice.has_value(), "Seekable mid-block AES-128-CTR read_range");
+    KX_CHECK(std::string(mid_slice->begin(), mid_slice->end()) == secret_cfg.substr(19, 25),
+             "Seekable unaligned AES-128-CTR slice matches plaintext byte-for-byte");
+
+    // Now mount the licensed encrypted package into OverlayVfs via XPackageMountWithUiAsync
+    hle::KxXAsyncBlock mount_async{};
+    KX_CHECK(SUCCEEDED(hle::kx_XPackageMountWithUiAsync(dlc_pkg_id, &mount_async)),
+             "XPackageMountWithUiAsync after license acquisition");
+    KX_CHECK(hle::kx_XAsyncGetStatus(&mount_async, true) == S_OK, "Licensed package mount status S_OK");
+
+    void* pkg_mount = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XPackageMountWithUiResult(&mount_async, &pkg_mount)) && pkg_mount != nullptr,
+             "XPackageMountWithUiResult");
+
+    size_t mount_path_sz = 0;
+    KX_CHECK(SUCCEEDED(hle::kx_XPackageGetMountPathSize(pkg_mount, &mount_path_sz)) && mount_path_sz > 1,
+             "XPackageGetMountPathSize");
+    std::string mount_path(mount_path_sz, '\0');
+    KX_CHECK(SUCCEEDED(hle::kx_XPackageGetMountPath(pkg_mount, mount_path_sz, mount_path.data())),
+             "XPackageGetMountPath");
+
+    // Read decrypted assets back from OverlayVfs
+    auto resolved_cfg = vfs.resolve("GAME:\\data\\secrets\\config.cfg", /*for_write=*/false);
+    KX_CHECK(resolved_cfg.has_value(), "Resolve decrypted config.cfg via OverlayVfs");
+    {
+        std::ifstream ifs(*resolved_cfg, std::ios::binary);
+        std::string got((std::istreambuf_iterator<char>(ifs)), {});
+        KX_CHECK(got == secret_cfg, "Decrypted config.cfg content matches original plaintext");
+    }
+
+    auto resolved_dds = vfs.resolve("GAME:\\data\\textures\\hero.dds", /*for_write=*/false);
+    KX_CHECK(resolved_dds.has_value(), "Resolve decrypted hero.dds via OverlayVfs");
+    {
+        std::ifstream ifs(*resolved_dds, std::ios::binary);
+        std::vector<uint8_t> got((std::istreambuf_iterator<char>(ifs)), {});
+        KX_CHECK(got == hero_dds, "Decrypted multi-block hero.dds matches original binary");
+    }
+
+    // 4. Durable add-on license acquisition & query
+    hle::KxXAsyncBlock dur_async{};
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreAcquireLicenseForDurablesAsync(store_ctx, durable_store_id, &dur_async)),
+             "XStoreAcquireLicenseForDurablesAsync");
+    void* dur_license = nullptr;
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreAcquireLicenseForDurablesResult(&dur_async, &dur_license)) &&
+             hle::kx_XStoreIsLicenseValid(dur_license),
+             "XStoreAcquireLicenseForDurablesResult valid");
+
+    hle::KxXAsyncBlock q_async{};
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreQueryAddOnLicensesAsync(store_ctx, &q_async)),
+             "XStoreQueryAddOnLicensesAsync");
+    uint32_t addon_count = 0;
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreQueryAddOnLicensesResultCount(&q_async, &addon_count)) && addon_count == 1,
+             "XStoreQueryAddOnLicensesResultCount == 1");
+    hle::KxXStoreAddonLicense addon_info{};
+    KX_CHECK(SUCCEEDED(hle::kx_XStoreQueryAddOnLicensesResult(&q_async, 1, &addon_info)) &&
+             addon_info.is_active &&
+             std::string_view(addon_info.sku_store_id) == durable_store_id,
+             "XStoreQueryAddOnLicensesResult returns active durable license");
+
+    // 5. Telemetry & HLE Registry export checks
+    const auto st_before_close = hle::xgameruntime_stats();
+    KX_CHECK(st_before_close.runtime_inits == 1 &&
+             st_before_close.licenses_acquired == 2 &&
+             st_before_close.active_licenses == 2 &&
+             st_before_close.packages_mounted == 1 &&
+             st_before_close.containers_decrypted == 1 &&
+             st_before_close.decrypted_bytes == secret_cfg_bytes.size() + hero_dds.size(),
+             "XGameRuntime licensing & decryption telemetry verified");
+
+    hle::kx_XPackageCloseMountHandle(pkg_mount);
+    hle::kx_XStoreCloseLicenseHandle(dur_license);
+    hle::kx_XStoreCloseLicenseHandle(pkg_license);
+    KX_CHECK(hle::xgameruntime_stats().active_licenses == 0, "Active licenses decremented to 0 after close");
+    hle::kx_XStoreCloseContextHandle(store_ctx);
+    hle::kx_XGameRuntimeUninitialize();
+
+    hle::Registry reg;
+    hle::register_xgameruntime(reg);
+    KX_CHECK(reg.resolve_name("xgameruntime.dll", "XGameRuntimeInitialize") != nullptr &&
+             reg.resolve_name("xgameruntime.dll", "XStoreAcquireLicenseForPackageAsync") != nullptr &&
+             reg.resolve_name("xgameruntime.dll", "XStoreIsLicenseValid") != nullptr &&
+             reg.resolve_name("xgameruntime.dll", "XPackageMountWithUiAsync") != nullptr,
+             "Registry exports GDK licensing & mount HLE shims");
+
+    hle::set_xgameruntime_vfs(nullptr);
+    fs::remove_all(temp_dir, ec);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -7616,6 +7860,7 @@ int main(int argc, char** argv) {
     run_test("GDK Agility SDK Query, Dynamic DLL Redirection & Modern D3D12/D3D12Core HLE Export Shims", test_pe_loader_agility_sdk_and_dll_redirection);
     run_test("Sparse Virtual Texturing (SVT) 64KB Page Table, LRU Eviction, Feedback & RDNA2 TFE", test_svt_page_table_lru_and_feedback);
     run_hw_test("Sparse Virtual Texturing (SVT) Reserved Resource, TFE Feedback & LRU Remap on Dual-GPU Hardware", test_svt_reserved_resource_tfe_feedback_dual_gpu);
+    run_test("GDK Cryptographic Container (KXVC AES-128-CTR / Pass-Through) & XStore/XPackage License Decryption", test_gdk_crypto_container_and_xstore_license_decryption);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

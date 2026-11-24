@@ -177,14 +177,14 @@ flowchart TD
     style V9 fill:#161b22,stroke:#8957e5,color:#fff
 ```
 
-#### v0.8.0 — Streaming, Raytracing & Modern Barriers (Target: Q1 2027)
+#### v0.8.0 — Streaming, Raytracing & Modern Barriers (In Active Development)
 1. **DirectStorage 1.2 GPU Decompression**: Implement in-shader GDeflate decompression compute shaders to offload game asset decompression directly to host GPUs.
 2. **DXR 1.1 / Raytracing Tier 1.1 Emulation**: Decode RDNA2 ray intersection microcode (`image_bvh_intersect_ray`) and map console BVH structures to D3D12 top/bottom-level acceleration structures (`BuildRaytracingAccelerationStructure`).
 3. **D3D12 Enhanced Barriers (`D3D12_BARRIER_GROUP`)**: Lift RDNA2 cache invalidate/flush primitives (`s_waitcnt`, `buffer_wbl2`) into fine-grained modern D3D12 enhanced buffer and texture barriers.
 4. **Spatial Audio 7.1 Downmixing**: 8-channel surround matrix mixer and low-latency WASAPI exclusive mode streaming.
 5. **Multi-User Identity & Profile Saves**: Profile-isolated `S:\` save mounts allowing simultaneous independent user profiles.
 
-#### v0.9.0 — Path to Commercial Boot (Target: Q2 2027)
+#### v0.9.0 — Path to Commercial Boot (Upcoming Sprint)
 1. **Full GDK Cryptographic & License Decryption Shim**: Transparent pass-through for unencrypted container archives and synthetic package license acquisition (`XStoreAcquireLicense`).
 2. **DirectX 12 Agility SDK Runtime Dynamic Injection**: Host-side injection of modern Agility SDK runtime components for seamless Windows 10/11 cross-compatibility.
 3. **Sparse Virtual Texturing (SVT) & Feedback Maps**: 64KB physical page table remapping for streaming open-world virtual textures.

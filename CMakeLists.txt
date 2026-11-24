@@ -138,13 +138,27 @@ set_target_properties(kestrel_crt_d3d12_title PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/crt_d3d12_title"
 )
 
+
+# Clean-room standalone drop-in xgameruntime.dll shim (outputs to build/<cfg>/shims/xgameruntime.dll)
+add_library(kestrel_xgameruntime_shim SHARED
+    src/shims/xgameruntime_dll.cpp
+    src/shims/xgameruntime.def
+)
+target_link_libraries(kestrel_xgameruntime_shim PRIVATE kestrel_core)
+set_target_properties(kestrel_xgameruntime_shim PROPERTIES
+    OUTPUT_NAME "xgameruntime"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shims"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shims"
+)
+
 enable_testing()
 add_executable(kestrel_tests tests/test_runner.cpp)
 target_link_libraries(kestrel_tests PRIVATE kestrel_core)
-add_dependencies(kestrel_tests kestrel_test_title kestrel_crt_d3d12_title kestrel_tls_slot)
+add_dependencies(kestrel_tests kestrel_test_title kestrel_crt_d3d12_title kestrel_tls_slot kestrel_xgameruntime_shim)
 target_compile_definitions(kestrel_tests PRIVATE
     KESTREL_TEST_TITLE_DIR="${CMAKE_BINARY_DIR}/test_title"
     KESTREL_CRT_D3D12_TITLE_DIR="${CMAKE_BINARY_DIR}/crt_d3d12_title"
+    KESTREL_SHIMS_DIR="${CMAKE_BINARY_DIR}/shims"
     KESTREL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 add_test(NAME kestrel_unit_and_gpu_tests COMMAND kestrel_tests)

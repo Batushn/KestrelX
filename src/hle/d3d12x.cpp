@@ -695,6 +695,14 @@ KxDeviceProxy::KxDeviceProxy(ID3D12Device* inner) : inner_(inner) {
         inner_->AddRef();
         (void)inner_->QueryInterface(IID_PPV_ARGS(&inner1_));
         (void)inner_->QueryInterface(IID_PPV_ARGS(&inner2_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner3_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner4_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner5_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner6_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner7_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner8_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner9_));
+        (void)inner_->QueryInterface(IID_PPV_ARGS(&inner10_));
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt1{};
         if (SUCCEEDED(inner_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opt1, sizeof(opt1)))) {
             supports_wave32_ = (opt1.WaveLaneCountMin <= 32 && opt1.WaveLaneCountMax >= 32);
@@ -703,6 +711,14 @@ KxDeviceProxy::KxDeviceProxy(ID3D12Device* inner) : inner_(inner) {
     }
 }
 KxDeviceProxy::~KxDeviceProxy() {
+    if (inner10_) { inner10_->Release(); inner10_ = nullptr; }
+    if (inner9_) { inner9_->Release(); inner9_ = nullptr; }
+    if (inner8_) { inner8_->Release(); inner8_ = nullptr; }
+    if (inner7_) { inner7_->Release(); inner7_ = nullptr; }
+    if (inner6_) { inner6_->Release(); inner6_ = nullptr; }
+    if (inner5_) { inner5_->Release(); inner5_ = nullptr; }
+    if (inner4_) { inner4_->Release(); inner4_ = nullptr; }
+    if (inner3_) { inner3_->Release(); inner3_ = nullptr; }
     if (inner2_) { inner2_->Release(); inner2_ = nullptr; }
     if (inner1_) { inner1_->Release(); inner1_ = nullptr; }
     if (inner_) { inner_->Release(); inner_ = nullptr; }
@@ -720,19 +736,17 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::QueryInterface(REFIID riid, void** ppv)
         AddRef();
         return S_OK;
     }
-    if (riid == __uuidof(ID3D12Device1) && inner1_) {
-        *ppv = static_cast<ID3D12Device1*>(this);
-        AddRef();
-        g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed);
-        return S_OK;
-    }
-    if (riid == __uuidof(ID3D12Device2) && inner2_) {
-        *ppv = static_cast<ID3D12Device2*>(this);
-        AddRef();
-        g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed);
-        return S_OK;
-    }
-    // Forward ID3D12Device3..ID3D12Device10 (and newer interfaces) cleanly to the underlying hardware device
+    if (riid == __uuidof(ID3D12Device1) && inner1_) { *ppv = static_cast<ID3D12Device1*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device2) && inner2_) { *ppv = static_cast<ID3D12Device2*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device3) && inner3_) { *ppv = static_cast<ID3D12Device3*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device4) && inner4_) { *ppv = static_cast<ID3D12Device4*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device5) && inner5_) { *ppv = static_cast<ID3D12Device5*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device6) && inner6_) { *ppv = static_cast<ID3D12Device6*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device7) && inner7_) { *ppv = static_cast<ID3D12Device7*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device8) && inner8_) { *ppv = static_cast<ID3D12Device8*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device9) && inner9_) { *ppv = static_cast<ID3D12Device9*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    if (riid == __uuidof(ID3D12Device10) && inner10_) { *ppv = static_cast<ID3D12Device10*>(this); AddRef(); g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed); return S_OK; }
+    // Forward auxiliary / newer interfaces (e.g. ID3D12DebugDevice, ID3D12InfoQueue, ID3D12Device11+) cleanly
     HRESULT hr = inner_->QueryInterface(riid, ppv);
     if (SUCCEEDED(hr)) {
         g_device_qi_upgrades.fetch_add(1, std::memory_order_relaxed);
@@ -971,6 +985,173 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePipelineState(const D3D12_PIPELIN
         return inner2_->CreatePipelineState(&patched_desc, r, o);
     }
     return inner2_->CreatePipelineState(d, r, o);
+}
+
+// ID3D12Device3
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::OpenExistingHeapFromAddress(const void* a, REFIID r, void** o) {
+    return inner3_ ? inner3_->OpenExistingHeapFromAddress(a, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::OpenExistingHeapFromFileMapping(HANDLE h, REFIID r, void** o) {
+    return inner3_ ? inner3_->OpenExistingHeapFromFileMapping(h, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::EnqueueMakeResident(D3D12_RESIDENCY_FLAGS f, UINT n, ID3D12Pageable* const* objs, ID3D12Fence* fence, UINT64 val) {
+    return inner3_ ? inner3_->EnqueueMakeResident(f, n, objs, fence, val) : E_NOINTERFACE;
+}
+
+// ID3D12Device4
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandList1(UINT m, D3D12_COMMAND_LIST_TYPE t, D3D12_COMMAND_LIST_FLAGS fl, REFIID r, void** o) {
+    if (!inner4_) return E_NOINTERFACE;
+    if (r == __uuidof(ID3D12CommandList) ||
+        r == __uuidof(ID3D12GraphicsCommandList) ||
+        r == __uuidof(ID3D12GraphicsCommandList1) ||
+        r == __uuidof(ID3D12GraphicsCommandList2) ||
+        r == __uuidof(ID3D12GraphicsCommandList3) ||
+        r == __uuidof(ID3D12GraphicsCommandList4) ||
+        r == __uuidof(ID3D12GraphicsCommandList5) ||
+        r == __uuidof(ID3D12GraphicsCommandList6) ||
+        r == __uuidof(ID3D12GraphicsCommandList7)) {
+        ID3D12GraphicsCommandList* raw = nullptr;
+        HRESULT hr = inner4_->CreateCommandList1(m, t, fl, IID_PPV_ARGS(&raw));
+        if (FAILED(hr)) return hr;
+        g_cmd_lists.fetch_add(1, std::memory_order_relaxed);
+        auto* proxy = new KxGraphicsCommandListProxy(raw);
+        raw->Release();
+        hr = proxy->QueryInterface(r, o);
+        proxy->Release();
+        return hr;
+    }
+    HRESULT hr = inner4_->CreateCommandList1(m, t, fl, r, o);
+    if (SUCCEEDED(hr)) g_cmd_lists.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC* d, REFIID r, void** o) {
+    return inner4_ ? inner4_->CreateProtectedResourceSession(d, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) {
+    if (!inner4_) return E_NOINTERFACE;
+    HRESULT hr = inner4_->CreateCommittedResource1(hp, hf, d, st, cv, ps, r, o);
+    if (SUCCEEDED(hr)) g_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateHeap1(const D3D12_HEAP_DESC* d, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) {
+    return inner4_ ? inner4_->CreateHeap1(d, ps, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateReservedResource1(const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) {
+    if (!inner4_) return E_NOINTERFACE;
+    HRESULT hr = inner4_->CreateReservedResource1(d, st, cv, ps, r, o);
+    if (SUCCEEDED(hr)) g_reserved_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
+D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE KxDeviceProxy::GetResourceAllocationInfo1(UINT vm, UINT n, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_ALLOCATION_INFO1* info1) {
+    if (inner4_) return inner4_->GetResourceAllocationInfo1(vm, n, d, info1);
+    return D3D12_RESOURCE_ALLOCATION_INFO{};
+}
+
+// ID3D12Device5
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateLifetimeTracker(ID3D12LifetimeOwner* owner, REFIID r, void** o) {
+    return inner5_ ? inner5_->CreateLifetimeTracker(owner, r, o) : E_NOINTERFACE;
+}
+void STDMETHODCALLTYPE KxDeviceProxy::RemoveDevice() {
+    if (inner5_) inner5_->RemoveDevice();
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::EnumerateMetaCommands(UINT* n, D3D12_META_COMMAND_DESC* d) {
+    return inner5_ ? inner5_->EnumerateMetaCommands(n, d) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::EnumerateMetaCommandParameters(REFGUID id, D3D12_META_COMMAND_PARAMETER_STAGE st, UINT* total, UINT* cnt, D3D12_META_COMMAND_PARAMETER_DESC* d) {
+    return inner5_ ? inner5_->EnumerateMetaCommandParameters(id, st, total, cnt, d) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateMetaCommand(REFGUID id, UINT m, const void* params, SIZE_T sz, REFIID r, void** o) {
+    return inner5_ ? inner5_->CreateMetaCommand(id, m, params, sz, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateStateObject(const D3D12_STATE_OBJECT_DESC* d, REFIID r, void** o) {
+    return inner5_ ? inner5_->CreateStateObject(d, r, o) : E_NOINTERFACE;
+}
+void STDMETHODCALLTYPE KxDeviceProxy::GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* d, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* info) {
+    if (inner5_) inner5_->GetRaytracingAccelerationStructurePrebuildInfo(d, info);
+}
+D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE KxDeviceProxy::CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE t, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* id) {
+    if (inner5_) return inner5_->CheckDriverMatchingIdentifier(t, id);
+    return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+}
+
+// ID3D12Device6
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE mode, D3D12_MEASUREMENTS_ACTION action, HANDLE ev, BOOL* further) {
+    return inner6_ ? inner6_->SetBackgroundProcessingMode(mode, action, ev, further) : E_NOINTERFACE;
+}
+
+// ID3D12Device7
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::AddToStateObject(const D3D12_STATE_OBJECT_DESC* add, ID3D12StateObject* grow, REFIID r, void** o) {
+    return inner7_ ? inner7_->AddToStateObject(add, grow, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateProtectedResourceSession1(const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* d, REFIID r, void** o) {
+    return inner7_ ? inner7_->CreateProtectedResourceSession1(d, r, o) : E_NOINTERFACE;
+}
+
+// ID3D12Device8
+D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE KxDeviceProxy::GetResourceAllocationInfo2(UINT vm, UINT n, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_ALLOCATION_INFO1* info1) {
+    if (inner8_) return inner8_->GetResourceAllocationInfo2(vm, n, d, info1);
+    return D3D12_RESOURCE_ALLOCATION_INFO{};
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommittedResource2(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) {
+    if (!inner8_) return E_NOINTERFACE;
+    HRESULT hr = inner8_->CreateCommittedResource2(hp, hf, d, st, cv, ps, r, o);
+    if (SUCCEEDED(hr)) g_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePlacedResource1(ID3D12Heap* h, UINT64 off, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID r, void** o) {
+    if (!inner8_) return E_NOINTERFACE;
+    HRESULT hr = inner8_->CreatePlacedResource1(h, off, d, st, cv, r, o);
+    if (SUCCEEDED(hr)) g_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
+void STDMETHODCALLTYPE KxDeviceProxy::CreateSamplerFeedbackUnorderedAccessView(ID3D12Resource* target, ID3D12Resource* fb, D3D12_CPU_DESCRIPTOR_HANDLE dst) {
+    if (inner8_) inner8_->CreateSamplerFeedbackUnorderedAccessView(target, fb, dst);
+}
+void STDMETHODCALLTYPE KxDeviceProxy::GetCopyableFootprints1(const D3D12_RESOURCE_DESC1* d, UINT f, UINT n, UINT64 off, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* l, UINT* nr, UINT64* rs, UINT64* tb) {
+    if (inner8_) inner8_->GetCopyableFootprints1(d, f, n, off, l, nr, rs, tb);
+}
+
+// ID3D12Device9
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC* d, REFIID r, void** o) {
+    return inner9_ ? inner9_->CreateShaderCacheSession(d, r, o) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS ctrl) {
+    return inner9_ ? inner9_->ShaderCacheControl(kinds, ctrl) : E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommandQueue1(const D3D12_COMMAND_QUEUE_DESC* d, REFIID creator_id, REFIID r, void** o) {
+    if (!inner9_) return E_NOINTERFACE;
+    ID3D12CommandQueue* raw = nullptr;
+    HRESULT hr = inner9_->CreateCommandQueue1(d, creator_id, IID_PPV_ARGS(&raw));
+    if (FAILED(hr)) return hr;
+    g_queues.fetch_add(1, std::memory_order_relaxed);
+    if (d && d->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        g_compute_queues.fetch_add(1, std::memory_order_relaxed);
+    }
+    auto* proxy = new KxCommandQueueProxy(raw);
+    raw->Release();
+    hr = proxy->QueryInterface(r, o);
+    proxy->Release();
+    return hr;
+}
+
+// ID3D12Device10
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateCommittedResource3(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC1* d, D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, UINT32 num_fmt, detail::KxCastableFormatsPtr fmts, REFIID r, void** o) {
+    if (!inner10_) return E_NOINTERFACE;
+    HRESULT hr = inner10_->CreateCommittedResource3(hp, hf, d, layout, cv, ps, num_fmt, fmts, r, o);
+    if (SUCCEEDED(hr)) g_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePlacedResource2(ID3D12Heap* h, UINT64 off, const D3D12_RESOURCE_DESC1* d, D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* cv, UINT32 num_fmt, detail::KxCastableFormatsPtr fmts, REFIID r, void** o) {
+    if (!inner10_) return E_NOINTERFACE;
+    HRESULT hr = inner10_->CreatePlacedResource2(h, off, d, layout, cv, num_fmt, fmts, r, o);
+    if (SUCCEEDED(hr)) g_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateReservedResource2(const D3D12_RESOURCE_DESC* d, D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, UINT32 num_fmt, detail::KxCastableFormatsPtr fmts, REFIID r, void** o) {
+    if (!inner10_) return E_NOINTERFACE;
+    HRESULT hr = inner10_->CreateReservedResource2(d, layout, cv, ps, num_fmt, fmts, r, o);
+    if (SUCCEEDED(hr)) g_reserved_resources.fetch_add(1, std::memory_order_relaxed);
+    return hr;
 }
 
 void set_d3d12x_preferred_adapter(int adapter_index) { g_preferred_adapter.store(adapter_index, std::memory_order_relaxed); }

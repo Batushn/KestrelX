@@ -5,8 +5,8 @@
   <p><strong>Clean-Room Xbox Series X|S Native Compatibility &amp; Dynamic RDNA2 (GFX10.3) &rarr; SM 6.6 DXIL Shader Recompilation Runtime</strong></p>
 
   <p>
-    <a href="#milestone-timeline"><img src="https://img.shields.io/badge/Release-v0.11.0-2ea44f?style=for-the-badge" alt="Release: v0.11.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-73%2F73_PASS-brightgreen?style=for-the-badge" alt="Tests: 73/73 PASS" /></a>
+    <a href="#milestone-timeline"><img src="https://img.shields.io/badge/Release-v0.12.0-2ea44f?style=for-the-badge" alt="Release: v0.12.0" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-75%2F75_PASS-brightgreen?style=for-the-badge" alt="Tests: 75/75 PASS" /></a>
     <a href="#external-amd-rga-gfx1030-validation"><img src="https://img.shields.io/badge/AMD_RGA_gfx1030-12%2F12_ELF64_PASS-107C10?style=for-the-badge" alt="External AMD RGA gfx1030: 12/12 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
@@ -90,10 +90,11 @@ flowchart LR
     M8["✅ v0.8.0<br/>GPU DirectStorage 1.2,<br/>DXR 1.1 / BVH, 7.1 Audio, Saves"]
     M9["✅ v0.9.0<br/>KXVC AES-128-CTR + XStore,<br/>Agility SDK, SVT 64KB, PresentX HUD"]
     M10["✅ v0.10.0<br/>External AMD RGA gfx1030<br/>ELF64 + GFX10.3 Spec Audit"]
-    M11["✅ v0.11.0 (Current)<br/>Unmodified DirectX 12 &amp;<br/>Xbox GDK EXE Execution"]
-    M12["🚀 v1.0.0 (Horizon)<br/>Commercial Title Bring-Up<br/>& Live GPU Profiler"]
+    M11["✅ v0.11.0<br/>Unmodified DirectX 12 &amp;<br/>Xbox GDK EXE Execution"]
+    M12["✅ v0.12.0 (Current)<br/>ID3D12Device10 Proxy,<br/>xgameruntime.dll &amp; GDK Mesh"]
+    M13["🚀 v1.0.0 (Horizon)<br/>Commercial Title Bring-Up<br/>&amp; Live GPU Profiler"]
 
-    M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10 --> M11 --> M12
+    M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10 --> M11 --> M12 --> M13
 
     style M1 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M2 fill:#1f6f3b,stroke:#2ea44f,color:#fff
@@ -105,8 +106,9 @@ flowchart LR
     style M8 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M9 fill:#1f6f3b,stroke:#2ea44f,color:#fff
     style M10 fill:#1f6f3b,stroke:#2ea44f,color:#fff
-    style M11 fill:#107c10,stroke:#56d364,stroke-width:3px,color:#fff
-    style M12 fill:#1f3a5f,stroke:#58a6ff,color:#fff
+    style M11 fill:#1f6f3b,stroke:#2ea44f,color:#fff
+    style M12 fill:#107c10,stroke:#56d364,stroke-width:3px,color:#fff
+    style M13 fill:#1f3a5f,stroke:#58a6ff,color:#fff
 ```
 
 ### RDNA2 IR Multi-Pass Optimization Pipeline
@@ -135,7 +137,7 @@ flowchart LR
 
 ### Subsystem Verification Matrix
 
-| Subsystem | Status | Implemented & Verified (`v0.11.0`) | Next Horizon (`v1.0.0`) |
+| Subsystem | Status | Implemented & Verified (`v0.12.0`) | Next Horizon (`v1.0.0`) |
 | :--- | :---: | :--- | :--- |
 | **PE32+ Loader & System Libs** | ✅ Verified | `MicrosoftGame.config` XML, PE32+ relocs (DIR64/HIGHLOW), delay-load imports (RVA/legacy VA), export forwarders (DLL.Symbol, DLL.#Ordinal), multi-page thunk cleanup, `.pdata` SEH, TLS callbacks, GDK Agility SDK query (`D3D12SDKVersion`, `D3D12SDKPath`), dynamic DLL redirection, `pe-probe` import auditor | Side-by-side title updates & patch mounts |
 | **CPU VEH Zen 2 Shim** | ✅ Verified | In-process VEH emulator for AMD Zen 2 `CLZERO`, `MONITORX`, `MWAITX`, `MCOMMIT`, `RDPRU`, `PREFETCHW`, and SSE4a `EXTRQ`/`INSERTQ` for Intel CPU compatibility | Dynamic TSC virtualization & CPU core topology pinning |
@@ -143,7 +145,7 @@ flowchart LR
 | **RDNA2 -> IR -> SM 6.6 DXIL** | ✅ Verified | External AMD RGA `gfx1030` ELF64 (`AMDHSA` ABI + MsgPack metadata) support, 12/12 real `gfx1030` kernels (`412/412` instructions, `0` unsupported) verified on hardware, VOP3A/B/VOP3-VOPC, SMEM `x8`/`x16`, divergent SIMT `exec` loops (`v_cmpx_*`, `s_andn2_saveexec_b32`), IEEE `v_frexp`/`v_ldexp`/`v_cmp_class_f32`, Mesh (`ms_6_6`) & Amplification (`as_6_6`), VRS Tier 2, BVH `RayQuery`, Wave intrinsics, `MIMG` `TFE` PRT | Inline procedural primitive intersection & full retail shader opcode tail |
 | **RDNA2 IR Optimization Passes** | ✅ Verified | Unreachable basic-block pruning, intra-block copy propagation, constant folding (integer & float operations), backward liveness DCE & unused flag pruning, dual-GPU parity | Inter-block global value numbering (GVN) |
 | **Persistent DXIL Shader Cache** | ✅ Verified | Mutex-protected thread-safe `DiskShaderCache`, LRU size quotas (`max_entries`, `max_bytes`), multi-dimensional dispatch keys (`group_y`, `group_z`, `mrt_mask`), corruption eviction | Background async shader pre-compilation pool |
-| **D3D12.X COM Proxy (`d3d12_xs`)** | ✅ Verified | Pure COM `KxDeviceProxy` (`ID3D12Device`-`Device10` QI), stream PSO auto-recomp, Async Compute queues with timeline fence sync, Work Graph DAG & 2-node `ExecuteIndirect`, `ID3D12GraphicsCommandList6/7` Enhanced Barriers & `DispatchMesh`, `d3d12.dll`/`d3d12core.dll` HLE redirection, SVT (`CreateReservedResource`, `UpdateTileMappings`, `CopyTiles`) | DirectSR super-resolution bridge |
+| **D3D12.X COM Proxy (`d3d12_xs`)** | ✅ Verified | Full `ID3D12Device10` COM inheritance `KxDeviceProxy` (zero proxy bypass across `Device1..10`), `CreateCommandList1` / `CreateCommandQueue1` / `CreateCommittedResource1..3` wrapping, stream PSO auto-recomp, Async Compute queues with timeline fence sync, Work Graph DAG & 2-node `ExecuteIndirect`, `ID3D12GraphicsCommandList6/7` Enhanced Barriers & `DispatchMesh`, `d3d12.dll`/`d3d12core.dll` HLE redirection, SVT (`CreateReservedResource`, `UpdateTileMappings`, `CopyTiles`) | DirectSR super-resolution bridge |
 | **WindowHost & PresentX** | ✅ Verified | Win32 `WindowHost` + `IDXGISwapChain3` waitable flip-model (`--windowed`, `DXGI_PRESENT_ALLOW_TEARING`), `FramePacer` (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, P99 telemetry, `--fps`, `--tearing`), borderless fullscreen (`--fullscreen`, `Alt+Enter`), live 236×76 GPU-composited telemetry HUD (`--hud`), headless BMP capture (`--capture`) | Multi-monitor HDR10 scRGB tone-mapping |
 | **Input (`gameinput.dll`)** | ✅ Verified | COM `GameInputCreate`, multi-controller slot management (0..3), hotplug callbacks & telemetry, impulse trigger force-feedback + dual-motor rumble bridging | Virtual gamepad remapping & deadzone calibration |
 | **Audio (`xaudio2_9.dll`)** | ✅ Verified | COM `XAudio2Create`, multi-voice software mixer, submix bus routing, non-48kHz pitch resampling, X3DAudio 3D spatial positioning, ITU-R BS.775 5.1 & 7.1 surround downmixing matrix, WASAPI thread lifecycle | WASAPI exclusive mode stream sync |
@@ -151,6 +153,16 @@ flowchart LR
 | **GFX10 Texture Tiling** | ✅ Verified | Clean-room 2D swizzle/deswizzle (all 7 modes), BC1/BC7 4×4 block tiling, 256B-aligned multi-level mip-chains, SGD5 archive decompression, 64KB SVT virtual texture layout & LRU physical tile pool | 3D/Array volume tiling & live upload staging |
 
 ---
+
+### What's New in v0.12.0
+
+KestrelX v0.12.0 upgrades the D3D12.X COM proxy to full **`ID3D12Device10` inheritance**, ships a **standalone drop-in `xgameruntime.dll` clean-room shim**, and verifies an **unmodified D3D12 Ultimate Mesh Shader Xbox GDK executable** (`ms_6_5`/`ps_6_5` + `DirectXTK12` SpriteFont HUD) end-to-end with 100% proxy telemetry:
+* **Full `ID3D12Device1..10` COM Proxy Inheritance (`include/kestrel/hle/d3d12x.hpp`, `src/hle/d3d12x.cpp`)**: Upgraded `KxDeviceProxy` from `ID3D12Device2` to `ID3D12Device10`, eliminating COM proxy bypass when modern titles (`ID3D12Device8`+) call `QueryInterface`. Wraps `CreateCommandList1`, `CreateCommandQueue1`, `CreateCommittedResource1/2/3`, `CreatePlacedResource1/2`, and `CreateReservedResource1/2`, with SDK-portable `CreateCommittedResource3` / `CreatePlacedResource2` / `CreateReservedResource2` castable-format signature deduction across Windows SDK `10.0.22621` and `10.0.26100`.
+* **Standalone Drop-In `xgameruntime.dll` Shim (`src/shims/xgameruntime_dll.cpp`, `src/shims/xgameruntime.def`)**: New CMake target `kestrel_xgameruntime_shim` builds `build/Release/shims/xgameruntime.dll`, exporting the full GDK dynamic thunk ABI (`InitializeApiImpl*`, `UninitializeApiImpl`, `QueryApiImpl`, `XError*`, `XGameRuntime*`, `XUser*`, `XStore*`, `XPackage*`, `XTaskQueue*`, `GameInputCreate`) backed directly by KestrelX's clean-room HLE runtime.
+* **CLI Mesh Shader Telemetry (`src/cli/main.cpp`)**: `kestrel run` now reports `mesh=<N>` (`DispatchMesh` calls intercepted through `KxGraphicsCommandListProxy`) alongside `draws`, `barriers`, `res`, `q`, `cmd`, and `present`.
+* **Verified Unmodified D3D12 Ultimate GDK Mesh Shader Binary (Compiled Locally Outside Repo)**:
+  * **`microsoft/Xbox-GDK-Samples` (`SimpleMeshShader.exe`, MIT, SM 6.5 `ms_6_5`/`ps_6_5` + `ID3D12Device8` + `ID3D12GraphicsCommandList6` + `DirectXTK12` SpriteFont HUD)**: `pe-probe` `218/218` imports (`100.0%`), ran 5 frames cleanly under `kestrel run --max-frames 5 --capture`, exit code `0`, full proxy telemetry `dev=1, q=1, cmd=2, res=10, draws=5, mesh=5, barriers=13, present=5`, 1280×720 RGB backbuffer verified.
+* **New Regression Tests (`Tests 74–75`)**: `KxDeviceProxy` full `ID3D12Device1..10` COM identity & `CreateCommandList1`/`CreateCommittedResource2/3` wrapping (`Test 74`), and live `LoadLibraryW` verification of standalone `shims/xgameruntime.dll` (`Test 75`).
 
 ### What's New in v0.11.0
 
@@ -229,7 +241,7 @@ flowchart TD
 3. **Sparse Virtual Texturing (SVT) & Feedback Maps**: 64KB physical page table LRU remapping, RGBA8/Min-Mip feedback, RDNA2 `MIMG` `TFE=1` (`CheckAccessFullyMapped`), and D3D12 `CreateReservedResource`.
 4. **Frame Pacing & PresentX Low-Latency HUD**: Waitable flip-model tear-free sync, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` frame limiter, borderless fullscreen toggle, and GPU-composited 236×76 performance HUD.
 
-> **Scope & Verification Note (`v0.10.0`):** KestrelX passes **70/70 tests** across physical NVIDIA RTX 4060 and AMD Radeon 780M GPUs (and **54/54** in `--unit-only` CI with **0 MSVC `/W4 /permissive-` warnings**), including **12/12 externally compiled AMD RGA `gfx1030` ELF64 kernels** and a clean-room Xbox-ABI guest test title (`kestrel_test_title.exe`). Booting unmodified commercial retail Xbox Series X|S titles remains future `v1.0.0` work (requiring per-title shader/HLE surface coverage and retail assets outside this clean-room repository).
+> **Scope & Verification Note (`v0.12.0`):** KestrelX passes **75/75 tests** across physical NVIDIA RTX 4060 and AMD Radeon 780M GPUs (and **58/58** in `--unit-only` CI with **0 MSVC `/W4 /permissive-` warnings**), including **12/12 externally compiled AMD RGA `gfx1030` ELF64 kernels**, a clean-room Xbox-ABI guest test title (`kestrel_test_title.exe`), and verified unmodified MIT DirectX 12 & Xbox GDK desktop samples (`D3D12HelloTriangle.exe`, `SimpleTriangleDesktop.exe`, `SimpleMeshShader.exe`) built outside this repository. Booting unmodified commercial retail Xbox Series X|S titles remains future `v1.0.0` work (requiring per-title shader/HLE surface coverage and retail assets outside this clean-room repository).
 
 ---
 
@@ -279,7 +291,7 @@ flowchart LR
 | **Shader Pipeline** | **RDNA2 (GFX10.3) -> CFG Basic-Block IR -> Dual Wave32 & Wave64 SM 6.6 HLSL -> In-Process DXC + Persistent Disk Cache** | Compiles native Wave32 shaders for NVIDIA warps and native Wave64 shaders for AMD RDNA GPUs from the same structured IR, verified bit-exact on dual-GPU hardware. |
 | **CPU Execution** | **Native PE32+ x64 Loader + VEH Zen 2 Shim** | Runs x86-64 natively with full relocations, guest DLL chaining, TLS callbacks, `.pdata` SEH, and VEH emulation for AMD Zen 2 instructions so Intel CPUs do not trap with `0xC000001D`. |
 | **Filesystem** | **Copy-on-Write Overlay VFS** | Maps `GAME:\`, `G:\`, `D:\`, `S:\`, and `T:\` with whiteouts and path-traversal rejection. The source title directory is **never mutated**. |
-| **Verification** | **68 Self-Contained Hardware & Unit Tests + Clean-Room Guest Title** | Links against 5 synthetic console import libs (`kernelx`, `xgameruntime`, `d3d12_xs`, `gameinput`, `xaudio2_9`) and validates every layer on real GPUs with zero retail files. |
+| **Verification** | **75 Self-Contained Hardware & Unit Tests + Clean-Room Guest Titles** | Links against 5 synthetic console import libs (`kernelx`, `xgameruntime`, `d3d12_xs`, `gameinput`, `xaudio2_9`) and validates every layer on real GPUs with zero retail files. |
 
 ---
 
@@ -363,7 +375,10 @@ KestrelX Verification Suite
     -> Full-CRT D3D12 EXE PASS: presents=3, BMP=256x256, center RGB=(25,204,76)
   [PASS] Full-CRT Win32 + D3D12 + KxDxgiFactoryProxy/KxSwapChainProxy Render, --max-frames & BMP Capture
   [PASS] GDK xgameruntime.lib Dynamic Thunk ABI (InitializeApiImplEx2, QueryApiImpl, XErrorReport & HLE Probe)
-Summary: 73 passed, 0 failed
+    -> KxDeviceProxy ID3D12Device8/10 PASS: dev10=yes, q=1, cmd=1, res=2, qi_upgrades=2
+  [PASS] D3D12.X KxDeviceProxy Full ID3D12Device1..10 COM Identity & CreateCommandList1/Resource2/3 Wrapping
+  [PASS] Standalone Drop-In xgameruntime.dll Shim DLL Live LoadLibrary & GDK ABI Execution
+Summary: 75 passed, 0 failed
 ```
 
 Unmodified third-party MIT `.exe` execution receipts (compiled locally from official Microsoft sources outside the repository; zero proprietary assets committed):
@@ -380,7 +395,14 @@ $ .\build\Release\kestrel.exe pe-probe SimpleTriangleDesktop.exe
   Import Audit  : 180 / 180 resolved (100.0% | HLE=3, Guest=0, Host=177, Missing/Stub=0)
 $ .\build\Release\kestrel.exe run SimpleTriangleDesktop.exe --max-frames 5 --capture gdk_triangle.bmp
 Loaded SimpleTriangleDesktop.exe @ 0x0000000140000000 (relocs=0, hle_imports=17, guest_imports=0, host_imports=163, stubs=0)
-Guest exited with code 0 | D3D12.X(dev=1, q=1, cmd=1, res=2, draws=5, barriers=10, cs_pso=0, gfx_pso=0, cache_hit=0, disk_hit=0, present=5)
+Guest exited with code 0 | D3D12.X(dev=1, q=1, cmd=1, res=2, draws=5, mesh=0, barriers=10, cs_pso=0, gfx_pso=0, cache_hit=0, disk_hit=0, present=5)
+
+# 3. microsoft/Xbox-GDK-Samples (MIT) — SimpleMeshShader.exe (unmodified, SM 6.5 ms_6_5/ps_6_5 + ID3D12Device8 + ID3D12GraphicsCommandList6 + DirectXTK12 SpriteFont)
+$ .\build\Release\kestrel.exe pe-probe SimpleMeshShader.exe
+  Import Audit  : 218 / 218 resolved (100.0% | HLE=3, Guest=0, Host=215, Missing/Stub=0)
+$ .\build\Release\kestrel.exe run SimpleMeshShader.exe --max-frames 5 --capture gdk_mesh_shader.bmp
+Loaded SimpleMeshShader.exe @ 0x0000000140000000 (relocs=0, hle_imports=17, guest_imports=0, host_imports=201, stubs=0)
+Guest exited with code 0 | D3D12.X(dev=1, q=1, cmd=2, res=10, draws=5, mesh=5, barriers=13, cs_pso=0, gfx_pso=0, cache_hit=0, disk_hit=0, present=5)
 ```
 
 CLI cold vs warm persistent disk-cache verification:
@@ -449,8 +471,8 @@ include/kestrel/
   vfs/       # Copy-on-Write Overlay VFS with whiteouts
   hle/       # HLE registry + stub thunks, kernelx (async I/O), xgameruntime, d3d12x (Dev1..10 + CmdListProxy), WindowHost, GameInput, XAudio2 (WASAPI)
   gpu/       # RDNA2 ISA decoder (SOP/VOP/FLAT/SMEM/DS/MUBUF/MTBUF/MIMG/EXP), AMDGPU ELF64 parser, DXBC parser, CFG IR, multi-stage HLSL recompiler, ShaderCensus, DiskShaderCache, DXC, GPU runner, GFX10 tiling
-src/         # Corresponding C++23 implementations + CLI (src/cli/main.cpp)
-tests/       # 73-test unit/dual-GPU verification runner + 12 external AMD RGA gfx1030 ELF64 kernels + full-CRT D3D12 & Xbox-ABI clean-room test titles
+src/         # Corresponding C++23 implementations + CLI (src/cli/main.cpp) + standalone drop-in shims (src/shims/xgameruntime_dll.cpp)
+tests/       # 75-test unit/dual-GPU verification runner + 12 external AMD RGA gfx1030 ELF64 kernels + full-CRT D3D12 & Xbox-ABI clean-room test titles
 docs/        # Architecture documentation & hardware-captured renders (first_light.png, textured_quad.png)
 ```
 

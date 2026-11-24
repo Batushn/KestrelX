@@ -30,6 +30,7 @@
 #include "kestrel/formats/sgd5.hpp"
 
 #include <dxgi1_6.h>
+#include <wrl/client.h>
 #include <array>
 #include <chrono>
 #include <thread>
@@ -8896,6 +8897,133 @@ void test_gdk_xgameruntime_thunk_abi() {
     hle::reset_xgameruntime_stats();
 }
 
+
+void test_d3d12x_device10_proxy_identity_and_wrapping() {
+    hle::reset_d3d12x_stats();
+
+    hle::Registry reg;
+    hle::register_d3d12x(reg);
+    auto create_dev = reinterpret_cast<HRESULT(__stdcall*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**)>(
+        reg.resolve_name("d3d12.dll", "D3D12CreateDevice"));
+    KX_CHECK(create_dev != nullptr, "D3D12CreateDevice must be registered");
+
+    // Use WARP or default adapter so this test runs reliably on CI windows-latest too
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> warp;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        (void)factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Device8> dev8;
+    HRESULT hr = create_dev(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev8));
+    if (FAILED(hr) && warp) {
+        hr = create_dev(warp.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev8));
+    }
+    KX_CHECK(SUCCEEDED(hr) && dev8 != nullptr, "D3D12CreateDevice(ID3D12Device8) must succeed");
+
+    // Critical check: QI(ID3D12Device8) must remain KxDeviceProxy, NEVER leaking raw host device!
+    // Creating a command queue and command list through ID3D12Device8 must increment KxDeviceProxy stats.
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    KX_CHECK(SUCCEEDED(dev8->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))), "dev8->CreateCommandQueue must succeed");
+
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList6> cmd6;
+    KX_CHECK(SUCCEEDED(dev8->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(&cmd6))),
+             "dev8->CreateCommandList1(ID3D12GraphicsCommandList6) must succeed");
+
+    // Verify CreateCommittedResource2 is intercepted by KxDeviceProxy
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC1 rd1{};
+    rd1.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd1.Width = 256;
+    rd1.Height = 1;
+    rd1.DepthOrArraySize = 1;
+    rd1.MipLevels = 1;
+    rd1.Format = DXGI_FORMAT_UNKNOWN;
+    rd1.SampleDesc.Count = 1;
+    rd1.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buf;
+    KX_CHECK(SUCCEEDED(dev8->CreateCommittedResource2(
+                 &hp, D3D12_HEAP_FLAG_NONE, &rd1, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, nullptr, IID_PPV_ARGS(&buf))),
+             "dev8->CreateCommittedResource2 must succeed");
+
+    // Also verify ID3D12Device10 upgrade if supported by host SDK/driver
+    Microsoft::WRL::ComPtr<ID3D12Device10> dev10;
+    const bool has_dev10 = SUCCEEDED(dev8.As(&dev10)) && dev10 != nullptr;
+    if (has_dev10) {
+        Microsoft::WRL::ComPtr<ID3D12Resource> buf10;
+        KX_CHECK(SUCCEEDED(dev10->CreateCommittedResource3(
+                     &hp, D3D12_HEAP_FLAG_NONE, &rd1, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, nullptr, 0, nullptr, IID_PPV_ARGS(&buf10))),
+                 "dev10->CreateCommittedResource3 must succeed");
+    }
+
+    const auto st = hle::d3d12x_stats();
+    KX_CHECK(st.devices_created >= 1u, "devices_created must be >= 1");
+    KX_CHECK(st.queues_created >= 1u, "dev8->CreateCommandQueue must increment queues_created (proxy preserved)");
+    KX_CHECK(st.cmd_lists_created >= 1u, "dev8->CreateCommandList1 must increment cmd_lists_created (proxy preserved)");
+    KX_CHECK(st.resources_created >= (has_dev10 ? 2u : 1u), "CreateCommittedResource2/3 must increment resources_created");
+    std::cout << std::format(
+        "    -> KxDeviceProxy ID3D12Device8/10 PASS: dev10={}, q={}, cmd={}, res={}, qi_upgrades={}\n",
+        has_dev10 ? "yes" : "no", st.queues_created, st.cmd_lists_created, st.resources_created, st.device_qi_upgrades);
+
+    hle::reset_d3d12x_stats();
+}
+
+static bool g_t75_task_ran = false;
+static void __stdcall t75_task_cb(void* ctx, bool canceled) {
+    if (!canceled && ctx == reinterpret_cast<void*>(0xCAFEBABEull)) {
+        g_t75_task_ran = true;
+    }
+}
+
+void test_standalone_dropin_xgameruntime_shim_dll() {
+    const std::filesystem::path dll_path = std::filesystem::path(KESTREL_SHIMS_DIR) / "xgameruntime.dll";
+    KX_CHECK(std::filesystem::exists(dll_path), "build/<cfg>/shims/xgameruntime.dll must exist");
+
+    HMODULE mod = LoadLibraryW(dll_path.c_str());
+    KX_CHECK(mod != nullptr, "LoadLibraryW(shims/xgameruntime.dll) must succeed");
+
+    auto init_ex2 = reinterpret_cast<HRESULT(__stdcall*)(uint64_t, const void*)>(GetProcAddress(mod, "InitializeApiImplEx2"));
+    auto uninit = reinterpret_cast<void(__stdcall*)()>(GetProcAddress(mod, "UninitializeApiImpl"));
+    auto query = reinterpret_cast<HRESULT(__stdcall*)(const void*, void**)>(GetProcAddress(mod, "QueryApiImpl"));
+    auto err_report = reinterpret_cast<bool(__stdcall*)(HRESULT, const char*)>(GetProcAddress(mod, "XErrorReport"));
+    auto dev_type = reinterpret_cast<uint32_t(__stdcall*)()>(GetProcAddress(mod, "XSystemGetDeviceType"));
+    auto title_id = reinterpret_cast<HRESULT(__stdcall*)(uint32_t*)>(GetProcAddress(mod, "XGameGetXboxTitleId"));
+    auto tq_create = reinterpret_cast<HRESULT(__stdcall*)(uint32_t, uint32_t, void**)>(GetProcAddress(mod, "XTaskQueueCreate"));
+    auto tq_submit = reinterpret_cast<HRESULT(__stdcall*)(void*, uint32_t, void*, void(__stdcall*)(void*, bool))>(GetProcAddress(mod, "XTaskQueueSubmitCallback"));
+    auto tq_dispatch = reinterpret_cast<bool(__stdcall*)(void*, uint32_t, uint32_t)>(GetProcAddress(mod, "XTaskQueueDispatch"));
+    auto tq_close = reinterpret_cast<void(__stdcall*)(void*)>(GetProcAddress(mod, "XTaskQueueCloseHandle"));
+    auto gi_create = reinterpret_cast<HRESULT(__stdcall*)(void**)>(GetProcAddress(mod, "GameInputCreate"));
+
+    KX_CHECK(init_ex2 && uninit && query && err_report && dev_type && title_id &&
+             tq_create && tq_submit && tq_dispatch && tq_close && gi_create,
+             "drop-in xgameruntime.dll must export all core GDK & thunk symbols");
+
+    KX_CHECK(SUCCEEDED(init_ex2(0x00010000ull, nullptr)), "drop-in InitializeApiImplEx2 must return S_OK");
+    KX_CHECK(dev_type() == 4u, "drop-in XSystemGetDeviceType must report Xbox Scarlett (4)");
+    uint32_t tid = 0;
+    KX_CHECK(SUCCEEDED(title_id(&tid)) && tid != 0u, "drop-in XGameGetXboxTitleId must succeed");
+    KX_CHECK(err_report(S_OK, "shim_probe"), "drop-in XErrorReport must return true");
+
+    void* q = nullptr;
+    g_t75_task_ran = false;
+    KX_CHECK(SUCCEEDED(tq_create(0u, 0u, &q)) && q != nullptr, "drop-in XTaskQueueCreate must succeed");
+    KX_CHECK(SUCCEEDED(tq_submit(q, 0u, reinterpret_cast<void*>(0xCAFEBABEull), &t75_task_cb)),
+             "drop-in XTaskQueueSubmitCallback must succeed");
+    KX_CHECK(tq_dispatch(q, 0u, 0u) && g_t75_task_ran, "drop-in XTaskQueueDispatch must execute queued callback");
+    tq_close(q);
+
+    void* dummy = reinterpret_cast<void*>(0x1234ull);
+    const GUID unknown_iid{0xAAAAAAAAu, 0xBBBBu, 0xCCCCu, {1, 2, 3, 4, 5, 6, 7, 8}};
+    KX_CHECK(query(&unknown_iid, &dummy) == E_NOINTERFACE && dummy == nullptr,
+             "drop-in QueryApiImpl must return E_NOINTERFACE for unknown IID");
+
+    uninit();
+    FreeLibrary(mod);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -8983,6 +9111,8 @@ int main(int argc, char** argv) {
     run_test("Full-CRT Win32 EXE Runtime (Static TLS, Worker Thread TLS, Process Identity, Dynamic LoadLibrary & ExitProcess Isolation)", test_full_crt_win32_exe_static_tls_identity_and_exit_isolation);
     run_hw_test("Full-CRT Win32 + D3D12 + KxDxgiFactoryProxy/KxSwapChainProxy Render, --max-frames & BMP Capture", test_full_crt_d3d12_swapchain_proxy_max_frames_and_capture_dual_gpu);
     run_test("GDK xgameruntime.lib Dynamic Thunk ABI (InitializeApiImplEx2, QueryApiImpl, XErrorReport & HLE Probe)", test_gdk_xgameruntime_thunk_abi);
+    run_test("D3D12.X KxDeviceProxy Full ID3D12Device1..10 COM Identity & CreateCommandList1/Resource2/3 Wrapping", test_d3d12x_device10_proxy_identity_and_wrapping);
+    run_test("Standalone Drop-In xgameruntime.dll Shim DLL Live LoadLibrary & GDK ABI Execution", test_standalone_dropin_xgameruntime_shim_dll);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

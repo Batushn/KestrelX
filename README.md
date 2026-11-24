@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://github.com/Batushn/KestrelX/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0-2ea44f?style=for-the-badge" alt="Release: v0.7.0" /></a>
-    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-59%2F59_PASS-brightgreen?style=for-the-badge" alt="Tests: 59/59 PASS" /></a>
+    <a href="#verified-hardware-test-receipts"><img src="https://img.shields.io/badge/Hardware_Tests-60%2F60_PASS-brightgreen?style=for-the-badge" alt="Tests: 60/60 PASS" /></a>
     <a href="#hardware-visual-showcase"><img src="https://img.shields.io/badge/Dual--GPU-RTX_4060_%2B_Radeon_780M-0078D6?style=for-the-badge" alt="Dual-GPU: NVIDIA + AMD" /></a>
     <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge" alt="C++23" /></a>
     <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/D3D12_Ultimate-SM_6.6_DXIL-107C10?style=for-the-badge" alt="D3D12 Ultimate" /></a>
@@ -125,7 +125,7 @@ flowchart LR
 | **PE32+ Loader & System Libs** | `██████████ 100%` | ✅ Ready | `MicrosoftGame.config` XML, PE32+ relocs (DIR64/HIGHLOW), delay-load imports (RVA/legacy VA), export forwarders (DLL.Symbol, DLL.#Ordinal), multi-page thunk leak cleanup, `.pdata` SEH, TLS callbacks | Dynamic GDK Agility SDK DLL redirection |
 | **CPU VEH Zen 2 Shim** | `██████████ 100%` | ✅ Ready | In-process VEH emulator for AMD Zen 2 `CLZERO`, `MONITORX`, `MWAITX`, `MCOMMIT`, `RDPRU`, `PREFETCHW`, and SSE4a `EXTRQ`/`INSERTQ` for crash-free Intel processor compatibility | Dynamic TSC virtualization & CPU core topology pinning |
 | **Copy-on-Write Overlay VFS** | `██████████ 100%` | ✅ Ready | Case-insensitive per-layer path lookup cache, merged `list_directory` across base and overlay, whiteout suppression, non-throwing `std::error_code` safety, multi-user save partition isolation (`set_active_user_xuid`, `active_save_root`), Xbox drive prefixes (`GAME:\`, `G:\`, `D:\`, `C:\`, `S:\`, `T:\`) | Encrypted container archive streaming mounts |
-| **RDNA2 -> IR -> SM 6.6 DXIL** | `█████████░ 95%` | ✅ Ready | Complete 30-predicate VCmp/SCmp, 64-bit scalar ALU, Mesh Shaders (`ms_6_6`), Amplification Shaders (`as_6_6`), VRS Tier 2 decoders & combiners, PBR 3-MRT GBuffer, 2D compute tiling, Wave intrinsics | Raytracing BVH traversal (`image_bvh_intersect_ray`) |
+| **RDNA2 -> IR -> SM 6.6 DXIL** | `██████████ 98%` | ✅ Ready | Complete 30-predicate VCmp/SCmp, 64-bit scalar ALU, Mesh Shaders (`ms_6_6`), Amplification Shaders (`as_6_6`), VRS Tier 2 decoders & combiners, Hardware Raytracing BVH traversal (`image_bvh_intersect_ray` / `image_bvh64_intersect_ray` -> inline SM 6.6 `RayQuery`), PBR 3-MRT GBuffer, 2D compute tiling, Wave intrinsics | Inline procedural primitive intersection shims |
 | **RDNA2 IR Optimization Passes** | `██████████ 100%` | ✅ Ready | Unreachable basic-block pruning, intra-block copy propagation, constant folding (integer & float operations), backward liveness DCE & unused flag pruning, bit-exact dual-GPU parity | Inter-block global value numbering (GVN) |
 | **Persistent DXIL Shader Cache** | `██████████ 100%` | ✅ Ready | Mutex-protected thread-safe `DiskShaderCache`, LRU size quotas (`max_entries`, `max_bytes`), multi-dimensional dispatch keys (`group_y`, `group_z`, `mrt_mask`), corruption eviction | Background async shader pre-compilation pool |
 | **D3D12.X COM Proxy (`d3d12_xs`)** | `██████████ 98%` | ✅ Ready | Pure COM `KxDeviceProxy` (`ID3D12Device`-`Device10` QI), stream PSO auto-recomp, dedicated Async Compute queues with timeline fence sync, Work Graph DAG validation & 2-node `ExecuteIndirect` producer->consumer, `ID3D12GraphicsCommandList6/7` Enhanced Barriers & `DispatchMesh` | DirectSR super-resolution bridge |
@@ -288,8 +288,9 @@ KestrelX Verification Suite
   [PASS] GameInput Dual-Motor & Trigger Force Feedback Rumble Bridge
   [PASS] Spatial Audio 5.1 & 7.1 Multi-Channel Surround Downmix Matrix (ITU-R BS.775)
   [PASS] GDK Multi-User Profile Identity, Controller Binding & Isolated S:\ Saves
+  [PASS] RDNA2 Hardware Raytracing BVH (IMAGE_BVH_INTERSECT_RAY) Decode, IR Lift & SM 6.6 RayQuery DXIL
 
-Summary: 59 passed, 0 failed
+Summary: 60 passed, 0 failed
 ```
 
 CLI cold vs warm persistent disk-cache verification:

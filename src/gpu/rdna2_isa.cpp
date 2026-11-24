@@ -376,6 +376,8 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
                 case 0x0E: d.mnemonic = "image_get_resinfo"; break;
                 case 0x20: d.mnemonic = "image_sample"; break;
                 case 0x24: d.mnemonic = "image_sample_l"; break;
+                case 0x50: d.mnemonic = "image_bvh_intersect_ray"; break;
+                case 0x51: d.mnemonic = "image_bvh64_intersect_ray"; break;
                 default: d.mnemonic = std::format("mimg_{:#x}", d.opcode); break;
             }
         } else if ((w0 >> 26) == 0x36u && i + 1 < count) {

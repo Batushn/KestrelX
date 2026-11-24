@@ -157,6 +157,10 @@ inline void mimg(std::vector<uint32_t>& out, uint32_t op, uint32_t vdata, uint32
     out.push_back(w0);
     out.push_back(w1);
 }
+inline void image_bvh_intersect_ray(std::vector<uint32_t>& out, uint32_t vdata, uint32_t vaddr,
+                                    uint32_t srsrc = 0, bool is_64 = false) {
+    mimg(out, is_64 ? 0x51u : 0x50u, vdata, vaddr, srsrc, 0, 0xFu, 0);
+}
 inline void ds(std::vector<uint32_t>& out, uint32_t op, uint32_t vdst, uint32_t addr, uint32_t data0 = 0, uint32_t data1 = 0, uint16_t offset = 0) {
     const uint32_t w0 = (0x36u << 26) | ((op & 0xFFu) << 18) | offset;
     const uint32_t w1 = ((vdst & 0xFFu) << 24) | ((data1 & 0xFFu) << 16) | ((data0 & 0xFFu) << 8) | (addr & 0xFFu);

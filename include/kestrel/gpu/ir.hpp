@@ -91,6 +91,7 @@ enum class IrOp : uint8_t {
     ImageSample,
     ImageLoad,
     ImageGetResInfo,
+    ImageBvhIntersectRay,
     DsReadB32,
     DsWriteB32,
     Barrier,
@@ -176,6 +177,7 @@ struct IrFunction {
     bool uses_buf_srv = false;
     bool uses_tex = false;
     bool uses_wave_ops = false;
+    bool uses_ray_tracing = false;
     uint32_t mrt_mask = 0;
     uint32_t max_mesh_verts = 0;
     uint32_t max_mesh_prims = 0;
@@ -183,6 +185,7 @@ struct IrFunction {
     std::vector<DescriptorSlot> tex_bindings;
     std::vector<DescriptorSlot> samp_bindings;
     std::vector<DescriptorSlot> buf_srv_bindings;
+    std::vector<DescriptorSlot> as_bindings;
 };
 
 struct IrOptStats {

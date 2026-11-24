@@ -6731,6 +6731,74 @@ void test_gdk_multi_user_profile_save_isolation() {
     fs::remove_all(tmp, ec);
 }
 
+void test_rdna2_raytracing_bvh_intersect_ray_decode_ir_dxc() {
+    using namespace gpu::encode;
+
+    // Build compute program with RDNA2 GFX10.3 raytracing instructions:
+    // 1. Ray parameters in v[4..11] (Origin xyz, TMin, Dir xyz, TMax)
+    // 2. image_bvh_intersect_ray v[12..15], v[4..11], s[8..11] (opcode 0x50)
+    // 3. image_bvh64_intersect_ray v[16..19], v[4..11], s[8..11] (opcode 0x51)
+    // 4. Write hit flags to g_mem
+    std::vector<uint32_t> prog;
+    prog.push_back(vop1(1, 4, 128)); // v_mov_b32 v4, 0 (origin.x)
+    prog.push_back(vop1(1, 5, 128)); // v_mov_b32 v5, 0 (origin.y)
+    prog.push_back(vop1(1, 6, 128)); // v_mov_b32 v6, 0 (origin.z)
+    prog.push_back(vop1(1, 7, 128)); // v_mov_b32 v7, 0 (t_min)
+    prog.push_back(vop1(1, 8, 128)); // v_mov_b32 v8, 0 (dir.x)
+    prog.push_back(vop1(1, 9, 128)); // v_mov_b32 v9, 0 (dir.y)
+    prog.push_back(vop1(1, 10, 240)); // v_mov_b32 v10, 1.0 (dir.z)
+    prog.push_back(vop1(1, 11, 244)); // v_mov_b32 v11, 2.0 (t_max)
+    image_bvh_intersect_ray(prog, 12, 4, 8, false);
+    image_bvh_intersect_ray(prog, 16, 4, 8, true);
+    global_mem(prog, 28, 12, 0, 127, 0); // global_store_dword v0, v12
+    prog.push_back(sopp(1)); // s_endpgm
+
+    // 1. Disassembly & instruction decode verification
+    const auto decoded = gpu::decode_rdna2(prog.data(), prog.size());
+    KX_CHECK(decoded.size() == 12, "Decoded 12 RDNA2 instructions");
+    KX_CHECK(decoded[8].enc == gpu::Encoding::MIMG, "Opcode 0x50 is MIMG encoding");
+    KX_CHECK(decoded[8].opcode == 0x50, "Opcode is 0x50");
+    KX_CHECK(decoded[8].mnemonic == "image_bvh_intersect_ray", "Mnemonic is image_bvh_intersect_ray");
+    KX_CHECK(decoded[9].enc == gpu::Encoding::MIMG, "Opcode 0x51 is MIMG encoding");
+    KX_CHECK(decoded[9].opcode == 0x51, "Opcode is 0x51");
+    KX_CHECK(decoded[9].mnemonic == "image_bvh64_intersect_ray", "Mnemonic is image_bvh64_intersect_ray");
+
+    // 2. CFG IR Lifting verification
+    auto ir = gpu::lift_rdna2_to_ir(decoded);
+    KX_CHECK(ir.uses_ray_tracing, "IR marks uses_ray_tracing = true");
+    KX_CHECK(ir.as_bindings.size() == 1, "One RaytracingAccelerationStructure descriptor allocated");
+    KX_CHECK(ir.as_bindings[0].sgpr_base == 8, "AS binding maps to SGPR base s8");
+
+    // 3. Optimization pass verification
+    auto opt_stats = gpu::optimize_ir(ir);
+    (void)opt_stats;
+    KX_CHECK(ir.uses_ray_tracing, "Optimized IR preserves ray tracing usage");
+
+    // 4. SM 6.6 HLSL emission verification
+    auto recomp = gpu::emit_hlsl_from_ir(ir, {.stage = gpu::ShaderStage::Compute, .wave_mode = gpu::WaveMode::Wave32});
+    KX_CHECK(recomp.hlsl.find("RaytracingAccelerationStructure g_as0") != std::string::npos,
+             "HLSL declares RaytracingAccelerationStructure g_as0");
+    KX_CHECK(recomp.hlsl.find("RayQuery<RAY_FLAG_NONE> kx_q;") != std::string::npos,
+             "HLSL declares inline RayQuery object");
+    KX_CHECK(recomp.hlsl.find("TraceRayInline(g_as0, RAY_FLAG_NONE, 0xFF, kx_ray);") != std::string::npos,
+             "HLSL calls TraceRayInline on acceleration structure");
+    KX_CHECK(recomp.hlsl.find("kx_q.Proceed();") != std::string::npos,
+             "HLSL drives inline BVH traversal loop via Proceed()");
+    KX_CHECK(recomp.hlsl.find("kx_q.CommittedStatus() == COMMITTED_TRIANGLE_HIT") != std::string::npos,
+             "HLSL maps committed triangle hit status to VGPR");
+
+    // 5. In-process compilation with DXC into SM 6.6 DXIL container
+    gpu::DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC initialized for SM 6.6 RayQuery compile");
+    auto dxc_res = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+    KX_CHECK(dxc_res.has_value(), dxc_res ? "" : dxc_res.error().message);
+    if (dxc_res) {
+        KX_CHECK(!dxc_res->dxil.empty(), "RayQuery SM 6.6 DXIL binary emitted");
+        auto parsed = gpu::parse_dxbc_container(dxc_res->dxil.data(), dxc_res->dxil.size());
+        KX_CHECK(parsed.has_value() && parsed->has_dxil, "DXBC container contains signed DXIL chunk");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6806,6 +6874,7 @@ int main(int argc, char** argv) {
     run_test("HLE Registry Multi-Page (>2048 Stubs) Thunk Cleanup", test_registry_multipage_thunk_cleanup);
     run_test("Spatial Audio 5.1 & 7.1 Multi-Channel Surround Downmix Matrix (ITU-R BS.775)", test_xaudio2_surround_5point1_and_7point1_downmix);
     run_test("GDK Multi-User Profile Identity, Controller Binding & Isolated S:\\ Saves", test_gdk_multi_user_profile_save_isolation);
+    run_test("RDNA2 Hardware Raytracing BVH (IMAGE_BVH_INTERSECT_RAY) Decode, IR Lift & SM 6.6 RayQuery DXIL", test_rdna2_raytracing_bvh_intersect_ray_decode_ir_dxc);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

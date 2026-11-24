@@ -133,6 +133,14 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
         fn.samp_bindings.push_back({ssamp, reg});
         return reg;
     };
+    auto alloc_as_slot = [&](uint32_t srsrc) -> uint32_t {
+        for (uint32_t k = 0; k < fn.as_bindings.size(); ++k) {
+            if (fn.as_bindings[k].sgpr_base == srsrc) return k;
+        }
+        const uint32_t reg = next_extra_t++;
+        fn.as_bindings.push_back({srsrc, reg});
+        return static_cast<uint32_t>(fn.as_bindings.size() - 1);
+    };
 
     // Pre-scan for mesh shader markers (s_sendmsg GS_ALLOC_REQ or EXP prim0)
     bool is_mesh_shader = false;
@@ -599,6 +607,14 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                     ir.rsrc_slot = alloc_tex_slot(d.src2);
                     if (d.dst + out_regs > fn.max_vgpr) fn.max_vgpr = d.dst + out_regs;
                     fn.uses_tex = true;
+                } else if (d.mnemonic == "image_bvh_intersect_ray" || d.mnemonic == "image_bvh64_intersect_ray") {
+                    ir.op = IrOp::ImageBvhIntersectRay;
+                    ir.dst = make_vgpr(d.dst);
+                    ir.src0 = make_vgpr(d.src0);
+                    ir.rsrc_slot = alloc_as_slot(d.src2);
+                    if (d.dst + 4 > fn.max_vgpr) fn.max_vgpr = d.dst + 4;
+                    if (d.src0 + 8 > fn.max_vgpr) fn.max_vgpr = d.src0 + 8;
+                    fn.uses_ray_tracing = true;
                 } else {
                     ir.op = IrOp::Unknown;
                     ir.subop = d.mnemonic;

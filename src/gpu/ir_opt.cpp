@@ -186,6 +186,7 @@ bool can_substitute_src(IrOp op, int src_idx) {
         case IrOp::ImageSample:
         case IrOp::ImageLoad:
         case IrOp::ImageGetResInfo:
+        case IrOp::ImageBvhIntersectRay:
             return src_idx != 0;  // src0 uses .reg directly as v[src0.reg ..]
         default:
             return true;
@@ -588,6 +589,10 @@ void propagate_and_fold_block(IrBlock& blk, IrOptStats& stats) {
             invalidate_span(true, inst.dst.reg, image_out_reg_count(inst.dmask));
             continue;
         }
+        if (inst.op == IrOp::ImageBvhIntersectRay) {
+            invalidate_span(true, inst.dst.reg, 4u);
+            continue;
+        }
 
         if ((inst.op == IrOp::SMov || inst.op == IrOp::VMov) && is_reg_operand(inst.dst)) {
             const RegKey dst_key = to_reg_key(inst.dst);
@@ -768,6 +773,11 @@ void transfer_inst_backward(const IrInst& inst, LiveSet& live) {
                 live.set_reg(true, inst.dst.reg + k, false);
             }
             break;
+        case IrOp::ImageBvhIntersectRay:
+            for (uint32_t k = 0; k < 4; ++k) {
+                live.set_reg(true, inst.dst.reg + k, false);
+            }
+            break;
         case IrOp::VWriteLaneB32:
             // Partial per-lane write: dst remains live if live after.
             break;
@@ -809,6 +819,10 @@ void transfer_inst_backward(const IrInst& inst, LiveSet& live) {
     } else if (inst.op == IrOp::ImageSample || inst.op == IrOp::ImageLoad) {
         live.set_reg(true, inst.src0.reg, true);
         live.set_reg(true, inst.src0.reg + 1u, true);
+    } else if (inst.op == IrOp::ImageBvhIntersectRay) {
+        for (uint32_t k = 0; k < 8; ++k) {
+            live.set_reg(true, inst.src0.reg + k, true);
+        }
     } else if (inst.op == IrOp::VWriteLaneB32 && inst.dst.kind == IrOperand::Kind::Vgpr) {
         live.set_reg(true, inst.dst.reg, true);
     }

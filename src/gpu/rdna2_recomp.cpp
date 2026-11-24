@@ -459,6 +459,25 @@ void emit_inst(std::ostringstream& out, const IrInst& i, const char* ind, const 
             out << "}\n";
             break;
         }
+        case IrOp::ImageBvhIntersectRay: {
+            out << ind << "{\n";
+            out << ind << "    RayDesc kx_ray;\n";
+            out << ind << std::format("    kx_ray.Origin = float3(asfloat(v[{}]), asfloat(v[{}]), asfloat(v[{}]));\n",
+                                      i.src0.reg, i.src0.reg + 1, i.src0.reg + 2);
+            out << ind << std::format("    kx_ray.TMin = asfloat(v[{}]);\n", i.src0.reg + 3);
+            out << ind << std::format("    kx_ray.Direction = float3(asfloat(v[{}]), asfloat(v[{}]), asfloat(v[{}]));\n",
+                                      i.src0.reg + 4, i.src0.reg + 5, i.src0.reg + 6);
+            out << ind << std::format("    kx_ray.TMax = asfloat(v[{}]);\n", i.src0.reg + 7);
+            out << ind << "    RayQuery<RAY_FLAG_NONE> kx_q;\n";
+            out << ind << std::format("    kx_q.TraceRayInline(g_as{}, RAY_FLAG_NONE, 0xFF, kx_ray);\n", i.rsrc_slot);
+            out << ind << "    kx_q.Proceed();\n";
+            out << ind << std::format("    v[{}] = (kx_q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ? 1u : 0u;\n", i.dst.reg);
+            out << ind << std::format("    v[{}] = asuint(kx_q.CommittedRayT());\n", i.dst.reg + 1);
+            out << ind << std::format("    v[{}] = asuint(kx_q.CommittedTriangleBarycentrics().x);\n", i.dst.reg + 2);
+            out << ind << std::format("    v[{}] = asuint(kx_q.CommittedTriangleBarycentrics().y);\n", i.dst.reg + 3);
+            out << ind << "}\n";
+            break;
+        }
         case IrOp::DsWriteB32:
             if (stage == ShaderStage::Amplification) {
                 out << ind << std::format("kx_payload.data[(({} + {}u) >> 2u) & 63u] = {};\n",
@@ -656,6 +675,11 @@ void emit_dynamic_descriptors(std::ostringstream& out, const IrFunction& fn, Sha
                            k, fn.samp_bindings[k].hlsl_reg,
                            fn.samp_bindings[k].sgpr_base, fn.samp_bindings[k].sgpr_base + 3);
     }
+    for (size_t k = 0; k < fn.as_bindings.size(); ++k) {
+        out << std::format("RaytracingAccelerationStructure g_as{} : register(t{}); // SGPR s[{}..{}]\n",
+                           k, fn.as_bindings[k].hlsl_reg,
+                           fn.as_bindings[k].sgpr_base, fn.as_bindings[k].sgpr_base + 3);
+    }
 }
 
 }  // namespace
@@ -680,6 +704,10 @@ RootSignatureRemapPlan build_root_remap_plan(const IrFunction& fn, ShaderStage s
     }
     for (const auto& t : fn.tex_bindings) {
         plan.entries.push_back({RootBindingEntry::Kind::SrvTexture, t.sgpr_base, t.hlsl_reg, root_idx++});
+        ++plan.total_srv_slots;
+    }
+    for (const auto& as : fn.as_bindings) {
+        plan.entries.push_back({RootBindingEntry::Kind::SrvTexture, as.sgpr_base, as.hlsl_reg, root_idx++});
         ++plan.total_srv_slots;
     }
     for (const auto& s : fn.samp_bindings) {

@@ -1236,7 +1236,9 @@ RecompResult emit_hlsl_from_ir(const IrFunction& fn_in, const RecompOptions& opt
             out << "groupshared uint g_lds[8192];\n";
         }
         out << "\n";
-        out << std::format("[WaveSize({})]\n", static_cast<uint32_t>(opt.wave_mode));
+        if (opt.emit_wave_size_attr) {
+            out << std::format("[WaveSize({})]\n", static_cast<uint32_t>(opt.wave_mode));
+        }
         out << std::format("[numthreads({}, {}, {})]\n", opt.group_size_x, opt.group_size_y, opt.group_size_z);
         out << std::format("void {}(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{\n", opt.entry_point);
     } else if (opt.stage == ShaderStage::Vertex) {

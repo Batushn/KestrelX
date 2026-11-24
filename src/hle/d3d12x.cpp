@@ -100,7 +100,7 @@ size_t subobject_stride(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
 bool try_recompile_kestrel_rdna2(
     const void* bytecode, SIZE_T length, gpu::ShaderStage expected_stage,
     bool prefer_wave64, std::vector<uint8_t>& out_dxil, bool& out_cache_hit,
-    bool mesh_has_payload = false) {
+    bool mesh_has_payload = false, bool emit_wave_size = true) {
     out_cache_hit = false;
     if (!bytecode || length < 12) return false;
     const auto* bytes = static_cast<const uint8_t*>(bytecode);
@@ -131,7 +131,7 @@ bool try_recompile_kestrel_rdna2(
     const bool effective_wave64 = prefer_wave64 &&
         !((expected_stage == gpu::ShaderStage::Mesh || expected_stage == gpu::ShaderStage::Amplification) && group_x < 64);
     const gpu::WaveMode wave = effective_wave64 ? gpu::WaveMode::Wave64 : gpu::WaveMode::Wave32;
-    const uint32_t cache_group_tag = group_x | (mesh_has_payload ? 0x80000000u : 0u);
+    const uint32_t cache_group_tag = group_x | (mesh_has_payload ? 0x80000000u : 0u) | (!emit_wave_size ? 0x40000000u : 0u);
     const uint64_t cache_key = gpu::DiskShaderCache::make_key(expected_stage, wave, cache_group_tag, bytes, length);
 
     {
@@ -175,6 +175,7 @@ bool try_recompile_kestrel_rdna2(
         .wave_mode = wave,
         .group_size_x = group_x,
         .mesh_has_payload = mesh_has_payload,
+        .emit_wave_size_attr = emit_wave_size,
     });
     const char* profile = "cs_6_6";
     switch (expected_stage) {
@@ -208,14 +209,9 @@ HRESULT pick_hardware_adapter(IDXGIAdapter1** out_adapter) {
     if (pref >= 0) {
         IDXGIAdapter1* ad = nullptr;
         if (SUCCEEDED(factory->EnumAdapters1(static_cast<UINT>(pref), &ad))) {
-            DXGI_ADAPTER_DESC1 desc{};
-            ad->GetDesc1(&desc);
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-                *out_adapter = ad;
-                factory->Release();
-                return S_OK;
-            }
-            ad->Release();
+            *out_adapter = ad;
+            factory->Release();
+            return S_OK;
         }
     }
 
@@ -688,6 +684,7 @@ KxDeviceProxy::KxDeviceProxy(ID3D12Device* inner) : inner_(inner) {
         (void)inner_->QueryInterface(IID_PPV_ARGS(&inner2_));
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt1{};
         if (SUCCEEDED(inner_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opt1, sizeof(opt1)))) {
+            supports_wave32_ = (opt1.WaveLaneCountMin <= 32 && opt1.WaveLaneCountMax >= 32);
             supports_wave64_ = (opt1.WaveLaneCountMin <= 64 && opt1.WaveLaneCountMax >= 64);
         }
     }
@@ -788,8 +785,9 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreateComputePipelineState(const D3D12_
     if (d && d->CS.pShaderBytecode && d->CS.BytecodeLength >= 12) {
         std::vector<uint8_t> dxil;
         bool cache_hit = false;
+        const bool emit_wave_size = (supports_wave64_ || supports_wave32_);
         if (try_recompile_kestrel_rdna2(d->CS.pShaderBytecode, d->CS.BytecodeLength,
-                                        gpu::ShaderStage::Compute, supports_wave64_, dxil, cache_hit)) {
+                                        gpu::ShaderStage::Compute, supports_wave64_, dxil, cache_hit, false, emit_wave_size)) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC patched = *d;
             patched.CS.pShaderBytecode = dxil.data();
             patched.CS.BytecodeLength = dxil.size();
@@ -935,8 +933,9 @@ HRESULT STDMETHODCALLTYPE KxDeviceProxy::CreatePipelineState(const D3D12_PIPELIN
             const bool mesh_payload = (stage == gpu::ShaderStage::Mesh) && has_amplification;
             std::vector<uint8_t> dxil;
             bool cache_hit = false;
+            const bool emit_wave_size = (supports_wave64_ || supports_wave32_);
             if (try_recompile_kestrel_rdna2(bc.pShaderBytecode, bc.BytecodeLength, stage,
-                                            supports_wave64_, dxil, cache_hit, mesh_payload)) {
+                                            supports_wave64_, dxil, cache_hit, mesh_payload, emit_wave_size)) {
                 owned_dxil.push_back(std::move(dxil));
                 D3D12_SHADER_BYTECODE patched_bc{owned_dxil.back().data(), owned_dxil.back().size()};
                 std::memcpy(stream_copy.data() + offset + bc_off, &patched_bc, sizeof(patched_bc));

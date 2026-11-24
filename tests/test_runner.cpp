@@ -95,7 +95,8 @@ void test_game_config_parser() {
 }
 
 void test_overlay_vfs_cow_and_security() {
-    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestVfs";
+    std::error_code tmp_ec;
+    const fs::path tmp = fs::weakly_canonical(fs::temp_directory_path(), tmp_ec) / "KestrelX_TestVfs";
     std::error_code ec;
     fs::remove_all(tmp, ec);
     const fs::path base = tmp / "base";

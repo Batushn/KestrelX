@@ -270,6 +270,7 @@ private:
     ID3D12Device* inner_ = nullptr;
     ID3D12Device1* inner1_ = nullptr;
     ID3D12Device2* inner2_ = nullptr;
+    bool supports_wave32_ = false;
     bool supports_wave64_ = false;
 };
 

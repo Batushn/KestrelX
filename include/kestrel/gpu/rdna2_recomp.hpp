@@ -31,6 +31,11 @@ struct RecompOptions {
     uint32_t max_mesh_prims = 0;   // 0 = auto from IrFunction::max_mesh_prims (default 64)
     bool mesh_has_payload = false; // true when paired with an Amplification Shader
     bool enable_ir_opt = true;
+    bool use_amdhsa_abi = false;
+    uint32_t amdhsa_kernarg_sgpr = 4;
+    uint32_t amdhsa_wg_id_x_sgpr = 6;
+    uint32_t amdhsa_wg_id_y_sgpr = 7;
+    uint32_t amdhsa_wg_id_z_sgpr = 8;
 };
 
 struct RecompResult {

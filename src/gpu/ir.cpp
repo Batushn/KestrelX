@@ -21,6 +21,8 @@ IrOperand decode_operand(uint32_t code, bool has_lit, uint32_t lit, bool abs = f
         op.kind = IrOperand::Kind::Vcc;
     } else if (code == 124) {
         op.kind = IrOperand::Kind::M0;
+    } else if (code == 125) {
+        op.kind = IrOperand::Kind::Null;
     } else if (code == 126 || code == 127) {
         op.kind = IrOperand::Kind::Exec;
     } else if (code >= 128 && code <= 192) {
@@ -53,12 +55,7 @@ IrOperand make_sgpr(uint32_t r) {
 }
 
 IrOperand make_sdst(uint32_t r) {
-    if (r == 124) {
-        IrOperand op{};
-        op.kind = IrOperand::Kind::M0;
-        return op;
-    }
-    return make_sgpr(r);
+    return decode_operand(r, false, 0);
 }
 
 IrOperand make_vgpr(uint32_t r) {
@@ -171,6 +168,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
         ir.pc = d.pc;
         ir.clamp = d.clamp;
         ir.offset = d.offset;
+        ir.soffset = d.soffset;
 
         switch (d.enc) {
             case Encoding::SOPP:
@@ -228,6 +226,10 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                     if (d.mnemonic == "s_cbranch_execz" || d.mnemonic == "s_cbranch_execnz") {
                         fn.uses_wave_ops = true;
                     }
+                } else if (d.mnemonic.rfind("sopp_", 0) == 0) {
+                    ir.op = IrOp::Unknown;
+                    ir.subop = d.mnemonic;
+                    ++fn.unknown_count;
                 } else {
                     ir.op = IrOp::Nop;
                     ir.subop = d.mnemonic;
@@ -266,7 +268,13 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                     ir.op = IrOp::SAndSaveExec;
                     ir.subop = d.mnemonic;
                     fn.uses_wave_ops = true;
+                    fn.uses_exec_mask = true;
                     if (d.mnemonic == "s_and_saveexec_b64" && d.dst + 2 > fn.max_sgpr) fn.max_sgpr = d.dst + 2;
+                } else if (d.mnemonic == "s_andn2_saveexec_b32") {
+                    ir.op = IrOp::SAndN2SaveExec;
+                    ir.subop = d.mnemonic;
+                    fn.uses_wave_ops = true;
+                    fn.uses_exec_mask = true;
                 } else {
                     ir.op = IrOp::Unknown;
                     ir.subop = d.mnemonic;
@@ -312,6 +320,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 else if (d.mnemonic == "s_cselect_b32") ir.op = IrOp::SCSelectB32;
                 else if (d.mnemonic == "s_mul_i32") ir.op = IrOp::SMulI32;
                 else if (d.mnemonic == "s_and_b32") ir.op = IrOp::SAndB32;
+                else if (d.mnemonic == "s_andn2_b32") ir.op = IrOp::SAndN2B32;
                 else if (d.mnemonic == "s_or_b32") ir.op = IrOp::SOrB32;
                 else if (d.mnemonic == "s_xor_b32") ir.op = IrOp::SXorB32;
                 else if (d.mnemonic == "s_lshl_b32") ir.op = IrOp::SLshlB32;
@@ -328,14 +337,21 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 break;
 
             case Encoding::SMEM:
-                if (d.mnemonic == "s_load_dword" || d.mnemonic == "s_load_dwordx2" || d.mnemonic == "s_load_dwordx4") {
+                if (d.mnemonic == "s_load_dword" || d.mnemonic == "s_load_dwordx2" ||
+                    d.mnemonic == "s_load_dwordx4" || d.mnemonic == "s_load_dwordx8" ||
+                    d.mnemonic == "s_load_dwordx16") {
                     ir.op = IrOp::SLoadDword;
                     ir.subop = d.mnemonic;
                     ir.dst = make_sgpr(d.dst);
                     ir.src0 = make_sgpr(d.src0);
+                    ir.src1 = decode_operand(d.src1, false, 0);
                     fn.uses_cbuf = true;
-                    if (d.mnemonic == "s_load_dwordx2" && d.dst + 2 > fn.max_sgpr) fn.max_sgpr = d.dst + 2;
-                    if (d.mnemonic == "s_load_dwordx4" && d.dst + 4 > fn.max_sgpr) fn.max_sgpr = d.dst + 4;
+                    uint32_t cnt = 1;
+                    if (d.mnemonic == "s_load_dwordx2") cnt = 2;
+                    else if (d.mnemonic == "s_load_dwordx4") cnt = 4;
+                    else if (d.mnemonic == "s_load_dwordx8") cnt = 8;
+                    else if (d.mnemonic == "s_load_dwordx16") cnt = 16;
+                    if (d.dst + cnt > fn.max_sgpr) fn.max_sgpr = d.dst + cnt;
                 } else {
                     ir.op = IrOp::Unknown;
                     ir.subop = d.mnemonic;
@@ -380,7 +396,13 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 else if (d.mnemonic == "v_sqrt_f32") ir.op = IrOp::VSqrtF32;
                 else if (d.mnemonic == "v_floor_f32") ir.op = IrOp::VFloorF32;
                 else if (d.mnemonic == "v_ceil_f32") ir.op = IrOp::VCeilF32;
+                else if (d.mnemonic == "v_trunc_f32") ir.op = IrOp::VTruncF32;
+                else if (d.mnemonic == "v_rndne_f32") ir.op = IrOp::VRndneF32;
                 else if (d.mnemonic == "v_fract_f32") ir.op = IrOp::VFractF32;
+                else if (d.mnemonic == "v_frexp_exp_i32_f32") ir.op = IrOp::VFrexpExpI32F32;
+                else if (d.mnemonic == "v_frexp_mant_f32") ir.op = IrOp::VFrexpMantF32;
+                else if (d.mnemonic == "v_sin_f32") ir.op = IrOp::VSinF32;
+                else if (d.mnemonic == "v_cos_f32") ir.op = IrOp::VCosF32;
                 else { ir.op = IrOp::Unknown; ir.subop = d.mnemonic; ++fn.unknown_count; }
                 break;
 
@@ -391,7 +413,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 if (d.mnemonic == "v_add_f32") ir.op = IrOp::VAddF32;
                 else if (d.mnemonic == "v_sub_f32") ir.op = IrOp::VSubF32;
                 else if (d.mnemonic == "v_subrev_f32") ir.op = IrOp::VSubRevF32;
-                else if (d.mnemonic == "v_mul_f32") ir.op = IrOp::VMulF32;
+                else if (d.mnemonic == "v_mul_f32" || d.mnemonic == "v_mul_legacy_f32") ir.op = IrOp::VMulF32;
                 else if (d.mnemonic == "v_min_f32") ir.op = IrOp::VMinF32;
                 else if (d.mnemonic == "v_max_f32") ir.op = IrOp::VMaxF32;
                 else if (d.mnemonic == "v_min_i32") ir.op = IrOp::VMinI32;
@@ -417,8 +439,27 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                     ir.src2 = ir.src1;
                     ir.src1.kind = IrOperand::Kind::Literal;
                     ir.src1.lit_u32 = d.literal;
+                } else if (d.mnemonic == "v_add_co_ci_u32") {
+                    ir.op = IrOp::VAddCoCiU32;
+                    ir.sdst.kind = IrOperand::Kind::Vcc;
+                    ir.src2.kind = IrOperand::Kind::Vcc;
+                    fn.reads_vcc_mask = true;
+                    fn.uses_wave_ops = true;
+                } else if (d.mnemonic == "v_sub_co_ci_u32") {
+                    ir.op = IrOp::VSubCoCiU32;
+                    ir.sdst.kind = IrOperand::Kind::Vcc;
+                    ir.src2.kind = IrOperand::Kind::Vcc;
+                    fn.reads_vcc_mask = true;
+                    fn.uses_wave_ops = true;
+                } else if (d.mnemonic == "v_subrev_co_ci_u32") {
+                    ir.op = IrOp::VSubRevCoCiU32;
+                    ir.sdst.kind = IrOperand::Kind::Vcc;
+                    ir.src2.kind = IrOperand::Kind::Vcc;
+                    fn.reads_vcc_mask = true;
+                    fn.uses_wave_ops = true;
                 } else if (d.mnemonic == "v_cndmask_b32") {
                     ir.op = IrOp::VCndMask;
+                    ir.src2.kind = IrOperand::Kind::Vcc;
                 } else {
                     ir.op = IrOp::Unknown;
                     ir.subop = d.mnemonic;
@@ -427,17 +468,55 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 break;
 
             case Encoding::VOPC:
-                ir.op = IrOp::VCmp;
+                if (d.mnemonic == "v_cmp_class_f32" || d.mnemonic == "v_cmpx_class_f32") {
+                    ir.op = IrOp::VCmpClassF32;
+                } else if (d.mnemonic.rfind("vopc_", 0) == 0) {
+                    ir.op = IrOp::Unknown;
+                    ++fn.unknown_count;
+                } else {
+                    ir.op = IrOp::VCmp;
+                }
                 ir.subop = d.mnemonic;
+                if (d.mnemonic.rfind("v_cmpx_", 0) == 0) {
+                    ir.sdst.kind = IrOperand::Kind::Exec;
+                    fn.uses_exec_mask = true;
+                    fn.uses_wave_ops = true;
+                } else {
+                    ir.sdst.kind = IrOperand::Kind::Vcc;
+                }
                 ir.src0 = decode_operand(d.src0, d.has_literal, d.literal);
                 ir.src1 = decode_operand(d.src1, d.has_literal, d.literal);
                 break;
 
             case Encoding::VOP3:
-                ir.dst = make_vgpr(d.dst);
                 ir.src0 = decode_operand(d.src0, d.has_literal, d.literal, (d.abs_mask & 1) != 0, (d.neg_mask & 1) != 0);
                 ir.src1 = decode_operand(d.src1, d.has_literal, d.literal, (d.abs_mask & 2) != 0, (d.neg_mask & 2) != 0);
                 ir.src2 = decode_operand(d.src2, d.has_literal, d.literal, (d.abs_mask & 4) != 0, (d.neg_mask & 4) != 0);
+                if (d.opcode < 0x100u) {
+                    ir.sdst = decode_operand(d.sdst, false, 0);
+                    ir.subop = d.mnemonic;
+                    if (d.mnemonic == "v_cmp_class_f32" || d.mnemonic == "v_cmpx_class_f32") {
+                        ir.op = IrOp::VCmpClassF32;
+                    } else if (!d.mnemonic.empty() && d.mnemonic.rfind("vopc_", 0) != 0 && d.mnemonic.rfind("vop3_", 0) != 0) {
+                        ir.op = IrOp::VCmp;
+                    } else {
+                        ir.op = IrOp::Unknown;
+                        ++fn.unknown_count;
+                    }
+                    if (d.mnemonic.rfind("v_cmpx_", 0) == 0 || ir.sdst.kind == IrOperand::Kind::Exec) {
+                        ir.sdst.kind = IrOperand::Kind::Exec;
+                        fn.uses_exec_mask = true;
+                    }
+                    fn.uses_wave_ops = true;
+                    fn.reads_vcc_mask = true;
+                    break;
+                }
+                ir.dst = make_vgpr(d.dst);
+                if (d.is_vop3b) {
+                    ir.sdst = decode_operand(d.sdst, false, 0);
+                    fn.uses_wave_ops = true;
+                    if (ir.sdst.kind == IrOperand::Kind::Vcc) fn.reads_vcc_mask = true;
+                }
                 if (d.mnemonic == "v_fma_f32" || d.mnemonic == "v_mad_f32") ir.op = IrOp::VFmaF32;
                 else if (d.mnemonic == "v_mul_lo_u32") ir.op = IrOp::VMulLoU32;
                 else if (d.mnemonic == "v_mad_u32_u24") ir.op = IrOp::VMadU32U24;
@@ -446,7 +525,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 else if (d.mnemonic == "v_add_f32") ir.op = IrOp::VAddF32;
                 else if (d.mnemonic == "v_sub_f32") ir.op = IrOp::VSubF32;
                 else if (d.mnemonic == "v_subrev_f32") ir.op = IrOp::VSubRevF32;
-                else if (d.mnemonic == "v_mul_f32") ir.op = IrOp::VMulF32;
+                else if (d.mnemonic == "v_mul_f32" || d.mnemonic == "v_mul_legacy_f32") ir.op = IrOp::VMulF32;
                 else if (d.mnemonic == "v_add_nc_u32") ir.op = IrOp::VAddU32;
                 else if (d.mnemonic == "v_sub_nc_u32") ir.op = IrOp::VSubU32;
                 else if (d.mnemonic == "v_subrev_nc_u32") ir.op = IrOp::VSubRevU32;
@@ -462,9 +541,62 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 else if (d.mnemonic == "v_max_i32") ir.op = IrOp::VMaxI32;
                 else if (d.mnemonic == "v_min_u32") ir.op = IrOp::VMinU32;
                 else if (d.mnemonic == "v_max_u32") ir.op = IrOp::VMaxU32;
-                else if (d.mnemonic == "v_cndmask_b32") ir.op = IrOp::VCndMask;
+                else if (d.mnemonic == "v_cndmask_b32") {
+                    ir.op = IrOp::VCndMask;
+                    if (ir.src2.kind == IrOperand::Kind::Sgpr) {
+                        fn.uses_wave_ops = true;
+                        fn.reads_vcc_mask = true;
+                    }
+                }
                 else if (d.mnemonic == "v_med3_f32") ir.op = IrOp::VMed3F32;
                 else if (d.mnemonic == "v_bfe_i32") ir.op = IrOp::VBfeI32;
+                else if (d.mnemonic == "v_add_co_u32") ir.op = IrOp::VAddCoU32;
+                else if (d.mnemonic == "v_sub_co_u32") ir.op = IrOp::VSubCoU32;
+                else if (d.mnemonic == "v_subrev_co_u32") ir.op = IrOp::VSubRevCoU32;
+                else if (d.mnemonic == "v_add_co_ci_u32") { ir.op = IrOp::VAddCoCiU32; fn.reads_vcc_mask = true; }
+                else if (d.mnemonic == "v_sub_co_ci_u32") { ir.op = IrOp::VSubCoCiU32; fn.reads_vcc_mask = true; }
+                else if (d.mnemonic == "v_subrev_co_ci_u32") { ir.op = IrOp::VSubRevCoCiU32; fn.reads_vcc_mask = true; }
+                else if (d.mnemonic == "v_add3_u32") ir.op = IrOp::VAdd3U32;
+                else if (d.mnemonic == "v_lshl_add_u32") ir.op = IrOp::VLshlAddU32;
+                else if (d.mnemonic == "v_lshl_or_b32") ir.op = IrOp::VLshlOrB32;
+                else if (d.mnemonic == "v_xor3_b32") ir.op = IrOp::VXor3B32;
+                else if (d.mnemonic == "v_perm_b32") ir.op = IrOp::VPermB32;
+                else if (d.mnemonic == "v_mad_u64_u32") {
+                    ir.op = IrOp::VMadU64U32;
+                    if (d.dst + 2 > fn.max_vgpr) fn.max_vgpr = d.dst + 2;
+                }
+                else if (d.mnemonic == "v_lshlrev_b64") {
+                    ir.op = IrOp::VLshlRevB64;
+                    if (d.dst + 2 > fn.max_vgpr) fn.max_vgpr = d.dst + 2;
+                    if (ir.src1.kind == IrOperand::Kind::Vgpr && ir.src1.reg + 2 > fn.max_vgpr) fn.max_vgpr = ir.src1.reg + 2;
+                }
+                else if (d.mnemonic == "v_lshrrev_b64") {
+                    ir.op = IrOp::VLshrRevB64;
+                    if (d.dst + 2 > fn.max_vgpr) fn.max_vgpr = d.dst + 2;
+                    if (ir.src1.kind == IrOperand::Kind::Vgpr && ir.src1.reg + 2 > fn.max_vgpr) fn.max_vgpr = ir.src1.reg + 2;
+                }
+                else if (d.mnemonic == "v_ashrrev_i64") {
+                    ir.op = IrOp::VAshrRevI64;
+                    if (d.dst + 2 > fn.max_vgpr) fn.max_vgpr = d.dst + 2;
+                    if (ir.src1.kind == IrOperand::Kind::Vgpr && ir.src1.reg + 2 > fn.max_vgpr) fn.max_vgpr = ir.src1.reg + 2;
+                }
+                else if (d.mnemonic == "v_ldexp_f32") ir.op = IrOp::VLdexpF32;
+                else if (d.mnemonic == "v_frexp_exp_i32_f32") ir.op = IrOp::VFrexpExpI32F32;
+                else if (d.mnemonic == "v_frexp_mant_f32") ir.op = IrOp::VFrexpMantF32;
+                else if (d.mnemonic == "v_floor_f32") ir.op = IrOp::VFloorF32;
+                else if (d.mnemonic == "v_ceil_f32") ir.op = IrOp::VCeilF32;
+                else if (d.mnemonic == "v_trunc_f32") ir.op = IrOp::VTruncF32;
+                else if (d.mnemonic == "v_rndne_f32") ir.op = IrOp::VRndneF32;
+                else if (d.mnemonic == "v_fract_f32") ir.op = IrOp::VFractF32;
+                else if (d.mnemonic == "v_rcp_f32") ir.op = IrOp::VRcpF32;
+                else if (d.mnemonic == "v_rsq_f32") ir.op = IrOp::VRsqF32;
+                else if (d.mnemonic == "v_sqrt_f32") ir.op = IrOp::VSqrtF32;
+                else if (d.mnemonic == "v_sin_f32") ir.op = IrOp::VSinF32;
+                else if (d.mnemonic == "v_cos_f32") ir.op = IrOp::VCosF32;
+                else if (d.mnemonic == "v_cvt_f32_i32") ir.op = IrOp::VCvtF32I32;
+                else if (d.mnemonic == "v_cvt_f32_u32") ir.op = IrOp::VCvtF32U32;
+                else if (d.mnemonic == "v_cvt_u32_f32") ir.op = IrOp::VCvtU32F32;
+                else if (d.mnemonic == "v_cvt_i32_f32") ir.op = IrOp::VCvtI32F32;
                 else if (d.mnemonic == "v_readlane_b32") {
                     ir.op = IrOp::VReadLaneB32;
                     ir.dst = make_sgpr(d.dst);
@@ -479,6 +611,7 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
                 break;
 
             case Encoding::FLAT:
+                ir.src2 = decode_operand(d.src2, false, 0);  // saddr (125 = null/off)
                 if (d.mnemonic == "global_load_dword") {
                     ir.op = IrOp::GlobalLoadDword;
                     ir.dst = make_vgpr(d.dst);
@@ -658,7 +791,20 @@ IrFunction lift_rdna2_to_ir(const std::vector<DecodedInst>& decoded) {
         }
 
         track_regs(ir.dst, fn.max_vgpr, fn.max_sgpr);
+        track_regs(ir.sdst, fn.max_vgpr, fn.max_sgpr);
         track_regs(ir.src0, fn.max_vgpr, fn.max_sgpr);
+        if (ir.dst.kind == IrOperand::Kind::Exec || ir.sdst.kind == IrOperand::Kind::Exec ||
+            ir.src0.kind == IrOperand::Kind::Exec || ir.src1.kind == IrOperand::Kind::Exec ||
+            ir.src2.kind == IrOperand::Kind::Exec ||
+            ir.op == IrOp::SAndSaveExec || ir.op == IrOp::SAndN2SaveExec) {
+            fn.uses_exec_mask = true;
+            fn.reads_vcc_mask = true;
+        }
+        if ((d.enc == Encoding::SOP1 || d.enc == Encoding::SOP2 || d.enc == Encoding::SOPC) &&
+            (ir.dst.kind == IrOperand::Kind::Vcc || ir.src0.kind == IrOperand::Kind::Vcc || ir.src1.kind == IrOperand::Kind::Vcc)) {
+            fn.reads_vcc_mask = true;
+            fn.uses_wave_ops = true;
+        }
         track_regs(ir.src1, fn.max_vgpr, fn.max_sgpr);
         track_regs(ir.src2, fn.max_vgpr, fn.max_sgpr);
         track_regs(ir.src3, fn.max_vgpr, fn.max_sgpr);

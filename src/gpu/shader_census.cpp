@@ -1,6 +1,7 @@
 #include "kestrel/gpu/shader_census.hpp"
 
 #include "kestrel/formats/sgd5.hpp"
+#include "kestrel/gpu/amdgpu_elf.hpp"
 #include "kestrel/gpu/dxc_compiler.hpp"
 #include "kestrel/gpu/ir.hpp"
 #include "kestrel/gpu/rdna2_isa.hpp"
@@ -67,7 +68,8 @@ bool has_shader_extension(const fs::path& p) {
     const std::string ext = to_lower_ascii(p.extension().string());
     return ext == ".sgd" || ext == ".sgd5" || ext == ".rpf" || ext == ".dxbc" ||
            ext == ".cso" || ext == ".bin" || ext == ".rdna2" || ext == ".kxrn" ||
-           ext == ".kxrv" || ext == ".kxrp" || ext == ".kxrm" || ext == ".kxra";
+           ext == ".kxrv" || ext == ".kxrp" || ext == ".kxrm" || ext == ".kxra" ||
+           ext == ".elf" || ext == ".hsaco" || ext == ".co" || ext == ".o";
 }
 
 struct KxHeader {
@@ -175,7 +177,8 @@ struct CensusCtx {
         size_t size,
         bool stage_known,
         ShaderStage known_stage,
-        formats::Sgd5ShaderKind sgd_hint) {
+        formats::Sgd5ShaderKind sgd_hint,
+        const AmdgpuKernelInfo* amdhsa_kernel = nullptr) {
         if (size < 4 || (size % 4) != 0) {
             add_failure(std::format("{}: non-dword-aligned microcode ({} bytes)", label, size));
             return;
@@ -229,6 +232,14 @@ struct CensusCtx {
         ropt.stage = stage;
         ropt.wave_mode = opt.wave_mode;
         ropt.enable_ir_opt = true;
+        if (amdhsa_kernel) {
+            ropt.use_amdhsa_abi = true;
+            ropt.amdhsa_kernarg_sgpr = amdhsa_kernel->kernarg_sgpr;
+            ropt.amdhsa_wg_id_x_sgpr = amdhsa_kernel->wg_id_x_sgpr;
+            ropt.amdhsa_wg_id_y_sgpr = amdhsa_kernel->wg_id_y_sgpr;
+            ropt.amdhsa_wg_id_z_sgpr = amdhsa_kernel->wg_id_z_sgpr;
+            ropt.group_size_x = 32;
+        }
         auto recomp = emit_hlsl_from_ir(ir, ropt);
         if (recomp.hlsl.empty()) {
             add_failure(std::format("{}: empty HLSL emission", label));
@@ -325,6 +336,30 @@ struct CensusCtx {
                 }
                 ++report.unpacked_ok;
                 analyze_blob(label, *unpacked, rec.kind);
+            }
+            return;
+        }
+
+        if (is_amdgpu_elf(bytes)) {
+            auto elf = parse_amdgpu_elf(bytes);
+            if (!elf) {
+                ++report.total_entries;
+                add_failure(std::format("{}: invalid AMDGPU ELF ({})", file_path.filename().string(), elf.error().message));
+                return;
+            }
+            for (const auto& k : elf->kernels) {
+                if (limit_reached()) break;
+                ++report.total_entries;
+                ++report.unpacked_ok;
+                const std::string label = std::format("{}:{}", file_path.filename().string(), k.name);
+                analyze_rdna2_stream(
+                    label,
+                    reinterpret_cast<const uint8_t*>(k.code_words.data()),
+                    k.code_words.size() * sizeof(uint32_t),
+                    true,
+                    ShaderStage::Compute,
+                    formats::Sgd5ShaderKind::Unknown,
+                    &k);
             }
             return;
         }

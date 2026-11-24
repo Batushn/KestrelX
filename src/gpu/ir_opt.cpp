@@ -84,6 +84,8 @@ bool is_normal_or_zero_f32(float f) {
 }
 
 uint32_t s_load_reg_count(const IrInst& inst) {
+    if (inst.subop == "s_load_dwordx16") return 16u;
+    if (inst.subop == "s_load_dwordx8") return 8u;
     if (inst.subop == "s_load_dwordx4") return 4u;
     if (inst.subop == "s_load_dwordx2") return 2u;
     return 1u;
@@ -132,6 +134,7 @@ bool has_side_effects(const IrInst& inst) {
         case IrOp::SSubU32:
         case IrOp::SMulI32:
         case IrOp::SAndB32:
+        case IrOp::SAndN2B32:
         case IrOp::SOrB32:
         case IrOp::SXorB32:
         case IrOp::SLshlB32:
@@ -148,6 +151,12 @@ bool has_side_effects(const IrInst& inst) {
         case IrOp::VMaxF32:
         case IrOp::VAddU32:
         case IrOp::VSubU32:
+        case IrOp::VSubRevU32:
+        case IrOp::VAdd3U32:
+        case IrOp::VLshlAddU32:
+        case IrOp::VLshlOrB32:
+        case IrOp::VXor3B32:
+        case IrOp::VPermB32:
         case IrOp::VMulLoU32:
         case IrOp::VAndB32:
         case IrOp::VOrB32:
@@ -164,7 +173,14 @@ bool has_side_effects(const IrInst& inst) {
         case IrOp::VSqrtF32:
         case IrOp::VFloorF32:
         case IrOp::VCeilF32:
+        case IrOp::VTruncF32:
+        case IrOp::VRndneF32:
         case IrOp::VFractF32:
+        case IrOp::VFrexpExpI32F32:
+        case IrOp::VFrexpMantF32:
+        case IrOp::VLdexpF32:
+        case IrOp::VSinF32:
+        case IrOp::VCosF32:
         case IrOp::VMed3F32:
         case IrOp::VBfeI32:
         case IrOp::VCmp:
@@ -179,6 +195,20 @@ bool can_substitute_src(IrOp op, int src_idx) {
     switch (op) {
         case IrOp::Unknown:
             return false;
+        case IrOp::SLoadDword:
+            return src_idx != 0;  // src0 is 64-bit SGPR base pair
+        case IrOp::GlobalLoadDword:
+        case IrOp::GlobalLoadDwordx2:
+        case IrOp::GlobalLoadDwordx4:
+            return src_idx != 0 && src_idx != 2;
+        case IrOp::GlobalStoreDword:
+        case IrOp::GlobalStoreDwordx2:
+        case IrOp::GlobalStoreDwordx4:
+            return src_idx != 0 && src_idx != 1 && src_idx != 2;
+        case IrOp::VLshlRevB64:
+        case IrOp::VLshrRevB64:
+        case IrOp::VAshrRevI64:
+            return src_idx != 1;  // src1 is 64-bit VGPR pair v[reg..reg+1]
         case IrOp::BufferStoreDword:
         case IrOp::BufferStoreDwordx2:
         case IrOp::BufferStoreDwordx4:
@@ -544,12 +574,14 @@ void propagate_and_fold_block(IrBlock& blk, IrOptStats& stats) {
         }
 
         // 3. Update tracked state for writes / clobbers
-        if (inst.op == IrOp::Unknown || inst.dst.kind == IrOperand::Kind::Exec) {
+        if (inst.op == IrOp::Unknown ||
+            inst.dst.kind == IrOperand::Kind::Exec ||
+            inst.sdst.kind == IrOperand::Kind::Exec) {
             env.clear();
             continue;
         }
 
-        if (inst.op == IrOp::SAndSaveExec) {
+        if (inst.op == IrOp::SAndSaveExec || inst.op == IrOp::SAndN2SaveExec) {
             invalidate_span(false, inst.dst.reg, (inst.subop == "s_and_saveexec_b64") ? 2u : 1u);
             // Exec mask changes: conservatively clear vector tracking.
             for (auto it = env.begin(); it != env.end();) {
@@ -582,6 +614,15 @@ void propagate_and_fold_block(IrBlock& blk, IrOptStats& stats) {
         if (inst.op == IrOp::SMovB64 || inst.op == IrOp::SNotB64) {
             invalidate_span(false, inst.dst.reg, 2u);
             continue;
+        }
+        if (inst.op == IrOp::VMadU64U32 || inst.op == IrOp::VLshlRevB64 ||
+            inst.op == IrOp::VLshrRevB64 || inst.op == IrOp::VAshrRevI64) {
+            if (inst.dst.kind == IrOperand::Kind::Vgpr) invalidate_span(true, inst.dst.reg, 2u);
+            if (inst.sdst.kind == IrOperand::Kind::Sgpr) invalidate_reg(to_reg_key(inst.sdst));
+            continue;
+        }
+        if (inst.sdst.kind == IrOperand::Kind::Sgpr) {
+            invalidate_reg(to_reg_key(inst.sdst));
         }
         if (inst.op == IrOp::ImageSample ||
             inst.op == IrOp::ImageLoad ||
@@ -706,9 +747,10 @@ uint32_t compute_max_reg(const IrFunction& fn, bool is_vgpr) {
     for (const auto& blk : fn.blocks) {
         for (const auto& inst : blk.insts) {
             bump(inst.dst, 4u);
+            bump(inst.sdst, 2u);
             bump(inst.src0, 2u);
             bump(inst.src1, 4u);
-            bump(inst.src2);
+            bump(inst.src2, 2u);
             bump(inst.src3);
         }
     }
@@ -719,7 +761,11 @@ bool is_inst_dead(const IrInst& inst, const LiveSet& live) {
     if (has_side_effects(inst)) return false;
     if (inst.op == IrOp::Nop) return true;
     if (inst.op == IrOp::SCmp) return !live.scc;
-    if (inst.op == IrOp::VCmp) return !live.vcc;
+    if (inst.op == IrOp::VCmp || inst.op == IrOp::VCmpClassF32) {
+        if (inst.sdst.kind == IrOperand::Kind::Sgpr) return !live.get_reg(false, inst.sdst.reg);
+        if (inst.sdst.kind == IrOperand::Kind::Exec || inst.sdst.kind == IrOperand::Kind::Null) return false;
+        return !live.vcc;
+    }
     if (inst.dst.kind == IrOperand::Kind::Sgpr) return !live.get_reg(false, inst.dst.reg);
     if (inst.dst.kind == IrOperand::Kind::Vgpr) return !live.get_reg(true, inst.dst.reg);
     if (inst.dst.kind == IrOperand::Kind::Scc) return !live.scc;
@@ -734,13 +780,39 @@ void transfer_inst_backward(const IrInst& inst, LiveSet& live) {
             live.scc = false;
             break;
         case IrOp::VCmp:
-            live.vcc = false;
+        case IrOp::VCmpClassF32:
+            if (inst.sdst.kind == IrOperand::Kind::Sgpr) live.set_reg(false, inst.sdst.reg, false);
+            else if (inst.sdst.kind == IrOperand::Kind::Vcc || inst.sdst.kind == IrOperand::Kind::None) live.vcc = false;
+            break;
+        case IrOp::VAddCoU32:
+        case IrOp::VSubCoU32:
+        case IrOp::VSubRevCoU32:
+        case IrOp::VAddCoCiU32:
+        case IrOp::VSubCoCiU32:
+        case IrOp::VSubRevCoCiU32:
+            if (inst.dst.kind == IrOperand::Kind::Vgpr) live.set_reg(true, inst.dst.reg, false);
+            if (inst.sdst.kind == IrOperand::Kind::Sgpr) live.set_reg(false, inst.sdst.reg, false);
+            else if (inst.sdst.kind == IrOperand::Kind::Vcc) live.vcc = false;
+            break;
+        case IrOp::VMadU64U32:
+        case IrOp::VLshlRevB64:
+        case IrOp::VLshrRevB64:
+        case IrOp::VAshrRevI64:
+            if (inst.dst.kind == IrOperand::Kind::Vgpr) {
+                live.set_reg(true, inst.dst.reg, false);
+                live.set_reg(true, inst.dst.reg + 1u, false);
+            }
+            if (inst.sdst.kind == IrOperand::Kind::Sgpr) live.set_reg(false, inst.sdst.reg, false);
+            else if (inst.sdst.kind == IrOperand::Kind::Vcc) live.vcc = false;
             break;
         case IrOp::SAndSaveExec:
+        case IrOp::SAndN2SaveExec:
             live.scc = false;
-            live.set_reg(false, inst.dst.reg, false);
-            if (inst.subop == "s_and_saveexec_b64") {
-                live.set_reg(false, inst.dst.reg + 1u, false);
+            if (inst.dst.kind == IrOperand::Kind::Sgpr) {
+                live.set_reg(false, inst.dst.reg, false);
+                if (inst.subop == "s_and_saveexec_b64") {
+                    live.set_reg(false, inst.dst.reg + 1u, false);
+                }
             }
             break;
         case IrOp::SLoadDword:
@@ -796,8 +868,12 @@ void transfer_inst_backward(const IrInst& inst, LiveSet& live) {
     live.add_operand(inst.src2);
     live.add_operand(inst.src3);
 
-    if (inst.op == IrOp::VCndMask) {
-        live.vcc = true;
+    if (inst.op == IrOp::VCndMask || inst.op == IrOp::VAddCoCiU32 ||
+               inst.op == IrOp::VSubCoCiU32 || inst.op == IrOp::VSubRevCoCiU32) {
+        if (inst.src2.kind == IrOperand::Kind::None || inst.src2.kind == IrOperand::Kind::Vcc) live.vcc = true;
+    } else if (inst.op == IrOp::SAndB32 || inst.op == IrOp::SOrB32 || inst.op == IrOp::SXorB32 ||
+               inst.op == IrOp::SAndN2B32 || inst.op == IrOp::SMov) {
+        if (inst.src0.kind == IrOperand::Kind::Vcc || inst.src1.kind == IrOperand::Kind::Vcc) live.vcc = true;
     } else if (inst.op == IrOp::SCSelectB32 || inst.op == IrOp::SAddCU32 || inst.op == IrOp::SSubBU32) {
         live.scc = true;
     } else if (inst.op == IrOp::CondBranch) {
@@ -808,7 +884,13 @@ void transfer_inst_backward(const IrInst& inst, LiveSet& live) {
         for (uint32_t k = 0; k < cnt; ++k) {
             live.set_reg(true, inst.src1.reg + k, true);
         }
+    } else if (inst.op == IrOp::VLshlRevB64 || inst.op == IrOp::VLshrRevB64 || inst.op == IrOp::VAshrRevI64) {
+        if (inst.src1.kind == IrOperand::Kind::Vgpr) live.set_reg(true, inst.src1.reg + 1u, true);
+    } else if (inst.op == IrOp::GlobalLoadDword || inst.op == IrOp::GlobalLoadDwordx2 || inst.op == IrOp::GlobalLoadDwordx4 ||
+               inst.op == IrOp::GlobalStoreDword) {
+        if (inst.src2.kind == IrOperand::Kind::Sgpr) live.set_reg(false, inst.src2.reg + 1u, true);
     } else if (inst.op == IrOp::GlobalStoreDwordx2 || inst.op == IrOp::GlobalStoreDwordx4) {
+        if (inst.src2.kind == IrOperand::Kind::Sgpr) live.set_reg(false, inst.src2.reg + 1u, true);
         const uint32_t cnt = global_reg_count(inst.op);
         for (uint32_t k = 0; k < cnt; ++k) {
             live.set_reg(true, inst.src1.reg + k, true);

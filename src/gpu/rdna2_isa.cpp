@@ -11,7 +11,7 @@ const char* sopp_name(uint32_t op) {
         case 0: return "s_nop";
         case 1: return "s_endpgm";
         case 2: return "s_branch";
-        case 3: return "s_sendmsg";
+        case 3: return "s_wakeup";
         case 4: return "s_cbranch_scc0";
         case 5: return "s_cbranch_scc1";
         case 6: return "s_cbranch_vccz";
@@ -22,6 +22,7 @@ const char* sopp_name(uint32_t op) {
         case 12: return "s_waitcnt";
         case 16: return "s_sendmsg";
         case 27: return "s_endpgm_saved";
+        case 33: return "s_clause";
         default: return nullptr;
     }
 }
@@ -35,6 +36,7 @@ const char* sop1_name(uint32_t op) {
         case 28: return "s_getpc_b64";
         case 32: return "s_and_saveexec_b64";
         case 60: return "s_and_saveexec_b32";
+        case 63: return "s_andn2_saveexec_b32";
         default: return nullptr;
     }
 }
@@ -51,10 +53,11 @@ const char* sop2_name(uint32_t op) {
         case 14: return "s_and_b32";
         case 16: return "s_or_b32";
         case 18: return "s_xor_b32";
+        case 20: return "s_andn2_b32";
         case 30: return "s_lshl_b32";
         case 32: return "s_lshr_b32";
         case 34: return "s_ashr_i32";
-        case 44: return "s_mul_i32";
+        case 38: return "s_mul_i32";
         default: return nullptr;
     }
 }
@@ -96,13 +99,19 @@ const char* vop1_name(uint32_t op) {
         case 7: return "v_cvt_u32_f32";
         case 8: return "v_cvt_i32_f32";
         case 32: return "v_fract_f32";
+        case 33: return "v_trunc_f32";
         case 34: return "v_ceil_f32";
+        case 35: return "v_rndne_f32";
         case 36: return "v_floor_f32";
         case 37: return "v_exp_f32";
         case 39: return "v_log_f32";
         case 42: return "v_rcp_f32";
         case 46: return "v_rsq_f32";
         case 51: return "v_sqrt_f32";
+        case 53: return "v_sin_f32";
+        case 54: return "v_cos_f32";
+        case 63: return "v_frexp_exp_i32_f32";
+        case 64: return "v_frexp_mant_f32";
         default: return nullptr;
     }
 }
@@ -113,7 +122,8 @@ const char* vop2_name(uint32_t op) {
         case 3: return "v_add_f32";
         case 4: return "v_sub_f32";
         case 5: return "v_subrev_f32";
-        case 7: return "v_mul_f32";
+        case 7: return "v_mul_legacy_f32";
+        case 8: return "v_mul_f32";
         case 15: return "v_min_f32";
         case 16: return "v_max_f32";
         case 17: return "v_min_i32";
@@ -129,6 +139,9 @@ const char* vop2_name(uint32_t op) {
         case 37: return "v_add_nc_u32";
         case 38: return "v_sub_nc_u32";
         case 39: return "v_subrev_nc_u32";
+        case 40: return "v_add_co_ci_u32";
+        case 41: return "v_sub_co_ci_u32";
+        case 42: return "v_subrev_co_ci_u32";
         case 43: return "v_fmac_f32";
         case 44: return "v_fmamk_f32";
         case 45: return "v_fmaak_f32";
@@ -138,57 +151,145 @@ const char* vop2_name(uint32_t op) {
 
 const char* vopc_name(uint32_t op) {
     switch (op) {
-        case 0x11: return "v_cmp_lt_f32";
-        case 0x12: return "v_cmp_eq_f32";
-        case 0x13: return "v_cmp_le_f32";
-        case 0x14: return "v_cmp_gt_f32";
-        case 0x15: return "v_cmp_lg_f32";
-        case 0x16: return "v_cmp_ge_f32";
+        // Float V_CMP_*_F32 (GFX10.3: 0x00..0x0F)
+        case 0x00: return "v_cmp_f_f32";
+        case 0x01: return "v_cmp_lt_f32";
+        case 0x02: return "v_cmp_eq_f32";
+        case 0x03: return "v_cmp_le_f32";
+        case 0x04: return "v_cmp_gt_f32";
+        case 0x05: return "v_cmp_lg_f32";
+        case 0x06: return "v_cmp_ge_f32";
+        case 0x07: return "v_cmp_o_f32";
+        case 0x08: return "v_cmp_u_f32";
+        case 0x09: return "v_cmp_nge_f32";
+        case 0x0A: return "v_cmp_nlg_f32";
+        case 0x0B: return "v_cmp_ngt_f32";
+        case 0x0C: return "v_cmp_nle_f32";
+        case 0x0D: return "v_cmp_neq_f32";
+        case 0x0E: return "v_cmp_nlt_f32";
+        case 0x0F: return "v_cmp_t_f32";
+        // Float V_CMPX_*_F32 (GFX10.3: 0x10..0x1F)
+        case 0x10: return "v_cmpx_f_f32";
+        case 0x11: return "v_cmpx_lt_f32";
+        case 0x12: return "v_cmpx_eq_f32";
+        case 0x13: return "v_cmpx_le_f32";
+        case 0x14: return "v_cmpx_gt_f32";
+        case 0x15: return "v_cmpx_lg_f32";
+        case 0x16: return "v_cmpx_ge_f32";
+        case 0x17: return "v_cmpx_o_f32";
+        case 0x18: return "v_cmpx_u_f32";
+        case 0x19: return "v_cmpx_nge_f32";
+        case 0x1A: return "v_cmpx_nlg_f32";
+        case 0x1B: return "v_cmpx_ngt_f32";
+        case 0x1C: return "v_cmpx_nle_f32";
+        case 0x1D: return "v_cmpx_neq_f32";
+        case 0x1E: return "v_cmpx_nlt_f32";
+        case 0x1F: return "v_cmpx_t_f32";
+        // Signed int V_CMP_*_I32 + V_CMP_CLASS_F32
+        case 0x80: return "v_cmp_f_i32";
         case 0x81: return "v_cmp_lt_i32";
         case 0x82: return "v_cmp_eq_i32";
         case 0x83: return "v_cmp_le_i32";
         case 0x84: return "v_cmp_gt_i32";
         case 0x85: return "v_cmp_ne_i32";
         case 0x86: return "v_cmp_ge_i32";
+        case 0x87: return "v_cmp_t_i32";
+        case 0x88: return "v_cmp_class_f32";
+        // Signed int V_CMPX_*_I32 + V_CMPX_CLASS_F32
+        case 0x90: return "v_cmpx_f_i32";
+        case 0x91: return "v_cmpx_lt_i32";
+        case 0x92: return "v_cmpx_eq_i32";
+        case 0x93: return "v_cmpx_le_i32";
+        case 0x94: return "v_cmpx_gt_i32";
+        case 0x95: return "v_cmpx_ne_i32";
+        case 0x96: return "v_cmpx_ge_i32";
+        case 0x97: return "v_cmpx_t_i32";
+        case 0x98: return "v_cmpx_class_f32";
+        // Unsigned int V_CMP_*_U32
+        case 0xC0: return "v_cmp_f_u32";
         case 0xC1: return "v_cmp_lt_u32";
         case 0xC2: return "v_cmp_eq_u32";
         case 0xC3: return "v_cmp_le_u32";
         case 0xC4: return "v_cmp_gt_u32";
         case 0xC5: return "v_cmp_ne_u32";
         case 0xC6: return "v_cmp_ge_u32";
+        case 0xC7: return "v_cmp_t_u32";
+        // Unsigned int V_CMPX_*_U32
+        case 0xD0: return "v_cmpx_f_u32";
+        case 0xD1: return "v_cmpx_lt_u32";
+        case 0xD2: return "v_cmpx_eq_u32";
+        case 0xD3: return "v_cmpx_le_u32";
+        case 0xD4: return "v_cmpx_gt_u32";
+        case 0xD5: return "v_cmpx_ne_u32";
+        case 0xD6: return "v_cmpx_ge_u32";
+        case 0xD7: return "v_cmpx_t_u32";
         default: return nullptr;
+    }
+}
+
+bool is_vop3b_opcode(uint32_t op) {
+    switch (op) {
+        case 0x128:  // v_add_co_ci_u32_e64
+        case 0x129:  // v_sub_co_ci_u32_e64
+        case 0x12A:  // v_subrev_co_ci_u32_e64
+        case 0x176:  // v_mad_u64_u32
+        case 0x177:  // v_mad_i64_i32
+        case 0x30F:  // v_add_co_u32
+        case 0x310:  // v_sub_co_u32
+        case 0x319:  // v_subrev_co_u32
+            return true;
+        default:
+            return false;
     }
 }
 
 const char* vop3_name(uint32_t op) {
     switch (op) {
-        case 0x14B: return "v_fma_f32";
+        case 0x143: return "v_mad_u32_u24";
         case 0x147: return "v_bfe_i32";
         case 0x148: return "v_bfe_u32";
         case 0x14A: return "v_bfi_b32";
+        case 0x14B: return "v_fma_f32";
         case 0x151: return "v_med3_f32";
         case 0x169: return "v_mul_lo_u32";
         case 0x16B: return "v_mbcnt_lo_u32_b32";
-        case 0x143: return "v_mad_u32_u24";
+        case 0x176: return "v_mad_u64_u32";
+        case 0x177: return "v_mad_i64_i32";
+        case 0x178: return "v_xor3_b32";
+        case 0x2FF: return "v_lshlrev_b64";
+        case 0x300: return "v_lshrrev_b64";
+        case 0x301: return "v_ashrrev_i64";
+        case 0x30F: return "v_add_co_u32";
+        case 0x310: return "v_sub_co_u32";
+        case 0x319: return "v_subrev_co_u32";
+        case 0x344: return "v_perm_b32";
+        case 0x346: return "v_lshl_add_u32";
         case 0x360: return "v_readlane_b32";
         case 0x361: return "v_writelane_b32";
+        case 0x362: return "v_ldexp_f32";
+        case 0x36D: return "v_add3_u32";
+        case 0x36F: return "v_lshl_or_b32";
         default: break;
     }
+    if (op < 0x100) return vopc_name(op);
     if (op >= 0x100 && op < 0x140) return vop2_name(op - 0x100);
     if (op >= 0x180 && op < 0x200) return vop1_name(op - 0x180);
     return nullptr;
 }
 
-const char* flat_name(uint32_t op) {
-    switch (op) {
-        case 12: return "global_load_dword";
-        case 13: return "global_load_dwordx2";
-        case 14: return "global_load_dwordx4";
-        case 28: return "global_store_dword";
-        case 29: return "global_store_dwordx2";
-        case 30: return "global_store_dwordx4";
-        default: return nullptr;
+const char* flat_name(uint32_t op, uint8_t seg) {
+    if (seg == 2 || seg == 0) {
+        switch (op) {
+            case 12: return "global_load_dword";
+            case 13: return "global_load_dwordx2";
+            case 14: return "global_load_dwordx4";
+            case 28: return "global_store_dword";
+            case 29: return "global_store_dwordx2";
+            case 30: return "global_store_dwordx4";
+            default: return nullptr;
+        }
     }
+    return nullptr;
 }
 
 }  // namespace
@@ -198,6 +299,7 @@ std::string format_rdna2_operand(uint32_t op, bool has_lit, uint32_t lit) {
     if (op == 106) return "vcc_lo";
     if (op == 107) return "vcc_hi";
     if (op == 124) return "m0";
+    if (op == 125) return "null";
     if (op == 126) return "exec_lo";
     if (op == 127) return "exec_hi";
     if (op >= 128 && op <= 192) return std::format("{}", static_cast<int>(op) - 128);
@@ -282,7 +384,16 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.enc = Encoding::VOP3;
             d.opcode = (w0 >> 16) & 0x3FFu;
             d.clamp = ((w0 >> 15) & 1u) != 0;
-            d.abs_mask = static_cast<uint8_t>((w0 >> 8) & 0x7u);
+            d.is_vop3b = is_vop3b_opcode(d.opcode);
+            if (d.is_vop3b) {
+                d.sdst = (w0 >> 8) & 0x7Fu;
+                d.abs_mask = 0;
+            } else {
+                d.abs_mask = static_cast<uint8_t>((w0 >> 8) & 0x7u);
+                if (d.opcode < 0x100u) {
+                    d.sdst = w0 & 0x7Fu;
+                }
+            }
             d.dst = w0 & 0xFFu;
             d.neg_mask = static_cast<uint8_t>((w1 >> 29) & 0x7u);
             d.src2 = (w1 >> 18) & 0x1FFu;
@@ -300,23 +411,30 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.size = 8;
             d.enc = Encoding::FLAT;
             d.opcode = (w0 >> 18) & 0x7Fu;
-            d.offset = w0 & 0x1FFFu;
+            d.flat_seg = static_cast<uint8_t>((w0 >> 14) & 0x3u);
+            d.soffset = static_cast<int32_t>(w0 << 20) >> 20;  // 12-bit signed offset
+            d.offset = static_cast<uint32_t>(d.soffset) & 0xFFFu;
             d.dst = (w1 >> 24) & 0xFFu;
-            d.src2 = (w1 >> 16) & 0x7Fu;  // saddr
+            d.src2 = (w1 >> 16) & 0x7Fu;  // saddr (125 = null/off)
             d.src1 = (w1 >> 8) & 0xFFu;   // data
             d.src0 = w1 & 0xFFu;          // vaddr
-            const char* n = flat_name(d.opcode);
+            const char* n = flat_name(d.opcode, d.flat_seg);
             d.mnemonic = n ? n : std::format("flat_{}", d.opcode);
         } else if ((w0 >> 26) == 0x3Du && i + 1 < count) {
+            const uint32_t w1 = words[i + 1];
             d.size = 8;
             d.enc = Encoding::SMEM;
             d.opcode = (w0 >> 18) & 0xFFu;
             d.dst = (w0 >> 6) & 0x7Fu;
             d.src0 = (w0 & 0x3Fu) << 1;
-            d.offset = words[i + 1] & 0x1FFFFFu;
+            d.src1 = (w1 >> 25) & 0x7Fu;  // soffset (125 = null)
+            d.soffset = static_cast<int32_t>(w1 << 11) >> 11;
+            d.offset = w1 & 0x1FFFFFu;
             if (d.opcode == 0) d.mnemonic = "s_load_dword";
             else if (d.opcode == 1) d.mnemonic = "s_load_dwordx2";
             else if (d.opcode == 2) d.mnemonic = "s_load_dwordx4";
+            else if (d.opcode == 3) d.mnemonic = "s_load_dwordx8";
+            else if (d.opcode == 4) d.mnemonic = "s_load_dwordx16";
             else d.mnemonic = std::format("smem_{}", d.opcode);
         } else if ((w0 >> 26) == 0x38u && i + 1 < count) {
             const uint32_t w1 = words[i + 1];
@@ -325,8 +443,8 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.opcode = (w0 >> 18) & 0x7Fu;
             d.offset = w0 & 0xFFFu;
             d.src0 = w1 & 0xFFu;                  // vaddr
-            d.dst = (w1 >> 8) & 0xFFu;            // vdata (load dst)
-            d.src1 = d.dst;                       // vdata (store src)
+            d.dst = (w1 >> 8) & 0xFFu;            // vdata dst
+            d.src1 = d.dst;                       // vdata src (for stores)
             d.src2 = ((w1 >> 16) & 0x1Fu) << 2;   // srsrc (V# SGPR base)
             d.src3 = (w1 >> 24) & 0xFFu;          // soffset
             switch (d.opcode) {
@@ -345,11 +463,11 @@ std::vector<DecodedInst> decode_rdna2(const uint32_t* words, size_t count) {
             d.mtbuf_format = static_cast<uint8_t>((w0 >> 19) & 0x7Fu);
             d.opcode = (w0 >> 16) & 0x7u;
             d.offset = w0 & 0xFFFu;
-            d.src0 = w1 & 0xFFu;                  // vaddr
-            d.dst = (w1 >> 8) & 0xFFu;            // vdata
+            d.src0 = w1 & 0xFFu;
+            d.dst = (w1 >> 8) & 0xFFu;
             d.src1 = d.dst;
-            d.src2 = ((w1 >> 16) & 0x1Fu) << 2;   // srsrc
-            d.src3 = (w1 >> 24) & 0xFFu;          // soffset
+            d.src2 = ((w1 >> 16) & 0x1Fu) << 2;
+            d.src3 = (w1 >> 24) & 0xFFu;
             switch (d.opcode) {
                 case 0: d.mnemonic = "tbuffer_load_format_x"; break;
                 case 1: d.mnemonic = "tbuffer_load_format_xy"; break;
@@ -468,6 +586,12 @@ std::string disassemble_inst(const DecodedInst& d) {
             return std::format("{} {}, {}", d.mnemonic,
                                format_rdna2_operand(d.src0, d.has_literal, d.literal),
                                format_rdna2_operand(d.src1, d.has_literal, d.literal));
+        case Encoding::SMEM:
+            return std::format("{} {}, s[{}:{}], {}, off:{:#x}", d.mnemonic,
+                               format_rdna2_operand(d.dst, false, 0),
+                               d.src0, d.src0 + 1,
+                               format_rdna2_operand(d.src1, false, 0),
+                               d.soffset);
         case Encoding::VOP1:
             return std::format("{} v{}, {}", d.mnemonic, d.dst, format_rdna2_operand(d.src0, d.has_literal, d.literal));
         case Encoding::VOP2:
@@ -477,12 +601,26 @@ std::string disassemble_inst(const DecodedInst& d) {
             return std::format("{} vcc, {}, v{}", d.mnemonic,
                                format_rdna2_operand(d.src0, d.has_literal, d.literal), d.src1 - 256);
         case Encoding::VOP3:
+            if (d.is_vop3b) {
+                return std::format("{} v{}, {}, {}, {}, {}", d.mnemonic, d.dst,
+                                   format_rdna2_operand(d.sdst, false, 0),
+                                   format_rdna2_operand(d.src0, d.has_literal, d.literal),
+                                   format_rdna2_operand(d.src1, d.has_literal, d.literal),
+                                   format_rdna2_operand(d.src2, d.has_literal, d.literal));
+            }
+            if (d.opcode < 0x100u) {
+                return std::format("{} {}, {}, {}", d.mnemonic,
+                                   format_rdna2_operand(d.sdst, false, 0),
+                                   format_rdna2_operand(d.src0, d.has_literal, d.literal),
+                                   format_rdna2_operand(d.src1, d.has_literal, d.literal));
+            }
             return std::format("{} v{}, {}, {}, {}", d.mnemonic, d.dst,
                                format_rdna2_operand(d.src0, d.has_literal, d.literal),
                                format_rdna2_operand(d.src1, d.has_literal, d.literal),
                                format_rdna2_operand(d.src2, d.has_literal, d.literal));
         case Encoding::FLAT:
-            return std::format("{} v{}, v{}, off:{:#x}", d.mnemonic, d.dst, d.src0, d.offset);
+            return std::format("{} v{}, v{}, {}, off:{}", d.mnemonic, d.dst, d.src0,
+                               format_rdna2_operand(d.src2, false, 0), d.soffset);
         case Encoding::MUBUF:
         case Encoding::MTBUF:
             return std::format("{} v{}, v{}, s[{}:{}], off:{:#x}",

@@ -22,6 +22,7 @@ enum class IrOp : uint8_t {
     SSubBU32,
     SMulI32,
     SAndB32,
+    SAndN2B32,
     SOrB32,
     SXorB32,
     SLshlB32,
@@ -44,6 +45,18 @@ enum class IrOp : uint8_t {
     VAddU32,
     VSubU32,
     VSubRevU32,
+    VAddCoU32,
+    VSubCoU32,
+    VSubRevCoU32,
+    VAddCoCiU32,
+    VSubCoCiU32,
+    VSubRevCoCiU32,
+    VAdd3U32,
+    VLshlAddU32,
+    VLshlOrB32,
+    VXor3B32,
+    VPermB32,
+    VMadU64U32,
     VMulLoU32,
     VMadU32U24,
     VBfeU32,
@@ -54,6 +67,9 @@ enum class IrOp : uint8_t {
     VLshlRevB32,
     VLshrRevB32,
     VAshrRevI32,
+    VLshlRevB64,
+    VLshrRevB64,
+    VAshrRevI64,
     VCvtF32I32,
     VCvtF32U32,
     VCvtI32F32,
@@ -63,10 +79,18 @@ enum class IrOp : uint8_t {
     VSqrtF32,
     VFloorF32,
     VCeilF32,
+    VTruncF32,
+    VRndneF32,
     VFractF32,
+    VFrexpExpI32F32,
+    VFrexpMantF32,
+    VLdexpF32,
+    VSinF32,
+    VCosF32,
     VMed3F32,
     VBfeI32,
     VCmp,
+    VCmpClassF32,
     VCndMask,
     // Wave / subgroup intrinsics (RDNA2 Wave32/Wave64 -> SM 6.6 Wave*)
     VReadFirstLaneB32,
@@ -74,6 +98,7 @@ enum class IrOp : uint8_t {
     VWriteLaneB32,
     VMbcntLoU32B32,
     SAndSaveExec,
+    SAndN2SaveExec,
     // Memory, Buffer, Texture, LDS & Graphics Export
     SLoadDword,
     GlobalLoadDword,
@@ -120,6 +145,7 @@ struct IrOperand {
         Vcc,
         Exec,
         M0,
+        Null,
     };
     Kind kind = Kind::None;
     uint32_t reg = 0;
@@ -140,11 +166,13 @@ struct IrInst {
     IrOp op = IrOp::Nop;
     std::string subop;  // comparison predicate or raw mnemonic
     IrOperand dst;
+    IrOperand sdst;   // Scalar destination for VOP3B / VOPC
     IrOperand src0;
     IrOperand src1;
     IrOperand src2;
     IrOperand src3;
     uint32_t offset = 0;
+    int32_t soffset = 0;
     uint32_t rsrc_slot = 0;  // Index into tex_bindings or buf_srv_bindings
     uint32_t samp_slot = 0;  // Index into samp_bindings
     uint8_t exp_target = 0;
@@ -178,6 +206,8 @@ struct IrFunction {
     bool uses_buf_srv = false;
     bool uses_tex = false;
     bool uses_wave_ops = false;
+    bool uses_exec_mask = false;
+    bool reads_vcc_mask = false;
     bool uses_ray_tracing = false;
     uint32_t mrt_mask = 0;
     uint32_t max_mesh_verts = 0;

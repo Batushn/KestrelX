@@ -39,7 +39,9 @@ struct DecodedInst {
     uint32_t src1 = 0;
     uint32_t src2 = 0;
     uint32_t src3 = 0;
+    uint32_t sdst = 0;         // VOP3B / VOP3-VOPC scalar destination (7-bit)
     int32_t simm16 = 0;
+    int32_t soffset = 0;       // Signed byte offset (FLAT/GLOBAL/SMEM)
     bool has_literal = false;
     uint32_t literal = 0;
     uint32_t offset = 0;
@@ -49,6 +51,8 @@ struct DecodedInst {
     uint8_t dmask = 0xFu;      // MIMG channel write mask (RGBA)
     uint8_t img_dim = 1;       // MIMG dimension (0=1D, 1=2D, 2=3D, 3=Cube)
     uint8_t mtbuf_format = 0;  // MTBUF data/number format
+    uint8_t flat_seg = 0;      // FLAT segment: 0=flat, 1=scratch, 2=global
+    bool is_vop3b = false;     // VOP3B uses w0[14:8] as sdst instead of abs modifiers
     bool exp_done = false;
     bool clamp = false;
     bool tfe = false;
@@ -80,7 +84,7 @@ constexpr uint32_t sopp(uint32_t op, int16_t simm16 = 0) {
     return (0x17Fu << 23) | ((op & 0x7Fu) << 16) | static_cast<uint16_t>(simm16);
 }
 constexpr uint32_t s_sendmsg(uint16_t msg_id) {
-    return sopp(3, static_cast<int16_t>(msg_id));
+    return sopp(16, static_cast<int16_t>(msg_id));
 }
 constexpr uint32_t sop1(uint32_t op, uint32_t sdst, uint32_t ssrc0) {
     return (0x17Du << 23) | ((sdst & 0x7Fu) << 16) | ((op & 0xFFu) << 8) | (ssrc0 & 0xFFu);

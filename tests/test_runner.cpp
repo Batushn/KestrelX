@@ -1,5 +1,6 @@
 #include "kestrel/common/types.hpp"
 #include "kestrel/cpu/veh_shim.hpp"
+#include "kestrel/gpu/amdgpu_elf.hpp"
 #include "kestrel/gpu/dxc_compiler.hpp"
 #include "kestrel/gpu/gfx10_tiling.hpp"
 #include "kestrel/gpu/gpu_runner.hpp"
@@ -1788,25 +1789,25 @@ void test_rdna2_depth_buffered_3d_cube_dual_gpu() {
     smem(vs_words, 2, 16, 0, 48);                           // s_load_dwordx4 s[16:19], s0, 48
 
     // Row 0 dot pos -> clip.x in v10
-    vs_words.push_back(vop2(7, 10, 4, 2));                  // v10 = s4 * v2
+    vs_words.push_back(vop2(8, 10, 4, 2));                  // v10 = s4 * v2
     vop3(vs_words, 0x14B, 10, 5, 256 + 3, 256 + 10);       // v10 = mad(s5, v3, v10)
     vop3(vs_words, 0x14B, 10, 6, 256 + 4, 256 + 10);       // v10 = mad(s6, v4, v10)
     vs_words.push_back(vop2(3, 10, 7, 10));                 // v10 = s7 + v10
 
     // Row 1 dot pos -> clip.y in v11
-    vs_words.push_back(vop2(7, 11, 8, 2));                  // v11 = s8 * v2
+    vs_words.push_back(vop2(8, 11, 8, 2));                  // v11 = s8 * v2
     vop3(vs_words, 0x14B, 11, 9, 256 + 3, 256 + 11);       // v11 = mad(s9, v3, v11)
     vop3(vs_words, 0x14B, 11, 10, 256 + 4, 256 + 11);      // v11 = mad(s10, v4, v11)
     vs_words.push_back(vop2(3, 11, 11, 11));                // v11 = s11 + v11
 
     // Row 2 dot pos -> clip.z in v12
-    vs_words.push_back(vop2(7, 12, 12, 2));                 // v12 = s12 * v2
+    vs_words.push_back(vop2(8, 12, 12, 2));                 // v12 = s12 * v2
     vop3(vs_words, 0x14B, 12, 13, 256 + 3, 256 + 12);      // v12 = mad(s13, v3, v12)
     vop3(vs_words, 0x14B, 12, 14, 256 + 4, 256 + 12);      // v12 = mad(s14, v4, v12)
     vs_words.push_back(vop2(3, 12, 15, 12));                // v12 = s15 + v12
 
     // Row 3 dot pos -> clip.w in v13
-    vs_words.push_back(vop2(7, 13, 16, 2));                 // v13 = s16 * v2
+    vs_words.push_back(vop2(8, 13, 16, 2));                 // v13 = s16 * v2
     vop3(vs_words, 0x14B, 13, 17, 256 + 3, 256 + 13);      // v13 = mad(s17, v3, v13)
     vop3(vs_words, 0x14B, 13, 18, 256 + 4, 256 + 13);      // v13 = mad(s18, v4, v13)
     vs_words.push_back(vop2(3, 13, 19, 13));                // v13 = s19 + v13
@@ -1819,9 +1820,9 @@ void test_rdna2_depth_buffered_3d_cube_dual_gpu() {
     // Build RDNA2 Pixel Shader with directional shade modulation
     std::vector<uint32_t> ps_words;
     mimg(ps_words, 0x20, 4, 0, 0, 0, 0xFu, 1);              // image_sample v[4:7], v[0:1], s[0:7], s[0:3]
-    ps_words.push_back(vop2(7, 4, 256 + 2, 4));             // v4 = shade * v4 (R)
-    ps_words.push_back(vop2(7, 5, 256 + 2, 5));             // v5 = shade * v5 (G)
-    ps_words.push_back(vop2(7, 6, 256 + 2, 6));             // v6 = shade * v6 (B)
+    ps_words.push_back(vop2(8, 4, 256 + 2, 4));             // v4 = shade * v4 (R)
+    ps_words.push_back(vop2(8, 5, 256 + 2, 5));             // v5 = shade * v5 (G)
+    ps_words.push_back(vop2(8, 6, 256 + 2, 6));             // v6 = shade * v6 (B)
     exp(ps_words, 0, 0xFu, 4, 5, 6, 7, true);               // exp mrt0 done
     ps_words.push_back(sopp(1));                            // s_endpgm
 
@@ -4584,12 +4585,12 @@ void test_rdna2_vcmp_scmp_and_lifted_opcodes_emission() {
         const char* expected_hlsl;
     };
     const VopcCase vopc_cases[] = {
-        {0x11, "v_cmp_lt_f32", "vcc = (asfloat(v[1]) < asfloat(v[2]));"},
-        {0x12, "v_cmp_eq_f32", "vcc = (asfloat(v[1]) == asfloat(v[2]));"},
-        {0x13, "v_cmp_le_f32", "vcc = (asfloat(v[1]) <= asfloat(v[2]));"},
-        {0x14, "v_cmp_gt_f32", "vcc = (asfloat(v[1]) > asfloat(v[2]));"},
-        {0x15, "v_cmp_lg_f32", "vcc = (asfloat(v[1]) != asfloat(v[2]));"},
-        {0x16, "v_cmp_ge_f32", "vcc = (asfloat(v[1]) >= asfloat(v[2]));"},
+        {0x01, "v_cmp_lt_f32", "vcc = (asfloat(v[1]) < asfloat(v[2]));"},
+        {0x02, "v_cmp_eq_f32", "vcc = (asfloat(v[1]) == asfloat(v[2]));"},
+        {0x03, "v_cmp_le_f32", "vcc = (asfloat(v[1]) <= asfloat(v[2]));"},
+        {0x04, "v_cmp_gt_f32", "vcc = (asfloat(v[1]) > asfloat(v[2]));"},
+        {0x05, "v_cmp_lg_f32", "vcc = (asfloat(v[1]) != asfloat(v[2]));"},
+        {0x06, "v_cmp_ge_f32", "vcc = (asfloat(v[1]) >= asfloat(v[2]));"},
         {0x81, "v_cmp_lt_i32", "vcc = (asint(v[1]) < asint(v[2]));"},
         {0x82, "v_cmp_eq_i32", "vcc = (asint(v[1]) == asint(v[2]));"},
         {0x83, "v_cmp_le_i32", "vcc = (asint(v[1]) <= asint(v[2]));"},
@@ -6158,11 +6159,11 @@ void test_rdna2_ir_opt_dual_gpu_parity() {
     mov_v_lit(10, 0x40400000u);                // v10 = 3.0f
     mov_v_lit(11, 0x3F800000u);                // v11 = 1.0f
     prog.push_back(vop2(3, 12, 256 + 10, 11)); // v12 = v10 + v11 (folds to 4.0f)
-    prog.push_back(vop2(7, 13, 256 + 10, 11)); // dead v13 = v10 * v11 (unused)
+    prog.push_back(vop2(8, 13, 256 + 10, 11)); // dead v13 = v10 * v11 (unused)
     prog.push_back(sopc(6, 0, 128));           // dead s_cmp_eq_u32 s0, 0 (overwritten below)
 
     // Live v_cmp_lt_f32 + v_cndmask_b32: v14 = (v9 < 0.0f) ? 2.0f : v12
-    prog.push_back(vopc(0x11, 256 + 9, 128));  // v_cmp_lt_f32 vcc, v9, 0
+    prog.push_back(vopc(0x01, 256 + 9, 128));  // v_cmp_lt_f32 vcc, v9, 0
     prog.push_back(vop1(1, 15, 244));          // v15 = 2.0f
     prog.push_back(vop2(1, 14, 256 + 12, 15)); // v_cndmask_b32 v14, v12, v15
 
@@ -8228,6 +8229,476 @@ void test_pe_probe_import_and_agility_audit() {
                              rep->total_imports);
 }
 
+void test_gfx1030_isa_spec_decoder_audit() {
+    using namespace gpu;
+    // Audit genuine AMD GFX10.3 (RDNA2) binary machine-code encodings (verified against RGA gfx1030 output)
+    // plus strict refusal on unknown opcodes / unsupported segments.
+    struct SpecVecCase {
+        std::vector<uint32_t> words;
+        Encoding enc;
+        const char* mnemonic;
+        uint32_t expected_size;
+        bool expected_vop3b;
+        uint32_t expected_sdst;
+    };
+
+    const std::vector<SpecVecCase> cases = {
+        // SOPP: s_nop, s_endpgm, s_wakeup(3), s_sendmsg(16), s_barrier(10), s_waitcnt(12), s_clause(33)
+        {{0xBF800000u}, Encoding::SOPP, "s_nop", 4, false, 0},
+        {{0xBF810000u}, Encoding::SOPP, "s_endpgm", 4, false, 0},
+        {{0xBF830000u}, Encoding::SOPP, "s_wakeup", 4, false, 0},
+        {{0xBF900002u}, Encoding::SOPP, "s_sendmsg", 4, false, 0},
+        {{0xBF8A0000u}, Encoding::SOPP, "s_barrier", 4, false, 0},
+        {{0xBF8CC07Fu}, Encoding::SOPP, "s_waitcnt", 4, false, 0},
+        {{0xBFA10002u}, Encoding::SOPP, "s_clause", 4, false, 0},
+        // SOP1: s_mov_b32, s_and_saveexec_b32(60), s_andn2_saveexec_b32(63)
+        {{0xBEA10380u}, Encoding::SOP1, "s_mov_b32", 4, false, 0},
+        {{0xBE803C00u}, Encoding::SOP1, "s_and_saveexec_b32", 4, false, 0},
+        {{0xBE863F06u}, Encoding::SOP1, "s_andn2_saveexec_b32", 4, false, 0},
+        {{0xBE8003FFu, 0x12345678u}, Encoding::SOP1, "s_mov_b32", 8, false, 0},
+        // SOP2: s_cselect_b32(10), s_andn2_b32(20), s_mul_i32(38)
+        {{0x850680C1u}, Encoding::SOP2, "s_cselect_b32", 4, false, 0},
+        {{0x8A7E057Eu}, Encoding::SOP2, "s_andn2_b32", 4, false, 0},
+        {{0x93060706u}, Encoding::SOP2, "s_mul_i32", 4, false, 0},
+        // VOP1: v_rcp_f32(42), v_rsq_f32(46), v_sqrt_f32(51), v_frexp_exp_i32_f32(63), v_frexp_mant_f32(64)
+        {{0x7E0A5505u}, Encoding::VOP1, "v_rcp_f32", 4, false, 0},
+        {{0x7E045D02u}, Encoding::VOP1, "v_rsq_f32", 4, false, 0},
+        {{0x7E086703u}, Encoding::VOP1, "v_sqrt_f32", 4, false, 0},
+        {{0x7E0E7F02u}, Encoding::VOP1, "v_frexp_exp_i32_f32", 4, false, 0},
+        {{0x7E0A8102u}, Encoding::VOP1, "v_frexp_mant_f32", 4, false, 0},
+        // VOP2: v_cndmask_b32(1), v_mul_f32(8), v_sub_nc_u32(38), v_fmaak_f32(45)
+        {{0x02060702u}, Encoding::VOP2, "v_cndmask_b32", 4, false, 0},
+        {{0x10080905u}, Encoding::VOP2, "v_mul_f32", 4, false, 0},
+        {{0x4C040702u}, Encoding::VOP2, "v_sub_nc_u32", 4, false, 0},
+        {{0x5A0404F5u, 0x40400000u}, Encoding::VOP2, "v_fmaak_f32", 8, false, 0},
+        // VOPC: v_cmp_gt_f32(0x04), v_cmp_gt_i32(0x84), v_cmp_lt_u32(0xC1), v_cmpx_eq_u32(0xD2)
+        {{0x7C0804FFu, 0x0F800000u}, Encoding::VOPC, "v_cmp_gt_f32", 8, false, 0},
+        {{0x7D080400u}, Encoding::VOPC, "v_cmp_gt_i32", 4, false, 0},
+        {{0x7D820481u}, Encoding::VOPC, "v_cmp_lt_u32", 4, false, 0},
+        {{0x7DA40681u}, Encoding::VOPC, "v_cmpx_eq_u32", 4, false, 0},
+        // VOP3-VOPC + VOP3A + VOP3B
+        {{0xD4060000u, 0x02020E80u}, Encoding::VOP3, "v_cmp_ge_f32", 8, false, 0},
+        {{0xD4010000u, 0x02021080u}, Encoding::VOP3, "v_cmp_lt_f32", 8, false, 0},
+        {{0xD488006Au, 0x0201FF03u, 0x00000260u}, Encoding::VOP3, "v_cmp_class_f32", 12, false, 106},
+        {{0xD5030102u, 0x0201E502u}, Encoding::VOP3, "v_add_f32", 8, false, 0},
+        {{0xD54B0007u, 0x240E0905u}, Encoding::VOP3, "v_fma_f32", 8, false, 0},
+        {{0xD70F6A02u, 0x02020000u}, Encoding::VOP3, "v_add_co_u32", 8, true, 106},
+        {{0xD5287D03u, 0x01AA0201u}, Encoding::VOP3, "v_add_co_ci_u32", 8, true, 125},
+        {{0xD5767D02u, 0x02050702u}, Encoding::VOP3, "v_mad_u64_u32", 8, true, 125},
+        {{0xD6FF0000u, 0x02020082u}, Encoding::VOP3, "v_lshlrev_b64", 8, false, 0},
+        {{0xD7440002u, 0x03FE0502u, 0x0C050C00u}, Encoding::VOP3, "v_perm_b32", 12, false, 0},
+        {{0xD7628002u, 0x02020504u}, Encoding::VOP3, "v_ldexp_f32", 8, false, 0},
+        {{0xD76D0000u, 0x04001006u}, Encoding::VOP3, "v_add3_u32", 8, false, 0},
+        {{0xD76F0002u, 0x04090902u}, Encoding::VOP3, "v_lshl_or_b32", 8, false, 0},
+        // SMEM: s_load_dword .. s_load_dwordx16
+        {{0xF40001C2u, 0xFA000024u}, Encoding::SMEM, "s_load_dword", 8, false, 0},
+        {{0xF4080002u, 0xFA000000u}, Encoding::SMEM, "s_load_dwordx4", 8, false, 0},
+        {{0xF4100000u, 0xFA000000u}, Encoding::SMEM, "s_load_dwordx16", 8, false, 0},
+        // FLAT/GLOBAL: global_load_dword / global_store_dword / global_load_dwordx4
+        {{0xDC308000u, 0x027D0002u}, Encoding::FLAT, "global_load_dword", 8, false, 0},
+        {{0xDC708000u, 0x007D0200u}, Encoding::FLAT, "global_store_dword", 8, false, 0},
+        {{0xDC388000u, 0x007D0000u}, Encoding::FLAT, "global_load_dwordx4", 8, false, 0},
+        // DS: ds_write_b32(13), ds_read_b32(54)
+        {{0xD8340000u, 0x00000305u}, Encoding::DS, "ds_write_b32", 8, false, 0},
+        {{0xD8D8007Cu, 0x03000004u}, Encoding::DS, "ds_read_b32", 8, false, 0},
+    };
+
+    for (const auto& tc : cases) {
+        auto dec = decode_rdna2(tc.words.data(), tc.words.size());
+        KX_CHECK(dec.size() == 1, std::format("Expected 1 decoded inst for {}", tc.mnemonic));
+        KX_CHECK(dec[0].enc == tc.enc, std::format("Encoding mismatch for {}", tc.mnemonic));
+        KX_CHECK(dec[0].mnemonic == tc.mnemonic,
+                 std::format("Mnemonic mismatch: got '{}' expected '{}'", dec[0].mnemonic, tc.mnemonic));
+        KX_CHECK(dec[0].size == tc.expected_size,
+                 std::format("Size mismatch for {}: got {} expected {}", tc.mnemonic, dec[0].size, tc.expected_size));
+        KX_CHECK(dec[0].is_vop3b == tc.expected_vop3b,
+                 std::format("is_vop3b mismatch for {}", tc.mnemonic));
+        if (tc.expected_sdst != 0) {
+            KX_CHECK(dec[0].sdst == tc.expected_sdst,
+                     std::format("sdst mismatch for {}: got {} expected {}", tc.mnemonic, dec[0].sdst, tc.expected_sdst));
+        }
+    }
+
+    // Verify signed branch offset & VOP3 abs/neg/clamp extraction
+    {
+        const uint32_t branch_prog[] = {
+            0xBF800000u,  // pc=0: s_nop
+            0xBF82FFFEu,  // pc=4: s_branch -2 -> target = 4 + 4 + (-2)*4 = 0
+            0xBF810000u,  // pc=8: s_endpgm
+        };
+        auto dec = decode_rdna2(branch_prog, std::size(branch_prog));
+        KX_CHECK(dec.size() == 3 && dec[1].is_branch && dec[1].branch_target == 0u,
+                 "Negative relative s_branch target calculation");
+
+        const uint32_t mod_words[] = {0xD5030102u, 0x0201E502u, 0xD54B0007u, 0x240E0905u, 0xD7628002u, 0x02020504u};
+        auto mod_dec = decode_rdna2(mod_words, std::size(mod_words));
+        KX_CHECK(mod_dec[0].abs_mask == 1u && mod_dec[0].neg_mask == 0u, "VOP3 abs_mask bit 0");
+        KX_CHECK(mod_dec[1].neg_mask == 1u, "VOP3 neg_mask bit 0");
+        KX_CHECK(mod_dec[2].clamp, "VOP3 clamp bit");
+    }
+
+    // Strict refusal audit: unknown opcodes and unsupported FLAT/SCRATCH segment must NEVER silently pass
+    const std::vector<std::vector<uint32_t>> invalid_progs = {
+        {encode::sopp(127), encode::sopp(1)},                              // unknown SOPP
+        {encode::sop2(120, 0, 1, 2), encode::sopp(1)},                     // unknown SOP2
+        {encode::vop1(254, 0, 1), encode::sopp(1)},                        // unknown VOP1
+        {encode::vop2(61, 0, 256, 1), encode::sopp(1)},                    // unknown VOP2
+        {encode::vopc(0xFF, 256, 1), encode::sopp(1)},                     // unknown VOPC
+        {0xD7FF0000u, 0x00000000u, encode::sopp(1)},                       // unknown VOP3
+        {0xF7FC0000u, 0xFA000000u, encode::sopp(1)},                       // unknown SMEM (255)
+        {0xDC304000u, 0x027D0002u, encode::sopp(1)},                       // SCRATCH seg=1 (unsupported)
+    };
+    DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    for (size_t idx = 0; idx < invalid_progs.size(); ++idx) {
+        auto dec = decode_rdna2(invalid_progs[idx].data(), invalid_progs[idx].size());
+        auto ir = lift_rdna2_to_ir(dec);
+        KX_CHECK(ir.unknown_count >= 1,
+                 std::format("Invalid prog {} must report unknown_count >= 1", idx));
+        auto hlsl = emit_hlsl_from_ir(ir, {.wave_mode = WaveMode::Wave32, .enable_ir_opt = false});
+        KX_CHECK(hlsl.hlsl.find("#error") != std::string::npos,
+                 std::format("Invalid prog {} must emit #error in HLSL", idx));
+        KX_CHECK(!dxc.compile_hlsl(hlsl.hlsl, "main", "cs_6_6").has_value(),
+                 std::format("Invalid prog {} must fail DXC compilation", idx));
+    }
+}
+
+void test_external_amd_rga_gfx1030_dual_gpu() {
+    using namespace gpu;
+    namespace fs = std::filesystem;
+
+    fs::path kernel_dir = fs::path(KESTREL_SOURCE_DIR) / "tests" / "amd_kernels";
+    KX_CHECK(fs::exists(kernel_dir), "tests/amd_kernels directory exists");
+
+    DxcCompiler dxc;
+    KX_CHECK(dxc.initialize().has_value(), "DXC init");
+    auto adapters = enumerate_d3d12_adapters();
+    KX_CHECK(adapters.has_value() && !adapters->empty(), "D3D12 adapters available");
+
+    constexpr uint32_t kWorkgroups = 2;
+    constexpr uint32_t kGroupSize = 32;
+    constexpr uint32_t kCount = kWorkgroups * kGroupSize;  // 64 threads
+
+    constexpr uint32_t kOffKernarg = 0u;
+    constexpr uint32_t kOffA = 256u;
+    constexpr uint32_t kOffB = 1280u;
+    constexpr uint32_t kOffOut = 2304u;
+    constexpr uint32_t kTotalDwords = (kOffOut + 1024u) / 4u;
+
+    auto f2u = [](float v) {
+        uint32_t u = 0;
+        std::memcpy(&u, &v, 4);
+        return u;
+    };
+    auto u2f = [](uint32_t u) {
+        float f = 0.0f;
+        std::memcpy(&f, &u, 4);
+        return f;
+    };
+
+    struct ExternalKernelSpec {
+        const char* elf_name;
+        const char* kernel_name;
+        std::function<void(const AmdgpuKernelInfo&, std::vector<uint32_t>& mem, std::vector<uint32_t>& exp, float& tol)> setup;
+    };
+
+    const std::vector<ExternalKernelSpec> specs = {
+        {"gfx1030_k01_vec_add.elf", "k01_vec_add", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 0.0f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 3>{kOffA, kOffB, kOffOut}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                uint32_t a = 0x1000u + i * 7u;
+                uint32_t b = 0xCAFE0000u ^ (i * 0x1111u);
+                mem[kOffA / 4u + i] = a;
+                mem[kOffB / 4u + i] = b;
+                exp[i] = a + b;
+            }
+        }},
+        {"gfx1030_k02_saxpy.elf", "k02_saxpy", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 1e-6f;
+            const float alpha = 2.75f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 4>{kOffA, kOffB, kOffOut, f2u(alpha)}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                float x = (static_cast<float>(static_cast<int32_t>(i) - 32)) * 0.25f;
+                float y = static_cast<float>(i) * 1.125f - 10.0f;
+                mem[kOffA / 4u + i] = f2u(x);
+                mem[kOffB / 4u + i] = f2u(y);
+                exp[i] = f2u(std::fma(alpha, x, y));
+            }
+        }},
+        {"gfx1030_k03_hash_u32.elf", "k03_hash_u32", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 0.0f;
+            const uint32_t seed = 0x9E3779B9u;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 3>{kOffA, kOffOut, seed}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                uint32_t v = i * 0x01010101u + 0x13572468u;
+                mem[kOffA / 4u + i] = v;
+                uint32_t x = v ^ seed;
+                x = (x ^ 61u) ^ (x >> 16);
+                x = x + (x << 3);
+                x = x ^ (x >> 4);
+                x = x * 0x27d4eb2du;
+                x = x ^ (x >> 15);
+                exp[i] = x;
+            }
+        }},
+        {"gfx1030_k04_dot4_f32.elf", "k04_dot4_f32", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 1e-5f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 3>{kOffA, kOffB, kOffOut}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                float a0 = static_cast<float>(i) * 0.125f - 2.0f;
+                float a1 = static_cast<float>((i * 3) % 19) * 0.25f;
+                float a2 = -static_cast<float>(i % 11) * 0.5f;
+                float a3 = 1.5f;
+                float b0 = 2.0f;
+                float b1 = static_cast<float>((i + 5) % 13) * 0.5f;
+                float b2 = -0.75f;
+                float b3 = static_cast<float>(i) * 0.0625f;
+                mem[kOffA / 4u + i * 4u + 0] = f2u(a0);
+                mem[kOffA / 4u + i * 4u + 1] = f2u(a1);
+                mem[kOffA / 4u + i * 4u + 2] = f2u(a2);
+                mem[kOffA / 4u + i * 4u + 3] = f2u(a3);
+                mem[kOffB / 4u + i * 4u + 0] = f2u(b0);
+                mem[kOffB / 4u + i * 4u + 1] = f2u(b1);
+                mem[kOffB / 4u + i * 4u + 2] = f2u(b2);
+                mem[kOffB / 4u + i * 4u + 3] = f2u(b3);
+                exp[i] = f2u(a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3);
+            }
+        }},
+        {"gfx1030_k05_clamp_smooth.elf", "k05_clamp_smooth", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 1e-5f;
+            const float lo = -1.5f;
+            const float hi = 2.0f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 4>{kOffA, kOffOut, f2u(lo), f2u(hi)}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                float x = -3.0f + static_cast<float>(i) * 0.1f;
+                mem[kOffA / 4u + i] = f2u(x);
+                float t = std::clamp((x - lo) / (hi - lo), 0.0f, 1.0f);
+                exp[i] = f2u(t * t * (3.0f - 2.0f * t));
+            }
+        }},
+        {"gfx1030_k06_select_i32.elf", "k06_select_i32", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 0.0f;
+            const int32_t thresh = -4;
+            auto blob = build_amdhsa_kernarg_blob(
+                k, std::array<uint64_t, 4>{kOffA, kOffB, kOffOut, static_cast<uint32_t>(thresh)}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                int32_t va = static_cast<int32_t>(i) - 30;
+                int32_t vb = 20 - static_cast<int32_t>(i) * 2;
+                mem[kOffA / 4u + i] = static_cast<uint32_t>(va);
+                mem[kOffB / 4u + i] = static_cast<uint32_t>(vb);
+                int32_t m = (va > vb) ? va : vb;
+                int32_t r = (m >= thresh) ? (m - thresh) : (-m);
+                exp[i] = static_cast<uint32_t>(r);
+            }
+        }},
+        {"gfx1030_k07_loop_collatz.elf", "k07_loop_collatz", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 0.0f;
+            const uint32_t max_steps = 40u;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 3>{kOffA, kOffOut, max_steps}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                uint32_t n = i + 1u;
+                mem[kOffA / 4u + i] = n;
+                uint32_t steps = 0u;
+                for (uint32_t s = 0u; s < max_steps; ++s) {
+                    if (n <= 1u) break;
+                    n = (n & 1u) ? (3u * n + 1u) : (n >> 1);
+                    ++steps;
+                }
+                exp[i] = steps ^ (n << 16);
+            }
+        }},
+        {"gfx1030_k08_bitfield.elf", "k08_bitfield", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 0.0f;
+            const uint32_t shift = 7u;
+            const uint32_t mask = 0x0FF3u;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 4>{kOffA, kOffOut, shift, mask}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                uint32_t v = (0xA5001234u ^ (i * 0x0103070Du));
+                mem[kOffA / 4u + i] = v;
+                uint32_t lo = (v >> shift) & mask;
+                uint32_t hi = ((v & mask) << (32u - shift)) | (v >> shift);
+                exp[i] = (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16);
+            }
+        }},
+        {"gfx1030_k09_math_f32.elf", "k09_math_f32", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 1e-4f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 2>{kOffA, kOffOut}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                float inp = static_cast<float>(static_cast<int32_t>(i) - 24) * 0.75f;
+                mem[kOffA / 4u + i] = f2u(inp);
+                float x = std::fabs(inp) + 1.0f;
+                float res = std::floor(std::sqrt(x)) + (1.0f / x) + (1.0f / std::sqrt(x));
+                exp[i] = f2u(res);
+            }
+        }},
+        {"gfx1030_k10_lds_reverse.elf", "k10_lds_reverse", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 0.0f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 2>{kOffA, kOffOut}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                mem[kOffA / 4u + i] = 0x2000u + i * 13u;
+            }
+            for (uint32_t wg = 0; wg < kWorkgroups; ++wg) {
+                for (uint32_t lid = 0; lid < kGroupSize; ++lid) {
+                    uint32_t partner_gid = wg * kGroupSize + (31u - lid);
+                    uint32_t tile_val = mem[kOffA / 4u + partner_gid] ^ ((31u - lid) * 0x9E3779B9u);
+                    exp[wg * kGroupSize + lid] = tile_val + lid;
+                }
+            }
+        }},
+        {"gfx1030_k11_mat4_mul.elf", "k11_mat4_mul", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 1e-5f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 3>{kOffA, kOffB, kOffOut}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            const float mat[16] = {
+                1.0f, 0.5f, -0.25f, 2.0f,
+                -0.5f, 1.5f, 0.75f, -1.0f,
+                0.25f, -0.75f, 2.0f, 0.5f,
+                0.0f, 0.25f, -0.5f, 1.25f
+            };
+            for (uint32_t j = 0; j < 16u; ++j) mem[kOffA / 4u + j] = f2u(mat[j]);
+            exp.resize(kCount * 4u);
+            for (uint32_t i = 0; i < kCount; ++i) {
+                float v[4] = {
+                    static_cast<float>(i) * 0.25f - 4.0f,
+                    static_cast<float>((i * 5) % 17) * 0.5f,
+                    -1.25f + static_cast<float>(i % 7) * 0.5f,
+                    1.0f
+                };
+                for (uint32_t c = 0; c < 4u; ++c) mem[kOffB / 4u + i * 4u + c] = f2u(v[c]);
+                for (uint32_t r = 0; r < 4u; ++r) {
+                    float acc = mat[r * 4 + 0] * v[0] + mat[r * 4 + 1] * v[1] + mat[r * 4 + 2] * v[2] + mat[r * 4 + 3] * v[3];
+                    exp[i * 4u + r] = f2u(acc);
+                }
+            }
+        }},
+        {"gfx1030_k12_morton_2d.elf", "k12_morton_2d", [&](const AmdgpuKernelInfo& k, auto& mem, auto& exp, float& tol) {
+            tol = 0.0f;
+            auto blob = build_amdhsa_kernarg_blob(k, std::array<uint64_t, 3>{kOffA, kOffB, kOffOut}, kWorkgroups, kGroupSize);
+            std::memcpy(mem.data(), blob.data(), blob.size());
+            exp.resize(kCount);
+            auto part1by1 = [](uint32_t x) {
+                x &= 0xFFFFu;
+                x = (x | (x << 8)) & 0x00FF00FFu;
+                x = (x | (x << 4)) & 0x0F0F0F0Fu;
+                x = (x | (x << 2)) & 0x33333333u;
+                x = (x | (x << 1)) & 0x55555555u;
+                return x;
+            };
+            for (uint32_t i = 0; i < kCount; ++i) {
+                uint32_t x = (i * 257u + 19u) & 0xFFFFu;
+                uint32_t y = (i * 1031u + 7u) & 0xFFFFu;
+                mem[kOffA / 4u + i] = x;
+                mem[kOffB / 4u + i] = y;
+                exp[i] = part1by1(x) | (part1by1(y) << 1);
+            }
+        }},
+    };
+
+    uint32_t hw_adapters = 0;
+    for (const auto& a : *adapters) {
+        if (!a.is_software) ++hw_adapters;
+    }
+    KX_CHECK(hw_adapters >= 1, "At least 1 hardware GPU adapter required");
+
+    uint32_t total_dispatches = 0;
+    uint32_t bit_exact_kernels = 0;
+
+    for (const auto& spec : specs) {
+        const fs::path elf_path = kernel_dir / spec.elf_name;
+        auto elf = load_amdgpu_elf_file(elf_path);
+        KX_CHECK(elf.has_value(), std::format("Loaded ELF64-AMDGPU {}", spec.elf_name));
+        KX_CHECK(elf->target.find("gfx1030") != std::string::npos,
+                 std::format("ELF target contains gfx1030 for {}", spec.elf_name));
+        KX_CHECK(!elf->kernels.empty(), std::format("Kernel metadata present in {}", spec.elf_name));
+
+        const AmdgpuKernelInfo& k = elf->kernels[0];
+        KX_CHECK(k.name == spec.kernel_name, std::format("Kernel name match: {}", spec.kernel_name));
+        KX_CHECK(k.wavefront_size == 32u, std::format("Wave32 mode in {}", spec.elf_name));
+
+        auto dec = decode_rdna2(k.code_words.data(), k.code_words.size());
+        auto ir = lift_rdna2_to_ir(dec);
+        KX_CHECK(ir.unknown_count == 0u,
+                 std::format("{}: expected 0 unknown instructions, got {}", spec.elf_name, ir.unknown_count));
+
+        RecompOptions opt{};
+        opt.stage = ShaderStage::Compute;
+        opt.wave_mode = WaveMode::Wave32;
+        opt.group_size_x = kGroupSize;
+        opt.use_amdhsa_abi = true;
+        opt.amdhsa_kernarg_sgpr = k.kernarg_sgpr;
+        opt.amdhsa_wg_id_x_sgpr = k.wg_id_x_sgpr;
+        opt.amdhsa_wg_id_y_sgpr = k.wg_id_y_sgpr;
+        opt.amdhsa_wg_id_z_sgpr = k.wg_id_z_sgpr;
+        auto recomp = emit_hlsl_from_ir(ir, opt);
+        auto dxil = dxc.compile_hlsl(recomp.hlsl, "main", "cs_6_6");
+        KX_CHECK(dxil.has_value(),
+                 std::format("{} DXC failed: {}", spec.elf_name, dxil ? "" : dxil.error().message));
+
+        std::vector<uint32_t> init_mem(kTotalDwords, 0u);
+        std::vector<uint32_t> exp;
+        float tol = 0.0f;
+        spec.setup(k, init_mem, exp, tol);
+
+        const uint32_t roots[8]{kOffKernarg, 0, 0, 0, 0, 0, 0, 0};
+        bool all_bit_exact_on_all_gpus = true;
+
+        for (const auto& a : *adapters) {
+            if (a.is_software) continue;
+            auto res = run_compute_dxil_on_gpu(a.index, dxil->dxil, init_mem, roots, kWorkgroups);
+            KX_CHECK(res.has_value(),
+                     std::format("{} failed on GPU [{}] {}: {}", spec.elf_name, a.index, a.name, res ? "" : res.error().message));
+
+            for (size_t idx = 0; idx < exp.size(); ++idx) {
+                const uint32_t got_u = res->output_u32[kOffOut / 4u + idx];
+                const uint32_t exp_u = exp[idx];
+                if (got_u != exp_u) {
+                    all_bit_exact_on_all_gpus = false;
+                }
+                if (tol == 0.0f) {
+                    KX_CHECK(got_u == exp_u,
+                             std::format("{} GPU [{}] idx {}: got {:#x} != exp {:#x}",
+                                         spec.elf_name, a.index, idx, got_u, exp_u));
+                } else {
+                    const float got_f = u2f(got_u);
+                    const float exp_f = u2f(exp_u);
+                    const float diff = std::fabs(got_f - exp_f);
+                    const float limit = std::max(tol, tol * std::fabs(exp_f));
+                    KX_CHECK(std::isfinite(got_f) && diff <= limit,
+                             std::format("{} GPU [{}] idx {}: got {} != exp {} (diff={}, limit={})",
+                                         spec.elf_name, a.index, idx, got_f, exp_f, diff, limit));
+                }
+            }
+            ++total_dispatches;
+        }
+        if (all_bit_exact_on_all_gpus) ++bit_exact_kernels;
+    }
+
+    std::cout << std::format(
+        "    -> External AMD RGA gfx1030 ELF64 Suite: 12/12 kernels verified across {} hardware GPU(s) ({} dispatches, {}/12 bit-exact u32)\n",
+        hw_adapters, total_dispatches, bit_exact_kernels);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--unit-only") {
@@ -8310,6 +8781,8 @@ int main(int argc, char** argv) {
     run_hw_test("PresentX Low-Latency Telemetry HUD GPU Compositor on Dual-GPU Hardware", test_presentx_low_latency_hud_composite_and_capture_dual_gpu);
     run_test("Batch RDNA2 Shader Census (SGD5 Archive + DXC DXIL + Unsupported Opcode Histogram)", test_shader_census_sgd5_batch_and_histogram);
     run_test("PE32+ Compatibility Probe (HLE, Guest DLL, Host & Agility SDK Import Audit)", test_pe_probe_import_and_agility_audit);
+    run_test("AMD GFX10.3 (RDNA2) ISA Spec Decoder Audit & Strict Refusal", test_gfx1030_isa_spec_decoder_audit);
+    run_hw_test("External AMD RGA gfx1030 ELF64 Kernels (12 Real Kernels) on Dual-GPU Hardware", test_external_amd_rga_gfx1030_dual_gpu);
 
     if (g_skipped > 0) {
         std::cout << std::format("\nSummary: {} passed, {} failed, {} skipped (--unit-only)\n",

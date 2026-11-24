@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(KestrelX VERSION 0.9.0 LANGUAGES CXX)
+project(KestrelX VERSION 0.10.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,6 +37,7 @@ add_library(kestrel_core STATIC
     src/hle/gameinput.cpp
     src/hle/xaudio2.cpp
     src/gpu/rdna2_isa.cpp
+    src/gpu/amdgpu_elf.cpp
     src/gpu/shader_container.cpp
     src/gpu/shader_cache.cpp
     src/gpu/ir.cpp
@@ -128,5 +129,6 @@ target_link_libraries(kestrel_tests PRIVATE kestrel_core)
 add_dependencies(kestrel_tests kestrel_test_title)
 target_compile_definitions(kestrel_tests PRIVATE
     KESTREL_TEST_TITLE_DIR="${CMAKE_BINARY_DIR}/test_title"
+    KESTREL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 add_test(NAME kestrel_unit_and_gpu_tests COMMAND kestrel_tests)

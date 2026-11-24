@@ -6218,6 +6218,151 @@ void test_rdna2_ir_opt_dual_gpu_parity() {
     KX_CHECK(tested > 0, "At least one hardware D3D12 adapter tested");
 }
 
+void test_overlay_vfs_case_cache_and_invalidation() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestVfsCaseCache";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    const fs::path base = tmp / "base";
+    const fs::path data = tmp / "data";
+    fs::create_directories(base / "Data" / "SubDir", ec);
+    {
+        std::ofstream ofs(base / "Data" / "SubDir" / "Asset.txt");
+        ofs << "ORIGINAL";
+    }
+
+    vfs::OverlayVfs vfs(base, data);
+    auto r0 = vfs.resolve("GAME:\\data\\subdir\\asset.txt", false);
+    KX_CHECK(r0.has_value() && *r0 == vfs.game_root() / "Data" / "SubDir" / "Asset.txt", "case-insensitive initial resolve");
+    const auto s0 = vfs.cache_stats();
+    KX_CHECK(s0.cache_misses >= 1 && s0.dir_scans >= 1, "initial resolve populated cache");
+
+    // Repeated lookups with varied casing must hit cache with zero extra dir scans
+    auto r1 = vfs.resolve("GAME:\\DATA\\SubDir\\ASSET.TXT", false);
+    KX_CHECK(r1.has_value() && *r1 == *r0, "repeated resolve returned cached path");
+    KX_CHECK(vfs.exists("g:\\data\\SUBDIR\\asset.txt"), "case-insensitive exists hit");
+    const auto s1 = vfs.cache_stats();
+    KX_CHECK(s1.cache_hits >= 2 && s1.dir_scans == s0.dir_scans, "cache hits avoided extra dir scans");
+
+    // Write invalidates overlay cache so subsequent read sees new overlay file
+    auto w0 = vfs.resolve("GAME:\\data\\subdir\\asset.txt", true);
+    KX_CHECK(w0.has_value(), "write resolve succeeded");
+    {
+        std::ofstream ofs(*w0);
+        ofs << "UPDATED";
+    }
+    auto r2 = vfs.resolve("GAME:\\DATA\\SUBDIR\\ASSET.TXT", false);
+    KX_CHECK(r2.has_value() && *r2 == *w0, "read after write saw overlay after cache invalidation");
+    KX_CHECK(vfs.exists("GAME:\\data\\subdir\\asset.txt"), "exists after write");
+
+    // Whiteout invalidates cache and hides file
+    KX_CHECK(vfs.remove_file("GAME:\\DATA\\subdir\\asset.txt").has_value(), "remove_file");
+    KX_CHECK(!vfs.exists("GAME:\\data\\subdir\\asset.txt"), "exists false after whiteout");
+    KX_CHECK(!vfs.resolve("GAME:\\data\\subdir\\asset.txt", false).has_value(), "resolve fails after whiteout");
+
+    fs::remove_all(tmp, ec);
+}
+
+void test_overlay_vfs_list_directory_and_non_throwing() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestVfsListDir";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    const fs::path base = tmp / "base";
+    const fs::path data = tmp / "data";
+    fs::create_directories(base / "Dir" / "Sub", ec);
+    {
+        std::ofstream(base / "Dir" / "OnlyBase.txt") << "base";
+        std::ofstream(base / "Dir" / "Shared.txt") << "base_shared";
+        std::ofstream(base / "Dir" / "WhitedOut.txt") << "gone";
+    }
+
+    vfs::OverlayVfs vfs(base, data);
+    if (auto w = vfs.resolve("GAME:\\dir\\SHARED.TXT", true)) {
+        std::ofstream(*w) << "upper_shared";
+    }
+    if (auto w = vfs.resolve("GAME:\\dir\\OnlyOverlay.txt", true)) {
+        std::ofstream(*w) << "overlay";
+    }
+    KX_CHECK(vfs.remove_file("GAME:\\dir\\WhitedOut.txt").has_value(), "whiteout entry");
+
+    auto listed = vfs.list_directory("GAME:\\DIR");
+    KX_CHECK(listed.has_value(), "list_directory succeeded");
+    KX_CHECK(listed->size() == 4, "expected 4 deduplicated non-whited-out entries");
+    bool saw_only_base = false;
+    bool saw_only_overlay = false;
+    bool saw_shared_upper = false;
+    bool saw_sub_dir = false;
+    for (const auto& e : *listed) {
+        if (e.name == "OnlyBase.txt" && !e.is_directory) saw_only_base = true;
+        if (e.name == "OnlyOverlay.txt" && !e.is_directory) saw_only_overlay = true;
+        if (e.name == "SHARED.TXT" && !e.is_directory) saw_shared_upper = true;
+        if (e.name == "Sub" && e.is_directory) saw_sub_dir = true;
+        KX_CHECK(e.name != "WhitedOut.txt", "whited-out entry must be suppressed");
+    }
+    KX_CHECK(saw_only_base && saw_only_overlay && saw_shared_upper && saw_sub_dir,
+             "merged upper+lower+subdir entries with upper winning case-insensitive collision");
+
+    // Non-throwing behavior on malformed, missing, or inaccessible paths
+    vfs::OverlayVfs missing_vfs(tmp / "does_not_exist_base", tmp / "does_not_exist_data");
+    KX_CHECK(!missing_vfs.exists("GAME:\\missing.txt"), "missing root exists returns false without throwing");
+    auto empty_list = missing_vfs.list_directory("GAME:\\missing_dir");
+    KX_CHECK(empty_list.has_value() && empty_list->empty(), "missing dir list_directory returns empty without throwing");
+    KX_CHECK(!vfs.resolve("", false).has_value(), "empty path rejected");
+    KX_CHECK(!vfs.resolve(std::string_view("GAME:\\bad\0name", 14), false).has_value(), "NUL byte rejected");
+    KX_CHECK(!vfs.resolve("GAME:\\stream.txt:ads", false).has_value(), "colon in relative path rejected");
+    KX_CHECK(!vfs.list_directory("GAME:\\..\\..\\Windows").has_value(), "list_directory traversal rejected");
+
+    fs::remove_all(tmp, ec);
+}
+
+void test_overlay_vfs_drive_prefixes_and_kernelx_sandbox() {
+    const fs::path tmp = fs::temp_directory_path() / "KestrelX_TestVfsDrives";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    const fs::path base = tmp / "base";
+    const fs::path data = tmp / "data";
+    fs::create_directories(base / "data", ec);
+    {
+        std::ofstream(base / "data" / "probe.txt") << "PROBE_OK";
+    }
+
+    vfs::OverlayVfs vfs(base, data);
+    const auto expected = vfs.game_root() / "data" / "probe.txt";
+    KX_CHECK(vfs.resolve("C:\\data\\probe.txt", false).value_or(fs::path{}) == expected, "C: maps to GameReadOnly");
+    KX_CHECK(vfs.resolve("D:\\data\\probe.txt", false).value_or(fs::path{}) == expected, "D: maps to GameReadOnly");
+    KX_CHECK(vfs.resolve("G:\\data\\probe.txt", false).value_or(fs::path{}) == expected, "G: maps to GameReadOnly");
+    KX_CHECK(vfs.resolve("\\\\?\\C:\\data\\probe.txt", false).value_or(fs::path{}) == expected, "\\\\?\\C: normalized");
+    KX_CHECK(vfs.resolve("\\??\\GAME:\\data\\probe.txt", false).value_or(fs::path{}) == expected, "\\??\\GAME: normalized");
+    KX_CHECK(vfs.resolve("S:\\save.bin", true).value_or(fs::path{}) == vfs.save_root() / "save.bin", "S: maps to save_root");
+    KX_CHECK(vfs.resolve("T:\\tmp.dat", true).value_or(fs::path{}) == vfs.temp_root() / "tmp.dat", "T: maps to temp_root");
+
+    KX_CHECK(!vfs.resolve("Z:\\Windows\\System32\\cmd.exe", false).has_value(), "unsupported drive rejected");
+    KX_CHECK(!vfs.resolve("C:..\\..\\Windows\\System32\\cmd.exe", false).has_value(), "C:.. traversal rejected");
+    KX_CHECK(!vfs.resolve("D:\\a\\..\\..\\Windows\\System32\\cmd.exe", false).has_value(), "D: deep traversal rejected");
+
+    // Verify KernelX HLE hooks normalize Xbox drives and block relative traversal
+    hle::Registry reg;
+    hle::set_kernelx_vfs(&vfs);
+    hle::register_kernelx(reg);
+    using CreateFileAFn = HANDLE(__stdcall*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+    auto cfa = reinterpret_cast<CreateFileAFn>(reg.resolve_name("kernelx.dll", "CreateFileA"));
+    KX_CHECK(cfa != nullptr, "kernelx!CreateFileA exported");
+
+    HANDLE h_ok = cfa("C:\\data\\probe.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    KX_CHECK(h_ok != INVALID_HANDLE_VALUE, "CreateFileA opened C:\\data\\probe.txt via VFS");
+    if (h_ok != INVALID_HANDLE_VALUE) CloseHandle(h_ok);
+
+    HANDLE h_trav = cfa("..\\..\\Windows\\System32\\cmd.exe", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    KX_CHECK(h_trav == INVALID_HANDLE_VALUE, "CreateFileA blocked relative traversal when VFS active");
+    if (h_trav != INVALID_HANDLE_VALUE) CloseHandle(h_trav);
+
+    HANDLE h_bad_drv = cfa("Z:\\Windows\\System32\\cmd.exe", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    KX_CHECK(h_bad_drv == INVALID_HANDLE_VALUE, "CreateFileA blocked unsupported drive Z:");
+    if (h_bad_drv != INVALID_HANDLE_VALUE) CloseHandle(h_bad_drv);
+
+    hle::set_kernelx_vfs(nullptr);
+    fs::remove_all(tmp, ec);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6236,6 +6381,9 @@ int main(int argc, char** argv) {
 
     run_test("MicrosoftGame.config XML parser", test_game_config_parser);
     run_test("Overlay VFS copy-on-write, whiteouts & path-traversal rejection", test_overlay_vfs_cow_and_security);
+    run_test("Overlay VFS Case-Insensitive Path Cache & Invalidation", test_overlay_vfs_case_cache_and_invalidation);
+    run_test("Overlay VFS Merged Directory Enumeration & Non-Throwing Error Handling", test_overlay_vfs_list_directory_and_non_throwing);
+    run_test("Overlay VFS Drive-Prefix Normalization & KernelX Sandbox Confinement", test_overlay_vfs_drive_prefixes_and_kernelx_sandbox);
     run_test("VEH AMD Zen 2 instruction decoder & emulator (CLZERO/MONITORX/MWAITX/MCOMMIT/RDPRU/PREFETCHW)", test_veh_zen2_decode_and_emulate);
     run_test("VEH live ScopedVehShim interception & safe CLZERO validation", test_veh_live_scoped_shim);
     run_test("RDNA2 (GFX10.3) decoder, CFG IR lifter & dual Wave32/Wave64 HLSL emission", test_rdna2_decoder_and_ir_cfg);
